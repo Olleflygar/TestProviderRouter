@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "providerrouter"
+version = "0.1.0"
+description = "Baseline provider router with round-robin routing."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.24,<1"]
+
+[project.optional-dependencies]
+openai = ["openai>=1.0,<3"]
+anthropic = ["anthropic>=0.20,<1"]
+all = ["openai>=1.0,<3", "anthropic>=0.20,<1"]
+dev = ["pytest>=7,<9"]
+
+[tool.setuptools.packages.find]
+include = ["providerrouter*"]
