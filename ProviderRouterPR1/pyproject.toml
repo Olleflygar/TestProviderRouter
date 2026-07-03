@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nygen-router"
+version = "0.1.0"
+description = "Lightweight provider router foundation."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.24,<1",
+    "pydantic>=2,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "coverage>=7,<8",
+    "mypy>=1,<2",
+    "pytest>=7,<9",
+    "pytest-asyncio>=0.23,<1",
+    "respx>=0.20,<1",
+    "ruff>=0.6,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+nygen_router = ["py.typed"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
