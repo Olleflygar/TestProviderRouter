@@ -10,7 +10,11 @@ from nygen_router import (
     RouterRequest,
     RouterResponse,
 )
-from nygen_router.errors import ConfigError, NoProvidersConfiguredError, UnsupportedProtocolError
+from nygen_router.errors import (
+    CapabilityError,
+    NoProvidersConfiguredError,
+    UnsupportedProtocolError,
+)
 
 
 def _openai_config(name: str = "provider_a", *, enabled: bool = True) -> ProviderConfig:
@@ -115,5 +119,8 @@ def test_router_rejects_tool_request_if_provider_does_not_support_tools(
         requires_tools=True,
     )
 
-    with pytest.raises(ConfigError):
+    with pytest.raises(CapabilityError) as exc_info:
         router.invoke(request)
+
+    assert exc_info.value.provider_name == "provider_a"
+    assert "tool calls" in str(exc_info.value)

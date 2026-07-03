@@ -32,4 +32,4 @@ class ProviderRouter:
     def _adapter_for(self, provider: ProviderConfig) -> ProviderAdapter:
         if provider.protocol == ApiProtocol.OPENAI_CHAT:
             return OpenAICompatibleAdapter(provider)
-        raise UnsupportedProtocolError(provider.protocol)
+        raise UnsupportedProtocolError(provider.name, provider.protocol)

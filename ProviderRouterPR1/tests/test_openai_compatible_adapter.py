@@ -8,7 +8,13 @@ import pytest
 
 from nygen_router import ApiProtocol, ChatMessage, ProviderConfig, RouterRequest
 from nygen_router.adapters.openai_compatible import OpenAICompatibleAdapter
-from nygen_router.errors import ProviderHTTPError, ProviderResponseError
+from nygen_router.errors import (
+    ProviderConnectionError,
+    ProviderError,
+    ProviderHTTPError,
+    ProviderResponseError,
+    ProviderTimeoutError,
+)
 
 
 def _config() -> ProviderConfig:
@@ -165,11 +171,89 @@ def test_http_errors_raise_provider_http_error(status_code: int) -> None:
     assert exc_info.value.status_code == status_code
 
 
+def test_http_error_preserves_verbatim_message_and_structured_fields() -> None:
+    body = {
+        "error": {
+            "message": "model gpt-4o-mini does not exist",
+            "type": "invalid_request_error",
+            "code": "model_not_found",
+        }
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json=body)
+
+    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(ProviderHTTPError) as exc_info:
+        adapter.invoke(_request())
+
+    error = exc_info.value
+    # The provider's exact message is front-and-center, no unwrapping needed.
+    assert error.message == "model gpt-4o-mini does not exist"
+    assert "model gpt-4o-mini does not exist" in str(error)
+    assert "HTTP 404 Not Found" in str(error)
+    assert error.error_type == "invalid_request_error"
+    assert error.error_code == "model_not_found"
+    assert error.body == body
+    assert error.status_code == 404
+    # The standard httpx error stays reachable as the chained cause.
+    assert isinstance(error.__cause__, httpx.HTTPStatusError)
+    assert error.response is not None
+    assert error.model == "model-a"
+
+
+def test_timeout_raises_provider_timeout_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(ProviderTimeoutError) as exc_info:
+        adapter.invoke(_request())
+
+    error = exc_info.value
+    assert error.provider_name == "provider_a"
+    assert error.model == "model-a"
+    assert "ReadTimeout" in str(error)
+    assert isinstance(error.__cause__, httpx.ReadTimeout)
+    assert error.original is error.__cause__
+
+
+def test_connection_failure_raises_provider_connection_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(ProviderConnectionError) as exc_info:
+        adapter.invoke(_request())
+
+    assert isinstance(exc_info.value.__cause__, httpx.ConnectError)
+    assert "ConnectError" in str(exc_info.value)
+
+
+def test_other_transport_error_raises_provider_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError("protocol error", request=request)
+
+    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(ProviderError) as exc_info:
+        adapter.invoke(_request())
+
+    assert not isinstance(exc_info.value, (ProviderTimeoutError, ProviderConnectionError))
+    assert isinstance(exc_info.value.__cause__, httpx.RemoteProtocolError)
+
+
 def test_malformed_response_raises_provider_response_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"not_choices": []})
 
     adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
 
-    with pytest.raises(ProviderResponseError):
+    with pytest.raises(ProviderResponseError) as exc_info:
         adapter.invoke(_request())
+
+    assert exc_info.value.provider_name == "provider_a"
+    assert exc_info.value.model == "model-a"
