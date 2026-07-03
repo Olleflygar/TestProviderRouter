@@ -1,0 +1,4 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/ProviderRouterPR1/.venv/bin/python",
+  "python.terminal.activateEnvironment": true
+}

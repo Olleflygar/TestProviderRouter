@@ -1,0 +1,10 @@
+httpx<1,>=0.24
+pydantic<3,>=2
+
+[dev]
+coverage<8,>=7
+mypy<2,>=1
+pytest<9,>=7
+pytest-asyncio<1,>=0.23
+respx<1,>=0.20
+ruff<1,>=0.6

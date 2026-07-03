@@ -1,3 +1,19 @@
+Metadata-Version: 2.4
+Name: nygen-router
+Version: 0.1.0
+Summary: Lightweight provider router foundation.
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: httpx<1,>=0.24
+Requires-Dist: pydantic<3,>=2
+Provides-Extra: dev
+Requires-Dist: coverage<8,>=7; extra == "dev"
+Requires-Dist: mypy<2,>=1; extra == "dev"
+Requires-Dist: pytest<9,>=7; extra == "dev"
+Requires-Dist: pytest-asyncio<1,>=0.23; extra == "dev"
+Requires-Dist: respx<1,>=0.20; extra == "dev"
+Requires-Dist: ruff<1,>=0.6; extra == "dev"
+
 # nygen-router
 
 `nygen-router` is a lightweight foundation for routing a request to one of several
