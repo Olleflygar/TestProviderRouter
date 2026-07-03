@@ -1,0 +1,542 @@
+You are implementing PR 1 of a Python package called nygen-router.
+
+Create a complete folder called:
+
+ProviderRouterPR1
+
+The goal of PR 1 is to create the first working foundation for a lightweight provider router.
+
+This PR should focus only on:
+
+provider configuration
+API key handling
+typed request/response models
+a basic ProviderRouter class
+an OpenAI-compatible HTTP adapter
+tests
+README
+pyproject.toml
+
+Do not implement round robin, SQLite, scoring, LangChain, Pydantic AI, Anthropic SDK, OpenAI SDK, DuckDB, Supabase, OpenTelemetry, Logfire, or advanced observability in PR 1.
+
+The package must be lightweight.
+
+This import must work without provider-specific SDKs installed:
+
+from nygen_router import ProviderRouter
+
+Use only these runtime dependencies:
+
+pydantic
+httpx
+typing-extensions if needed
+
+Use these dev dependencies:
+
+pytest
+pytest-asyncio
+respx
+ruff
+mypy
+coverage
+
+Provider-specific SDKs must not be imported anywhere in core.
+
+For PR 1, use direct HTTP calls with httpx for OpenAI-compatible providers.
+
+⸻
+
+Folder structure
+
+Create exactly this structure:
+
+ProviderRouterPR1/
+  AGENT.md
+  README.md
+  pyproject.toml
+  src/
+    nygen_router/
+      __init__.py
+      config.py
+      types.py
+      errors.py
+      capabilities.py
+      router.py
+      adapters/
+        __init__.py
+        base.py
+        openai_compatible.py
+  tests/
+    test_config.py
+    test_openai_compatible_adapter.py
+    test_router_pr1.py
+
+⸻
+
+pyproject.toml requirements
+
+Use modern Python packaging with src layout.
+
+Package name:
+
+nygen-router
+
+Import package name:
+
+nygen_router
+
+Python support:
+
+>=3.12
+
+Primary target is Python 3.14, but code should also work on 3.12 and 3.13.
+
+Runtime dependencies:
+
+pydantic
+httpx
+
+Dev dependencies:
+
+pytest
+pytest-asyncio
+respx
+ruff
+mypy
+coverage
+
+Configure ruff and mypy.
+
+Ruff should check and format the project.
+
+Mypy should type-check src.
+
+⸻
+
+Core design requirements
+
+The router is for provider routing, not model routing.
+
+The user supplies several providers that can serve a model. The router will later decide which provider is best.
+
+In PR 1, the router may simply use the first valid provider.
+
+Do not implement round robin yet.
+
+⸻
+
+config.py
+
+Implement:
+
+ApiProtocol
+ProviderCapabilities
+ProviderConfig
+
+Use Pydantic for user-facing config validation.
+
+ApiProtocol should be an enum with at least:
+
+OPENAI_CHAT = "openai_chat"
+OPENAI_RESPONSES = "openai_responses"
+ANTHROPIC_MESSAGES = "anthropic_messages"
+
+Only OPENAI_CHAT needs to be implemented in PR 1.
+
+ProviderCapabilities should include:
+
+supports_chat: bool = True
+supports_responses_api: bool = False
+supports_tools: bool = False
+supports_streaming: bool = False
+supports_json_mode: bool = False
+
+ProviderConfig should include:
+
+name: str
+protocol: ApiProtocol
+model: str
+base_url: str | None = None
+api_key: str | None = None
+api_key_env: str | None = None
+enabled: bool = True
+timeout_seconds: float = 30.0
+capabilities: ProviderCapabilities = ProviderCapabilities()
+
+Validation rules:
+
+name must not be empty
+model must not be empty
+timeout_seconds must be positive
+for OPENAI_CHAT, base_url is required
+at least one of api_key or api_key_env should be supplied
+
+Add a method:
+
+def resolve_api_key(self) -> str:
+    ...
+
+Behavior:
+
+if api_key is provided, return it
+else if api_key_env is provided and exists in os.environ, return env value
+else raise MissingApiKeyError
+
+Do not print or expose API keys.
+
+⸻
+
+types.py
+
+Implement typed internal structures.
+
+Use Pydantic or dataclasses. Prefer Pydantic for request/response models in PR 1.
+
+Implement:
+
+ChatMessage
+RouterRequest
+TokenUsage
+RouterResponse
+
+ChatMessage:
+
+role: str
+content: str
+
+RouterRequest:
+
+messages: list[ChatMessage]
+temperature: float | None = None
+max_tokens: int | None = None
+requires_tools: bool = False
+requires_streaming: bool = False
+requires_json_mode: bool = False
+
+Add a convenience constructor or normalization helper so the router can accept a plain string and convert it into a user message.
+
+TokenUsage:
+
+input_tokens: int | None = None
+output_tokens: int | None = None
+total_tokens: int | None = None
+
+RouterResponse:
+
+provider_name: str
+model: str
+text: str
+raw: dict[str, object] | None = None
+usage: TokenUsage | None = None
+
+⸻
+
+errors.py
+
+Implement custom exceptions:
+
+NygenRouterError
+ConfigError
+MissingApiKeyError
+UnsupportedProtocolError
+ProviderError
+ProviderHTTPError
+ProviderResponseError
+NoProvidersConfiguredError
+
+ProviderHTTPError should include:
+
+provider_name
+status_code
+message
+
+No traceback formatting is needed.
+
+⸻
+
+capabilities.py
+
+For PR 1, keep this minimal.
+
+Implement a function:
+
+def validate_request_capabilities(config: ProviderConfig, request: RouterRequest) -> None:
+    ...
+
+This should raise an error if:
+
+request requires tools but provider does not support tools
+request requires streaming but provider does not support streaming
+request requires JSON mode but provider does not support JSON mode
+
+Do not implement full hard filtering yet. That is PR 2.
+
+⸻
+
+adapters/base.py
+
+Implement a protocol or abstract base class:
+
+class ProviderAdapter(Protocol):
+    def invoke(self, request: RouterRequest) -> RouterResponse:
+        ...
+
+Keep it sync for PR 1.
+
+Async can be added later.
+
+⸻
+
+adapters/openai_compatible.py
+
+Implement:
+
+class OpenAICompatibleAdapter:
+    def __init__(self, config: ProviderConfig):
+        ...
+    
+    def invoke(self, request: RouterRequest) -> RouterResponse:
+        ...
+
+Use httpx.Client.
+
+Endpoint:
+
+{base_url}/chat/completions
+
+Be careful with trailing slashes.
+
+Request payload:
+
+{
+    "model": config.model,
+    "messages": [{"role": ..., "content": ...}],
+}
+
+Include optional fields if present:
+
+temperature
+max_tokens
+
+Headers:
+
+Authorization: Bearer <api_key>
+Content-Type: application/json
+
+Parse OpenAI-compatible response shape:
+
+{
+  "choices": [
+    {
+      "message": {
+        "content": "..."
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 20,
+    "total_tokens": 30
+  }
+}
+
+Map usage:
+
+prompt_tokens -> input_tokens
+completion_tokens -> output_tokens
+total_tokens -> total_tokens
+
+Error behavior:
+
+HTTP status >= 400 -> ProviderHTTPError
+missing choices -> ProviderResponseError
+missing message content -> ProviderResponseError
+
+Do not log API keys.
+
+Do not import the OpenAI SDK.
+
+⸻
+
+router.py
+
+Implement:
+
+class ProviderRouter:
+    def __init__(self, providers: list[ProviderConfig]):
+        ...
+    
+    def invoke(self, input: str | RouterRequest) -> RouterResponse:
+        ...
+
+Behavior for PR 1:
+
+if no providers, raise NoProvidersConfiguredError
+normalize string input into RouterRequest
+choose the first enabled provider
+validate basic capabilities
+create adapter based on provider protocol
+call adapter
+return RouterResponse
+
+Only support ApiProtocol.OPENAI_CHAT in PR 1.
+
+If another protocol is used, raise UnsupportedProtocolError.
+
+Do not implement round robin yet.
+
+Do not implement scoring yet.
+
+Do not implement SQLite yet.
+
+⸻
+
+__init__.py
+
+Expose:
+
+ProviderRouter
+ProviderConfig
+ApiProtocol
+ProviderCapabilities
+RouterRequest
+RouterResponse
+ChatMessage
+TokenUsage
+
+This should work:
+
+from nygen_router import ProviderRouter, ProviderConfig, ApiProtocol
+
+⸻
+
+Tests
+
+Use pytest.
+
+Use respx or httpx.MockTransport for HTTP tests.
+
+Do not call real providers in required tests.
+
+test_config.py
+
+Test:
+
+valid OpenAI-compatible config
+empty name rejected
+empty model rejected
+missing base_url rejected for OPENAI_CHAT
+missing API key and api_key_env rejected
+explicit api_key resolves
+api_key_env resolves from environment
+missing env var raises MissingApiKeyError
+
+test_openai_compatible_adapter.py
+
+Test:
+
+adapter sends request to /chat/completions
+adapter includes model and messages
+adapter includes authorization header
+adapter parses response text
+adapter parses usage
+HTTP 401 raises ProviderHTTPError
+HTTP 429 raises ProviderHTTPError
+malformed response raises ProviderResponseError
+
+test_router_pr1.py
+
+Test:
+
+router raises NoProvidersConfiguredError with no providers
+router invokes first enabled OpenAI-compatible provider
+router normalizes string input into user message
+router raises UnsupportedProtocolError for unimplemented protocol
+router rejects tool request if provider does not support tools
+
+⸻
+
+README.md
+
+Write a concise README with:
+
+project description
+installation for local dev
+minimal usage example
+environment variable example
+note that PR 1 only supports OpenAI-compatible chat/completions
+note that round robin, SQLite, scoring, Responses API, and framework adapters are future PRs
+
+Include example:
+
+from nygen_router import ProviderRouter, ProviderConfig, ApiProtocol
+router = ProviderRouter(
+    providers=[
+        ProviderConfig(
+            name="provider_a",
+            protocol=ApiProtocol.OPENAI_CHAT,
+            model="my-model",
+            base_url="https://api.provider-a.com/v1",
+            api_key_env="PROVIDER_A_API_KEY",
+        )
+    ]
+)
+response = router.invoke("Hello")
+print(response.text)
+
+⸻
+
+AGENT.md
+
+Create an AGENT.md inside the generated folder.
+
+It should include the implementation rules:
+
+core imports must stay lightweight
+no provider SDK imports in core
+provider-specific SDKs must be lazy-imported in adapters
+no LangChain/Pydantic AI/DuckDB/Supabase/OpenTelemetry in PR 1
+do not leak API keys
+use typed models, not raw dictionaries in core
+tests must not require real API keys
+PR 1 only supports OpenAI-compatible chat/completions
+
+⸻
+
+Quality commands
+
+Make sure these commands should pass:
+
+ruff format .
+ruff check .
+mypy src
+pytest
+coverage run -m pytest
+coverage report
+
+⸻
+
+Implementation quality
+
+Prefer simple, readable code.
+
+Do not over-engineer PR 1.
+
+But structure the files so future PRs can add:
+
+hard filters
+round robin
+SQLite memory
+health/cooldowns
+score-based routing
+Responses API adapter
+DuckDB
+LangChain adapter
+Pydantic AI adapter
+observability
+
+The final output should be a complete folder named:
+
+ProviderRouterPR1
+
+with all files needed to install, test, and run the PR 1 package locally.
