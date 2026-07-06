@@ -121,6 +121,18 @@ Scope:
 - API key loading from environment
 - tests
 
+Response transparency (schema added now, populated fully by later PRs):
+- RouterResponse.attempts: list[ProviderAttempt], one entry per provider actually
+  invoked during this call (provider name, success flag, and the real
+  underlying error object if it failed -- never a router-rephrased summary).
+  In PR1 this is always exactly one entry, since PR1 has no fallback yet.
+- RouterResponse.excluded: list[EligibilityResult], one entry per provider that
+  was filtered out before any call was made, with its specific reason. Always
+  populated, even on a successful call. In PR1 this is always empty, since
+  hard filtering does not exist until PR2.
+- Adding both fields now (rather than in PR2/PR3, when they first have real
+  content) avoids a breaking schema change to a public response type later.
+
 Suggested files:
 ProviderRouterPR1/
   pyproject.toml
@@ -150,6 +162,12 @@ Key implementation decisions:
 - Do not implement SQLite yet.
 - Do not implement scoring yet.
 - Do not implement LangChain, Pydantic AI, DuckDB, Anthropic SDK, or observability.
+- Transparency principle (applies to every PR from here on): the router must
+  never wrap, rephrase, or blend a provider's own error into a generic router
+  message. Individual failures/exclusions are always shown with their real,
+  specific cause; only when every provider fails/is excluded does the router
+  raise its own error, and that error must still enumerate each provider's
+  real, distinct reason rather than a single blended message.
 
 Minimum usage example:
 from nygen_router import ProviderRouter, ProviderConfig, ApiProtocol
@@ -217,12 +235,32 @@ tests/test_filters.py
 Important principle:
 Hard filters are not scores. A provider that cannot support tools should be excluded for tool requests, not ranked lower.
 
+Control flow change from PR1:
+ProviderRouter.invoke() changes from "pick the first enabled provider, then
+validate capabilities against only that one provider" to "filter the whole
+provider list down to eligible candidates first, then select among survivors."
+CapabilityError is retired as something invoke() raises directly -- it is no
+longer reachable from the normal invoke() path. Each exclusion becomes an
+EligibilityResult carrying a FilterReason enum (per the enums-for-capability-
+flags principle) plus a specific human-readable detail, e.g. "missing
+tool-calling support". These results populate RouterResponse.excluded on
+every call (see PR1), success or failure.
+
+If filtering excludes every configured provider, invoke() raises
+NoEligibleProvidersError. Per the transparency principle, this error must
+enumerate every excluded provider with its own specific FilterReason/detail
+(e.g. "provider_a: missing tool-calling support; provider_c: disabled"),
+never a single generic "no eligible providers" message.
+
 Tests:
 - provider without API key is excluded
 - disabled provider is excluded
 - provider without tools is excluded when tools are required
 - provider without streaming is excluded when streaming is required
-- all providers filtered out raises NoEligibleProvidersError
+- all providers filtered out raises NoEligibleProvidersError, and the error
+  message names each excluded provider with its own specific reason
+- a successful call still reports any filtered-out providers in
+  RouterResponse.excluded
 
 PR 3: Round robin with current-run memory only
 ----------------------------------------------
@@ -251,12 +289,34 @@ The selected provider should rotate during that Python process.
 
 No persistence yet.
 
+Default policy (no API change required from PR1/PR2 callers):
+Round-robin + fallback becomes the automatic default the moment PR3 ships.
+ProviderRouter(providers=[...]) -- the exact same call signature as PR1 --
+starts rotating and falling back with no code change. ProviderRouter gains an
+optional `policy` constructor argument (e.g. policy=RoundRobinPolicy()) only
+for explicitly overriding the default later (PR9's ScoreBasedPolicy).
+
+Shared health/disablement state:
+Per-run provider health state (starting with "auth-disabled this run" here,
+extended by PR5 with cooldowns/consecutive-failure counts) lives on
+ProviderRouter itself as a small tracker (e.g. self._health: dict[str,
+ProviderHealthState]), not inside RoundRobinPolicy. This is so the same state
+is visible to the eligibility filter (PR2) and to any policy, including
+PR9's ScoreBasedPolicy later -- state must not be lost if the policy is
+swapped. PR5 extends ProviderHealthState in place; it does not relocate it.
+
+RouterResponse.attempts (see PR1) is populated with one entry per provider
+actually invoked during fallback, in order, each carrying its real
+success/failure outcome and the provider's real error object (never
+rewrapped) if it failed.
+
 Required fallback behavior:
 provider A selected
 provider A times out
 router tries provider B
 provider B succeeds
-router returns provider B response
+router returns provider B response (with attempts = [A: failed w/ real
+error, B: succeeded])
 
 Error categories:
 - TIMEOUT
@@ -279,7 +339,11 @@ Tests:
 - fallback tries second provider on timeout
 - fallback tries second provider on rate limit
 - auth error disables provider for current run
-- all providers fail raises RouterExhaustedError
+- all providers fail raises RouterExhaustedError, and the error message names
+  each attempted provider with its own real, distinct failure (never a
+  blended "all providers failed" message)
+- a successful fallback populates RouterResponse.attempts with every
+  provider tried, including the real error for ones that failed first
 
 PR 4: SQLite memory
 -------------------
@@ -319,6 +383,19 @@ CREATE TABLE provider_attempts (
 Important behavior:
 Storage failure should not break a successful LLM response. If the provider succeeds but metrics storage fails, return the provider response.
 
+Default storage (works out of the box, no config required):
+ProviderRouter defaults to a SQLiteMetricsStore backed by a fixed file under
+the user's home directory (~/.nygen_router/metrics.db), created automatically
+on first use. This is a real file on disk, not an in-memory ":memory:"
+database -- in-memory SQLite only lives for the current process and would
+not persist across separate runs of a script, which would defeat the "router
+learns over time" goal (PR9's final demo target). Using a fixed user-level
+path (rather than a path relative to the current working directory) means
+history is reused correctly regardless of which directory the program is
+run from. `metrics_store` remains overridable: pass an explicit
+SQLiteMetricsStore(path) for a custom location/backend, or metrics_store=None
+to disable persistence entirely.
+
 Tests:
 - creates schema
 - records success event
@@ -326,6 +403,9 @@ Tests:
 - queries recent events
 - ignores events outside lookback window
 - router continues if metrics store fails
+- default metrics_store writes to ~/.nygen_router/metrics.db when not
+  otherwise configured
+- metrics_store=None disables persistence with no file created
 
 PR 5: Health state and cooldowns
 --------------------------------
@@ -345,11 +425,26 @@ Suggested behavior:
 - AUTH: disable provider for current router instance
 - SUCCESS: reset provider failure count
 
+Relationship to PR3:
+This extends the same ProviderHealthState/self._health tracker introduced in
+PR3 (auth-disabled) in place -- adding cooldown_until and
+consecutive_failures fields -- rather than moving health state to a new
+owner. It remains owned by ProviderRouter, shared by every policy.
+
+Cooldown/auth-disabled exclusions are hard filters, not a separate
+mechanism: filter_eligible_providers (PR2) consults this health state
+alongside its static config checks, using the same FilterReason/
+EligibilityResult machinery. A provider skipped for being in cooldown or
+auth-disabled therefore also shows up in RouterResponse.excluded with its
+specific reason, exactly like a PR2 static exclusion.
+
 Tests:
 - rate-limited provider enters cooldown
-- provider in cooldown is filtered out
+- provider in cooldown is filtered out, and appears in RouterResponse.excluded
+  with a cooldown-specific FilterReason
 - success resets failure count
-- auth error disables provider for current run
+- auth error disables provider for current run, and appears in
+  RouterResponse.excluded with an auth-disabled FilterReason
 
 PR 6: Token cost calculation
 ----------------------------
