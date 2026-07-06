@@ -35,10 +35,8 @@ def test_router_raises_no_providers_configured_with_no_providers() -> None:
         router.invoke("Hello")
 
 
-def test_router_invokes_first_enabled_openai_compatible_provider(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Swap in a fake adapter (no real HTTP) to check provider selection only."""
+def test_router_invokes_first_enabled_openai_compatible_provider() -> None:
+    """Inject a fake adapter (no real HTTP) via adapter_factory to check provider selection only."""
     called_with: dict[str, str] = {}
 
     class FakeAdapter:
@@ -53,12 +51,12 @@ def test_router_invokes_first_enabled_openai_compatible_provider(
                 text=request.messages[0].content,
             )
 
-    monkeypatch.setattr("nygen_router.router.OpenAICompatibleAdapter", FakeAdapter)
     router = ProviderRouter(
         providers=[
             _openai_config("provider_a", enabled=False),
             _openai_config("provider_b", enabled=True),
-        ]
+        ],
+        adapter_factory=FakeAdapter,
     )
 
     response = router.invoke("Hello")
@@ -67,7 +65,7 @@ def test_router_invokes_first_enabled_openai_compatible_provider(
     assert response.provider_name == "provider_b"
 
 
-def test_router_normalizes_string_input_into_user_message(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_router_normalizes_string_input_into_user_message() -> None:
     class FakeAdapter:
         def __init__(self, config: ProviderConfig):
             self.config = config
@@ -79,8 +77,7 @@ def test_router_normalizes_string_input_into_user_message(monkeypatch: pytest.Mo
                 text=f"{request.messages[0].role}:{request.messages[0].content}",
             )
 
-    monkeypatch.setattr("nygen_router.router.OpenAICompatibleAdapter", FakeAdapter)
-    router = ProviderRouter(providers=[_openai_config()])
+    router = ProviderRouter(providers=[_openai_config()], adapter_factory=FakeAdapter)
 
     response = router.invoke("Hello")
 
@@ -103,9 +100,7 @@ def test_router_raises_unsupported_protocol_for_unimplemented_protocol() -> None
         router.invoke("Hello")
 
 
-def test_router_rejects_tool_request_if_provider_does_not_support_tools(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_router_rejects_tool_request_if_provider_does_not_support_tools() -> None:
     class FakeAdapter:
         def __init__(self, config: ProviderConfig):
             self.config = config
@@ -113,8 +108,7 @@ def test_router_rejects_tool_request_if_provider_does_not_support_tools(
         def invoke(self, request: RouterRequest) -> RouterResponse:
             raise AssertionError("adapter should not be called")
 
-    monkeypatch.setattr("nygen_router.router.OpenAICompatibleAdapter", FakeAdapter)
-    router = ProviderRouter(providers=[_openai_config()])
+    router = ProviderRouter(providers=[_openai_config()], adapter_factory=FakeAdapter)
     request = RouterRequest(
         messages=[ChatMessage(role="user", content="Use a tool")],
         requires_tools=True,

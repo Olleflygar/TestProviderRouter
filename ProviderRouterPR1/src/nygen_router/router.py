@@ -41,6 +41,10 @@ class ProviderRouter:
         raise NoProvidersConfiguredError("No enabled providers configured.")
 
     def _adapter_for(self, provider: ProviderConfig) -> ProviderAdapter:
+        return self._adapter_factory(provider)
+
+    @staticmethod
+    def _default_adapter_for(provider: ProviderConfig) -> ProviderAdapter:
         """Map a provider's protocol to its adapter (only OPENAI_CHAT exists so far)."""
         if provider.protocol == ApiProtocol.OPENAI_CHAT:
             return OpenAICompatibleAdapter(provider)
