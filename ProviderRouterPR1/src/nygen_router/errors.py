@@ -23,6 +23,7 @@ class ConfigError(NygenRouterError):
 
 class MissingApiKeyError(ConfigError):
     def __init__(self, provider_name: str, env_var: str | None = None) -> None:
+        """Build a message hinting how to supply the missing key."""
         self.provider_name = provider_name
         self.env_var = env_var
         if env_var:
@@ -34,6 +35,7 @@ class MissingApiKeyError(ConfigError):
 
 class UnsupportedProtocolError(NygenRouterError):
     def __init__(self, provider_name: str, protocol: object) -> None:
+        """Flag a provider configured with a protocol no adapter handles yet."""
         self.provider_name = provider_name
         self.protocol = protocol
         super().__init__(
@@ -109,6 +111,7 @@ class ProviderHTTPError(ProviderError):
         response: httpx.Response | None = None,
         original: BaseException | None = None,
     ) -> None:
+        """Format a message combining status, provider's error text, and type/code tags."""
         self.status_code = status_code
         self.message = message
         self.error_type = error_type
@@ -154,6 +157,7 @@ class ProviderResponseError(ProviderError):
 
 
 def _http_reason(status_code: int) -> str:
+    """Map a status code to its standard reason phrase, or "" if unknown."""
     try:
         return HTTPStatus(status_code).phrase
     except ValueError:

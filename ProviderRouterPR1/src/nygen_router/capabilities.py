@@ -6,6 +6,7 @@ from nygen_router.types import RouterRequest
 
 
 def validate_request_capabilities(config: ProviderConfig, request: RouterRequest) -> None:
+    """Raise CapabilityError if the provider can't meet a capability the request needs."""
     if request.requires_tools and not config.capabilities.supports_tools:
         raise CapabilityError(config.name, "tool calls")
     if request.requires_streaming and not config.capabilities.supports_streaming:

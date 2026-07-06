@@ -13,6 +13,7 @@ class ProviderRouter:
         self.providers = list(providers)
 
     def invoke(self, input: str | RouterRequest) -> RouterResponse:
+        """Pick a provider, check it can serve the request, and call it."""
         request = RouterRequest.from_input(input)
         provider = self._first_enabled_provider()
         validate_request_capabilities(provider, request)
@@ -20,6 +21,7 @@ class ProviderRouter:
         return adapter.invoke(request)
 
     def _first_enabled_provider(self) -> ProviderConfig:
+        """Return the first enabled provider in config order (PR1: no filtering/rotation yet)."""
         if not self.providers:
             raise NoProvidersConfiguredError("No providers configured.")
 
@@ -30,6 +32,7 @@ class ProviderRouter:
         raise NoProvidersConfiguredError("No enabled providers configured.")
 
     def _adapter_for(self, provider: ProviderConfig) -> ProviderAdapter:
+        """Map a provider's protocol to its adapter (only OPENAI_CHAT exists so far)."""
         if provider.protocol == ApiProtocol.OPENAI_CHAT:
             return OpenAICompatibleAdapter(provider)
         raise UnsupportedProtocolError(provider.name, provider.protocol)

@@ -22,6 +22,7 @@ class RouterRequest(BaseModel):
 
     @classmethod
     def from_input(cls, value: str | RouterRequest) -> RouterRequest:
+        """Wrap a plain string as a single user message, or pass a request through."""
         if isinstance(value, str):
             return cls(messages=[ChatMessage(role="user", content=value)])
         return value

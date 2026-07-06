@@ -41,6 +41,7 @@ class ProviderConfig(BaseModel):
     @field_validator("name", "model")
     @classmethod
     def _must_not_be_empty(cls, value: str) -> str:
+        """Reject blank or whitespace-only values for name/model."""
         value = value.strip()
         if not value:
             raise ValueError("must not be empty")
@@ -49,6 +50,7 @@ class ProviderConfig(BaseModel):
     @field_validator("base_url", "api_key_env")
     @classmethod
     def _blank_strings_become_none(cls, value: str | None) -> str | None:
+        """Treat an empty/whitespace string as if it were never set."""
         if value is None:
             return None
         value = value.strip()
@@ -57,6 +59,7 @@ class ProviderConfig(BaseModel):
     @field_validator("api_key", mode="before")
     @classmethod
     def _blank_api_key_becomes_none(cls, value: object) -> object:
+        """Same blank-to-None treatment as above, run before SecretStr coercion."""
         if isinstance(value, str):
             value = value.strip()
             return value or None
@@ -65,12 +68,14 @@ class ProviderConfig(BaseModel):
     @field_validator("timeout_seconds")
     @classmethod
     def _timeout_must_be_positive(cls, value: float) -> float:
+        """Reject zero/negative timeouts."""
         if value <= 0:
             raise ValueError("must be positive")
         return value
 
     @model_validator(mode="after")
     def _validate_provider_requirements(self) -> Self:
+        """Cross-field checks: base_url for OPENAI_CHAT, and some API key source."""
         if self.protocol == ApiProtocol.OPENAI_CHAT and self.base_url is None:
             raise ValueError("base_url is required for OPENAI_CHAT providers.")
         if self.api_key is None and self.api_key_env is None:
@@ -78,6 +83,7 @@ class ProviderConfig(BaseModel):
         return self
 
     def resolve_api_key(self) -> str:
+        """Return the real API key, from explicit config or the env var."""
         if self.api_key is not None:
             return self.api_key.get_secret_value()
         if self.api_key_env is not None:

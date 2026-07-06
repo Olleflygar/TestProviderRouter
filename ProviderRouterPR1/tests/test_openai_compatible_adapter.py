@@ -156,6 +156,8 @@ def test_adapter_parses_usage() -> None:
 
 @pytest.mark.parametrize("status_code", [401, 429])
 def test_http_errors_raise_provider_http_error(status_code: int) -> None:
+    """401 (auth) and 429 (rate limit) both map to the same ProviderHTTPError."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             status_code,

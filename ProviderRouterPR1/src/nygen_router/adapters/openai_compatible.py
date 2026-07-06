@@ -22,6 +22,7 @@ class OpenAICompatibleAdapter:
         self._transport = transport
 
     def invoke(self, request: RouterRequest) -> RouterResponse:
+        """POST the request to /chat/completions and normalize the response or raise."""
         name = self.config.name
         model = self.config.model
 
@@ -90,12 +91,14 @@ class OpenAICompatibleAdapter:
         )
 
     def _endpoint(self) -> str:
+        """Build the chat/completions URL, or raise if base_url is missing."""
         if self.config.base_url is None:
             raise ConfigError(f"Provider {self.config.name!r} has no base_url configured.")
         return f"{self.config.base_url.rstrip('/')}/chat/completions"
 
 
 def _raise_http_error(config: ProviderConfig, response: httpx.Response) -> NoReturn:
+    """Turn a non-2xx response into a ProviderHTTPError, chained from httpx's own error."""
     message, error_type, error_code, body = _parse_provider_error(response)
     try:
         # Produces a standard httpx.HTTPStatusError we chain from, so the
@@ -157,6 +160,7 @@ def _parse_provider_error(
 
 
 def _decode_json(response: httpx.Response, provider_name: str, model: str) -> dict[str, object]:
+    """Parse the body as a JSON object, or raise ProviderResponseError."""
     try:
         payload = response.json()
     except ValueError as exc:
@@ -180,6 +184,7 @@ def _decode_json(response: httpx.Response, provider_name: str, model: str) -> di
 
 
 def _extract_text(raw: dict[str, object], provider_name: str, model: str) -> str:
+    """Pull the assistant's message content out of the choices[0] shape."""
     choices = raw.get("choices")
     if not isinstance(choices, list) or not choices:
         raise ProviderResponseError(provider_name, model, "response is missing 'choices'", body=raw)
@@ -206,6 +211,7 @@ def _extract_text(raw: dict[str, object], provider_name: str, model: str) -> str
 
 
 def _extract_usage(raw: dict[str, object]) -> TokenUsage | None:
+    """Read token usage from the response if the provider included it."""
     usage = raw.get("usage")
     if not isinstance(usage, dict):
         return None

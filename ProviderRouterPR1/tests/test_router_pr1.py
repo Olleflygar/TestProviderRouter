@@ -38,6 +38,7 @@ def test_router_raises_no_providers_configured_with_no_providers() -> None:
 def test_router_invokes_first_enabled_openai_compatible_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Swap in a fake adapter (no real HTTP) to check provider selection only."""
     called_with: dict[str, str] = {}
 
     class FakeAdapter:
