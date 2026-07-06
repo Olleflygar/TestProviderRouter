@@ -4,7 +4,7 @@ import os
 from enum import StrEnum
 from typing import Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from nygen_router.errors import MissingApiKeyError
 
@@ -32,7 +32,7 @@ class ProviderConfig(BaseModel):
     protocol: ApiProtocol
     model: str
     base_url: str | None = None
-    api_key: str | None = None
+    api_key: SecretStr | None = None
     api_key_env: str | None = None
     enabled: bool = True
     timeout_seconds: float = 30.0
@@ -46,13 +46,21 @@ class ProviderConfig(BaseModel):
             raise ValueError("must not be empty")
         return value
 
-    @field_validator("base_url", "api_key", "api_key_env")
+    @field_validator("base_url", "api_key_env")
     @classmethod
     def _blank_strings_become_none(cls, value: str | None) -> str | None:
         if value is None:
             return None
         value = value.strip()
         return value or None
+
+    @field_validator("api_key", mode="before")
+    @classmethod
+    def _blank_api_key_becomes_none(cls, value: object) -> object:
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
 
     @field_validator("timeout_seconds")
     @classmethod
@@ -71,7 +79,7 @@ class ProviderConfig(BaseModel):
 
     def resolve_api_key(self) -> str:
         if self.api_key is not None:
-            return self.api_key
+            return self.api_key.get_secret_value()
         if self.api_key_env is not None:
             api_key = os.environ.get(self.api_key_env)
             if api_key:
