@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Callable
+
 from nygen_router.adapters.base import ProviderAdapter
 from nygen_router.adapters.openai_compatible import OpenAICompatibleAdapter
 from nygen_router.capabilities import validate_request_capabilities
@@ -7,10 +9,17 @@ from nygen_router.config import ApiProtocol, ProviderConfig
 from nygen_router.errors import NoProvidersConfiguredError, UnsupportedProtocolError
 from nygen_router.types import RouterRequest, RouterResponse
 
+AdapterFactory = Callable[[ProviderConfig], ProviderAdapter]
+
 
 class ProviderRouter:
-    def __init__(self, providers: list[ProviderConfig]):
+    def __init__(
+        self,
+        providers: list[ProviderConfig],
+        adapter_factory: AdapterFactory | None = None,
+    ):
         self.providers = list(providers)
+        self._adapter_factory = adapter_factory or self._default_adapter_for
 
     def invoke(self, input: str | RouterRequest) -> RouterResponse:
         """Pick a provider, check it can serve the request, and call it."""

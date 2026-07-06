@@ -67,6 +67,50 @@ Core design principles
 
 10. Storage and observability failures should not break successful LLM responses.
 
+Testing philosophy
+-------------------
+These rules apply to every PR from here on, not just PR 1.
+
+1. No monkeypatching of internal collaborators. Do not use
+   `monkeypatch.setattr(...)` or `unittest.mock.patch(...)` to reach into a
+   module and swap out a class/function/attribute it references internally
+   (e.g. patching `nygen_router.router.OpenAICompatibleAdapter`). Patching
+   internals like this couples the test suite to implementation details/module
+   paths instead of the public API, so an unrelated refactor (renaming an
+   import, restructuring a module) silently breaks tests that never should
+   have known that detail existed.
+
+   Instead, production code must expose a real seam for tests to use:
+   a constructor parameter, an injectable factory/protocol, or an already-
+   public extension point. Example already in this codebase:
+   `OpenAICompatibleAdapter(config, transport=httpx.MockTransport(handler))` --
+   the adapter accepts a `transport` argument, so tests inject a fake HTTP
+   transport without patching anything. `ProviderRouter` follows the same
+   pattern via its `adapter_factory` constructor argument, used instead of
+   patching the adapter class it references internally.
+
+   `monkeypatch.setenv` / `monkeypatch.delenv` for environment variables are
+   not covered by this rule -- they set process state that the code under
+   test is meant to read, not a fake replacing a real collaborator.
+
+   Every PR after this one tends to add more collaborators to fake (policies,
+   storage backends, health state) -- each of those needs its own constructor-
+   level seam, following this same pattern, rather than a new patch target.
+
+2. Do not delete existing tests as the project grows unless completely
+   necessary, and only after careful consideration. Each PR's suggested test
+   files (see each PR section below) are additive: new PRs get new test
+   files alongside the existing ones, which keep acting as regression
+   coverage for earlier behavior.
+
+   A test may be updated (not deleted) when a later PR deliberately changes
+   the behavior it was asserting -- e.g. PR 2 changes `invoke()` from "pick
+   the first enabled provider, validate only that one" to "filter the whole
+   list, then select among survivors," which changes what the PR 1 selection
+   test's assertions mean. In that case, update the test to match the new,
+   intentional behavior; do not delete it outright, and do not delete or
+   weaken tests just because they are inconvenient to keep passing.
+
 Recommended package structure
 -----------------------------
 nygen_router/
