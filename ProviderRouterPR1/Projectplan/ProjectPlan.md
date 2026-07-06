@@ -5,7 +5,15 @@ Project goal
 ------------
 Build nygen-router, a lightweight Python provider router for LLM calls.
 
-The router prioritizes provider routing, not model routing. The user chooses the model they want to run, and the router chooses the best configured provider for that model based on runtime observations such as latency, success rate, rate limits, tool-calling support, and user-configured token cost.
+The router prioritizes provider routing, not model routing. The user chooses the model they want to run, and the router chooses the best configured provider for that model based on runtime observations such as latency, success rate, rate limits, and tool-calling support.
+
+Cost is not part of the router's core routing/scoring logic. The main focus
+of this project is a pluggable router that works with minimal setup out of
+the box, and is easy to customize if someone wants different routing logic.
+An automatic token-price scraper will not be built (provider pricing changes
+too fast to scrape reliably at this project's scale). Manually-configured
+token pricing may be added later as an optional, user-supplied customization
+(see PR 6), but it is deferred and does not gate the core sprint.
 
 Core design principles
 ----------------------
@@ -374,7 +382,6 @@ CREATE TABLE provider_attempts (
     latency_ms REAL,
     input_tokens INTEGER,
     output_tokens INTEGER,
-    estimated_cost_usd REAL,
     error_type TEXT,
     required_tools INTEGER NOT NULL,
     request_size_bucket TEXT NOT NULL
@@ -446,15 +453,25 @@ Tests:
 - auth error disables provider for current run, and appears in
   RouterResponse.excluded with an auth-disabled FilterReason
 
-PR 6: Token cost calculation
-----------------------------
-Goal:
+PR 6: Token cost calculation (deferred, optional)
+--------------------------------------------------
+Status:
+Deferred and out of the core/near-term scope. Cost is not a factor in the
+router's routing or scoring decisions (see Project goal). This PR exists as
+a possible later, opt-in customization for users who want cost visibility,
+not as something the core sprint depends on. It does not gate PR 7-10 or
+the "80% sprint" boundary below -- PR 7's stats, PR 8's scoring factors, and
+PR 9's routing policy are all designed to work with zero cost data.
+
+Goal (if/when built):
 Calculate estimated cost from user-provided pricing.
 
 Scope:
 - TokenPricing
 - cost calculation helper
 - cost field in metrics event
+- adds the estimated_cost_usd column to the provider_attempts schema (PR 4
+  ships without this column; this PR adds it via a schema change)
 
 Important rule:
 Do not scrape provider prices. Users configure cost per million tokens.
@@ -494,10 +511,12 @@ Stats to compute:
 - success count
 - success rate
 - average latency
-- average cost
 - rate limit count
 - timeout count
 - recent error count
+
+Note: no cost stat here -- cost is deferred/optional (see PR 6) and is not
+part of the core aggregation this PR needs to produce.
 
 Tests:
 - aggregates by provider
@@ -525,14 +544,17 @@ Rules:
 First scoring factors:
 - success rate
 - latency
-- cost
 - recent errors
 - exploration bonus
+
+Note: cost is deliberately not a default scoring factor (see Project goal
+and PR 6). If manual cost tracking is ever built, it could be wired in as an
+additional optional weight in ScoreWeights later, but it is not part of the
+core scoring model.
 
 Tests:
 - higher success rate improves score
 - lower latency improves score
-- lower cost improves score
 - recent errors reduce score
 - unknown provider gets exploration bonus
 
@@ -668,9 +690,12 @@ Scope:
 Add predefined routing profiles:
 - balanced
 - fastest
-- cheapest
 - most_reliable
 - tool_heavy
+
+Note: no "cheapest" profile -- cost is deferred/optional (see PR 6) and
+isn't part of the core scoring model, so a cost-driven profile doesn't apply
+unless/until PR 6 ships.
 
 Each profile controls:
 - score weights
@@ -762,7 +787,6 @@ That gives the project:
 - fallback
 - SQLite memory
 - health/cooldowns
-- cost tracking
 - metrics aggregation
 - basic scoring
 - recency-aware routing
@@ -777,7 +801,7 @@ I configured 3 providers for the same model.
 The router called them.
 One failed.
 The router fell back.
-The router stored latency, success, token usage, and estimated cost.
+The router stored latency, success, and token usage.
 After enough calls, the router started preferring the better provider.
 
 Quality commands
