@@ -16,5 +16,6 @@ src/nygen_router/adapters/__init__.py
 src/nygen_router/adapters/base.py
 src/nygen_router/adapters/openai_compatible.py
 tests/test_config.py
+tests/test_live_provider.py
 tests/test_openai_compatible_adapter.py
 tests/test_router_pr1.py
