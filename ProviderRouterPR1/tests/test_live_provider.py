@@ -14,13 +14,12 @@ import os
 import string
 
 import pytest
+from dotenv import load_dotenv
 
 from nygen_router import ApiProtocol, ChatMessage, ProviderConfig, RouterRequest
 from nygen_router.router import ProviderRouter
 
-from dotenv import load_dotenv
 load_dotenv()
-
 
 
 # --- EDIT ME: point this at the provider you want to verify -----------------

@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import httpx
 
+    from nygen_router.types import EligibilityResult
+
 
 class NygenRouterError(Exception):
     """Base class for every error raised by nygen-router.
@@ -44,20 +46,22 @@ class UnsupportedProtocolError(NygenRouterError):
         )
 
 
-class CapabilityError(NygenRouterError):
-    """The request needs a capability the chosen provider does not declare."""
-
-    def __init__(self, provider_name: str, capability: str) -> None:
-        self.provider_name = provider_name
-        self.capability = capability
-        super().__init__(
-            f"Provider {provider_name!r} does not support {capability}, "
-            f"which this request requires."
-        )
-
-
 class NoProvidersConfiguredError(ConfigError):
     """No usable provider was available when routing a request."""
+
+
+class NoEligibleProvidersError(NygenRouterError):
+    """Every configured provider was filtered out before any call was made.
+
+    Per the transparency principle, the message enumerates each excluded
+    provider with its own specific reason rather than a single blended
+    summary; the structured results stay available on ``.exclusions``.
+    """
+
+    def __init__(self, exclusions: list[EligibilityResult]) -> None:
+        self.exclusions = exclusions
+        detail = "; ".join(f"{result.provider_name}: {result.detail}" for result in exclusions)
+        super().__init__(f"No eligible providers for this request: {detail}.")
 
 
 class ProviderError(NygenRouterError):

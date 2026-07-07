@@ -1,12 +1,13 @@
 # nygen-router
 
 `nygen-router` is a lightweight foundation for routing a request to one of several
-providers that can serve the same model. PR 1 intentionally keeps behavior simple:
-it validates provider configuration, normalizes input, checks basic requested
-capabilities, and calls the first enabled OpenAI-compatible provider with `httpx`.
+providers that can serve the same model. It validates provider configuration,
+normalizes input, filters out providers that cannot satisfy the request (hard
+filters), and calls the first eligible OpenAI-compatible provider with `httpx`.
 
-PR 1 only supports OpenAI-compatible `chat/completions`. Round robin, SQLite,
-scoring, the Responses API, and framework adapters are future PRs.
+Only OpenAI-compatible `chat/completions` is implemented so far. Round robin,
+fallback, SQLite memory, scoring, the Responses API, and framework adapters are
+future PRs.
 
 ## Local Development
 
@@ -64,6 +65,34 @@ export PROVIDER_A_API_KEY="your-key"
 API keys can also be passed explicitly with `api_key`, but keys are never printed
 or included in router responses.
 
+## Hard filtering and response transparency
+
+Before routing, the router filters the full provider list down to providers that
+can satisfy the request. Filters are hard, not scores: a provider that fails an
+essential check — disabled, no API key available, unsupported protocol, or a
+missing required capability (tool-calling, streaming, or JSON mode) — is
+excluded, not ranked lower.
+
+Every response reports what happened, so routing is never a black box:
+
+- `response.attempts` — one `ProviderAttempt` per provider actually invoked. In
+  this PR that is always exactly one (the provider that served the call);
+  fallback across providers arrives in a later PR.
+- `response.excluded` — one `EligibilityResult` per provider filtered out before
+  any call, each carrying a specific `FilterReason` and human-readable `detail`.
+  Populated on every call, success or not.
+
+If filtering removes every configured provider, `invoke()` raises
+`NoEligibleProvidersError`, whose message enumerates each excluded provider with
+its own specific reason rather than a single blended summary.
+
+```python
+response = router.invoke("Hello")
+print(response.text)
+print([a.provider_name for a in response.attempts])          # provider(s) called
+print([(e.provider_name, e.reason) for e in response.excluded])  # who was filtered, and why
+```
+
 ## Errors
 
 The router is deliberately transparent about failures — no "peel the onion"
@@ -78,12 +107,11 @@ debugging. The contract:
   `response`. The standard `httpx.HTTPStatusError` stays reachable via
   `__cause__`.
 - **The error type names the stage.** `ConfigError` / `MissingApiKeyError`
-  (configuration), `CapabilityError` (requested capability unavailable),
-  `NoProvidersConfiguredError` (selection), `UnsupportedProtocolError` (adapter
-  selection), `ProviderTimeoutError` / `ProviderConnectionError` /
-  `ProviderError` (transport), `ProviderHTTPError` (HTTP status),
-  `ProviderResponseError` (unparseable 2xx). Messages always name the provider
-  and model.
+  (configuration), `NoProvidersConfiguredError` (no providers configured),
+  `NoEligibleProvidersError` (all providers filtered out), `ProviderTimeoutError`
+  / `ProviderConnectionError` / `ProviderError` (transport), `ProviderHTTPError`
+  (HTTP status), `ProviderResponseError` (unparseable 2xx). Messages always name
+  the provider and model.
 - **Originals are chained, never re-wrapped.** Transport failures keep the exact
   `httpx` exception type in the message and attach it as both `__cause__` and
   `.original`.

@@ -5,15 +5,15 @@ import pytest
 from nygen_router import (
     ApiProtocol,
     ChatMessage,
+    FilterReason,
     ProviderConfig,
     ProviderRouter,
     RouterRequest,
     RouterResponse,
 )
 from nygen_router.errors import (
-    CapabilityError,
+    NoEligibleProvidersError,
     NoProvidersConfiguredError,
-    UnsupportedProtocolError,
 )
 
 
@@ -84,7 +84,8 @@ def test_router_normalizes_string_input_into_user_message() -> None:
     assert response.text == "user:Hello"
 
 
-def test_router_raises_unsupported_protocol_for_unimplemented_protocol() -> None:
+def test_router_excludes_provider_with_unsupported_protocol() -> None:
+    """PR2: an unsupported protocol is a hard filter, not a raised UnsupportedProtocolError."""
     router = ProviderRouter(
         providers=[
             ProviderConfig(
@@ -96,11 +97,16 @@ def test_router_raises_unsupported_protocol_for_unimplemented_protocol() -> None
         ]
     )
 
-    with pytest.raises(UnsupportedProtocolError):
+    with pytest.raises(NoEligibleProvidersError) as exc_info:
         router.invoke("Hello")
 
+    assert "anthropic" in str(exc_info.value)
+    assert exc_info.value.exclusions[0].reason is FilterReason.UNSUPPORTED_PROTOCOL
 
-def test_router_rejects_tool_request_if_provider_does_not_support_tools() -> None:
+
+def test_router_excludes_tool_request_when_provider_lacks_tool_support() -> None:
+    """PR2: a missing required capability excludes the provider instead of raising."""
+
     class FakeAdapter:
         def __init__(self, config: ProviderConfig):
             self.config = config
@@ -114,8 +120,9 @@ def test_router_rejects_tool_request_if_provider_does_not_support_tools() -> Non
         requires_tools=True,
     )
 
-    with pytest.raises(CapabilityError) as exc_info:
+    with pytest.raises(NoEligibleProvidersError) as exc_info:
         router.invoke(request)
 
-    assert exc_info.value.provider_name == "provider_a"
-    assert "tool calls" in str(exc_info.value)
+    assert "provider_a" in str(exc_info.value)
+    assert "tool-calling" in str(exc_info.value)
+    assert exc_info.value.exclusions[0].reason is FilterReason.MISSING_TOOLS

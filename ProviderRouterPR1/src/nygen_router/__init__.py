@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from nygen_router.config import ApiProtocol, ProviderCapabilities, ProviderConfig
 from nygen_router.errors import (
-    CapabilityError,
     ConfigError,
     MissingApiKeyError,
+    NoEligibleProvidersError,
     NoProvidersConfiguredError,
     NygenRouterError,
     ProviderConnectionError,
@@ -14,17 +14,29 @@ from nygen_router.errors import (
     ProviderTimeoutError,
     UnsupportedProtocolError,
 )
+from nygen_router.filters import filter_eligible_providers
 from nygen_router.router import ProviderRouter
-from nygen_router.types import ChatMessage, RouterRequest, RouterResponse, TokenUsage
+from nygen_router.types import (
+    ChatMessage,
+    EligibilityResult,
+    FilterReason,
+    ProviderAttempt,
+    RouterRequest,
+    RouterResponse,
+    TokenUsage,
+)
 
 __all__ = [
     "ApiProtocol",
-    "CapabilityError",
     "ChatMessage",
     "ConfigError",
+    "EligibilityResult",
+    "FilterReason",
     "MissingApiKeyError",
+    "NoEligibleProvidersError",
     "NoProvidersConfiguredError",
     "NygenRouterError",
+    "ProviderAttempt",
     "ProviderCapabilities",
     "ProviderConfig",
     "ProviderConnectionError",
@@ -37,4 +49,5 @@ __all__ = [
     "RouterResponse",
     "TokenUsage",
     "UnsupportedProtocolError",
+    "filter_eligible_providers",
 ]

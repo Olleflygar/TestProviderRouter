@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from enum import StrEnum
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ChatMessage(BaseModel):
@@ -36,6 +38,43 @@ class TokenUsage(BaseModel):
     total_tokens: int | None = None
 
 
+class FilterReason(StrEnum):
+    """Why a provider was excluded by a hard filter before any call was made."""
+
+    DISABLED = "disabled"
+    MISSING_API_KEY = "missing_api_key"
+    UNSUPPORTED_PROTOCOL = "unsupported_protocol"
+    MISSING_TOOLS = "missing_tools"
+    MISSING_STREAMING = "missing_streaming"
+    MISSING_JSON_MODE = "missing_json_mode"
+
+
+class EligibilityResult(BaseModel):
+    """One excluded provider, with its specific reason and human-readable detail."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider_name: str
+    reason: FilterReason
+    detail: str
+
+
+class ProviderAttempt(BaseModel):
+    """One provider actually invoked during a call.
+
+    ``error`` holds the provider's real exception object on failure (never a
+    router-rephrased summary), so ``arbitrary_types_allowed`` is required. In
+    PR2 there is no fallback, so a returned response carries exactly one
+    attempt and it always succeeded.
+    """
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    provider_name: str
+    success: bool
+    error: Exception | None = None
+
+
 class RouterResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -44,3 +83,5 @@ class RouterResponse(BaseModel):
     text: str
     raw: dict[str, object] | None = None
     usage: TokenUsage | None = None
+    attempts: list[ProviderAttempt] = Field(default_factory=list)
+    excluded: list[EligibilityResult] = Field(default_factory=list)

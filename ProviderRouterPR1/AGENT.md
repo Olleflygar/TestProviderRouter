@@ -8,8 +8,12 @@ Implementation rules for this PR 1 package:
 - Do not add LangChain, Pydantic AI, DuckDB, Supabase, or OpenTelemetry in PR 1.
 - Do not leak API keys in errors, logs, responses, or tests.
 - Use typed models, not raw dictionaries in core APIs.
-- Tests must not require real API keys.
-- PR 1 only supports OpenAI-compatible chat/completions.
+- Required tests must not require real API keys (a live provider test may exist,
+  but it must skip when its key is unset).
+- Only OpenAI-compatible chat/completions is implemented so far. PR 2 adds hard
+  filters (eligibility) that run before routing; excluded providers are reported
+  on `RouterResponse.excluded`, and every unsupported protocol or missing
+  required capability is a filter exclusion, not a raised error.
 
 ## Error transparency (non-negotiable)
 
