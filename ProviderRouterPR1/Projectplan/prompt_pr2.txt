@@ -1,0 +1,224 @@
+You are implementing PR 2 ("Essential hard filters") of the nygen-router package.
+
+You are working inside the existing repository, modifying it in place. Do not
+create a new sibling folder.
+
+Before writing any code, read these in full:
+
+1. Projectplan/ProjectPlan.md — especially: Project goal, Core design
+   principles, Testing philosophy, the PR 1 section (response transparency),
+   and the PR 2 section. The Testing philosophy and the transparency
+   principle are binding for this PR.
+2. The current source under src/nygen_router/ and the tests under tests/.
+
+⸻
+
+Git workflow
+
+Work directly on the current branch (main) in this folder.
+
+Before changing anything:
+- Confirm the working tree is clean; if not, stop and report what is pending.
+- Ensure a tag named pr1-complete exists. If it does not, create it on the
+  current commit: git tag pr1-complete
+
+Commit at logical milestones with clear messages. When every quality gate
+below passes, create the tag pr2-complete on the final commit.
+
+⸻
+
+Known deviations from the plan (read carefully)
+
+The plan's PR 1 section says RouterResponse already carries `attempts` and
+`excluded` fields. In the real code it does not: PR 1 shipped without them,
+and the ProviderAttempt / EligibilityResult types do not exist anywhere.
+PR 2 must therefore add all of this now:
+
+- EligibilityResult and ProviderAttempt types (see types below)
+- RouterResponse.excluded: list[EligibilityResult] — populated with real
+  content on every call; this is PR 2's core job
+- RouterResponse.attempts: list[ProviderAttempt] — schema added now so PR 3
+  does not need a breaking change to a public response type; in PR 2 it
+  always contains exactly one entry (the single provider actually invoked)
+
+Also present in the current code: capabilities.py has
+validate_request_capabilities() raising CapabilityError, called from
+ProviderRouter.invoke(). PR 2 retires that path (see control flow below).
+
+⸻
+
+Goal
+
+Before routing, filter the whole provider list down to providers that can
+satisfy the request, and make every exclusion transparent to the caller.
+
+Important principle: hard filters are not scores. A provider that cannot
+support tools is EXCLUDED for a tool request, never ranked lower.
+
+⸻
+
+filters.py (new module: src/nygen_router/filters.py)
+
+Implement:
+
+- FilterReason: an enum of exclusion reasons (per the plan's
+  enums-for-capability-flags principle). Cover at least: provider disabled,
+  API key unavailable, protocol unsupported, missing tool-calling support,
+  missing streaming support, missing JSON-mode support.
+
+- EligibilityResult: one record per excluded provider, carrying the provider
+  name, its FilterReason, and a specific human-readable detail string
+  (e.g. "missing tool-calling support").
+
+- filter_eligible_providers(...): takes the full provider list and the
+  request, returns the eligible providers and the exclusions (one
+  EligibilityResult per excluded provider). Essential filters:
+
+  * provider enabled
+  * API key available (resolvable from api_key or a populated api_key_env —
+    check without raising and without exposing the key)
+  * protocol supported by the router (only OPENAI_CHAT has an adapter today)
+  * model configured
+  * tool-calling support, if request.requires_tools
+  * streaming support, if request.requires_streaming
+  * JSON mode support, if request.requires_json_mode
+
+- RequestRequirements: the plan lists this type in PR 2 scope. Implement it
+  as a small internal record (dataclass, per the plan's typing principles)
+  derived from RouterRequest if it makes the filter interface clearer. If
+  passing RouterRequest directly is cleaner, that is acceptable — state the
+  choice and its reason in your completion report.
+
+⸻
+
+types.py additions
+
+- ProviderAttempt: provider_name, success flag, and the real underlying
+  error object if the attempt failed — the actual exception, never a
+  router-rephrased summary. None on success.
+
+- EligibilityResult and ProviderAttempt appear on the public RouterResponse,
+  so prefer Pydantic models for consistency with the rest of types.py. Note:
+  holding a real exception object in a Pydantic field requires allowing
+  arbitrary types on that model's config.
+
+- RouterResponse gains two fields, both defaulting to empty lists (use
+  default_factory):
+    attempts: list[ProviderAttempt]
+    excluded: list[EligibilityResult]
+
+⸻
+
+Router control flow change (router.py)
+
+invoke() changes from "pick the first enabled provider, then validate
+capabilities against only that one" to:
+
+1. Filter the whole provider list with filter_eligible_providers.
+2. Among eligible survivors, select the first (no rotation — that is PR 3).
+3. Invoke it via the adapter, as today.
+4. Return a RouterResponse whose `excluded` lists every filtered-out
+   provider with its specific reason (populated on EVERY call, success or
+   not) and whose `attempts` contains exactly the one invoked provider.
+
+CapabilityError is retired from the invoke() path — it must no longer be
+reachable from a normal invoke() call. If nothing references CapabilityError
+or validate_request_capabilities after the refactor, remove them and update
+their tests to the new behavior. This is the deliberate, plan-sanctioned
+behavior change described in the Testing philosophy; it is not a license to
+weaken unrelated tests.
+
+If filtering excludes every configured provider, raise
+NoEligibleProvidersError (new, in errors.py, inside the existing exception
+hierarchy). Per the transparency principle, its message must enumerate every
+excluded provider with its own specific reason, e.g.
+"provider_a: missing tool-calling support; provider_c: disabled" —
+never a single blended "no eligible providers" message.
+
+Keep NoProvidersConfiguredError for the empty-provider-list case.
+
+⸻
+
+__init__.py exports
+
+Add: FilterReason, EligibilityResult, ProviderAttempt,
+NoEligibleProvidersError, filter_eligible_providers.
+
+This must keep working with no optional dependencies installed:
+
+from nygen_router import ProviderRouter
+
+⸻
+
+Out of scope — do not implement
+
+- round robin / rotation, fallback to a second provider, retries (PR 3)
+- SQLite or metrics storage (PR 4)
+- health state / cooldowns (PR 5)
+- scoring (PR 8+)
+- new adapters or protocols
+
+⸻
+
+Testing rules (binding, from the plan's Testing philosophy)
+
+- No monkeypatching of internal collaborators: no monkeypatch.setattr or
+  unittest.mock.patch reaching into modules to swap classes/functions. Use
+  the existing constructor seams instead:
+  OpenAICompatibleAdapter(config, transport=httpx.MockTransport(handler))
+  and ProviderRouter(providers, adapter_factory=...).
+  monkeypatch.setenv / monkeypatch.delenv for environment variables are
+  allowed.
+
+- Do not delete existing tests. Tests in test_router_pr1.py whose asserted
+  behavior deliberately changes in PR 2 (first-enabled selection; capability
+  rejection raising CapabilityError) must be UPDATED to assert the new
+  intentional behavior, not removed.
+
+- tests/test_live_provider.py is a live integration test that auto-skips
+  when its API key environment variable is unset. Leave it as-is; it must
+  keep collecting and skipping cleanly.
+
+New test file: tests/test_filters.py. Cover at minimum:
+
+- provider without an API key is excluded, with the matching FilterReason
+- disabled provider is excluded
+- provider without tool support is excluded when the request requires tools
+- provider without streaming is excluded when the request requires streaming
+- all providers filtered out raises NoEligibleProvidersError, and the error
+  message names each excluded provider with its own specific reason
+- a successful call still reports filtered-out providers in
+  RouterResponse.excluded
+- a successful call populates RouterResponse.attempts with exactly the one
+  invoked provider
+
+⸻
+
+Docs
+
+- Update README.md: describe hard filtering, the excluded/attempts response
+  fields, and NoEligibleProvidersError; adjust the "future PRs" note so it
+  no longer lists hard filters as future work.
+- Update AGENT.md where it describes PR 1-only behavior.
+
+⸻
+
+Quality gates
+
+All of these must pass before you declare PR 2 done. Use the project's own
+virtual environment (.venv in the repo), not the system Python:
+
+ruff format .
+ruff check .
+mypy src
+pytest
+coverage run -m pytest
+coverage report
+
+⸻
+
+Completion report
+
+End with: files changed; the behavior changes made; any judgment calls
+(RequestRequirements decision, whether CapabilityError was removed) with a
+one-line reason each; and the verbatim results of the quality-gate commands.
