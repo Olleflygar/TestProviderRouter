@@ -18,11 +18,17 @@ import pytest
 from nygen_router import ApiProtocol, ChatMessage, ProviderConfig, RouterRequest
 from nygen_router.router import ProviderRouter
 
+from dotenv import load_dotenv
+import os
+load_dotenv()
+
+
+
 # --- EDIT ME: point this at the provider you want to verify -----------------
-LIVE_PROVIDER_NAME = "openai"
-LIVE_BASE_URL = "https://api.openai.com/v1"
-LIVE_MODEL = "gpt-4o-mini"
-LIVE_API_KEY_ENV = "OPENAI_API_KEY"  # env var holding the key; never put the key itself here
+LIVE_PROVIDER_NAME = "DeepInfra"
+LIVE_BASE_URL = "https://api.deepinfra.com/v1"
+LIVE_MODEL = "deepseek-r1"
+LIVE_API_KEY_ENV = os.environ["DeepInfra_API_KEY"]  # env var holding the key; never put the key itself here
 # -----------------------------------------------------------------------------
 
 requires_live_key = pytest.mark.skipif(
