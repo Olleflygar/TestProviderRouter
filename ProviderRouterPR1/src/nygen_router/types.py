@@ -42,6 +42,7 @@ class FilterReason(StrEnum):
     """Why a provider was excluded by a hard filter before any call was made."""
 
     DISABLED = "disabled"
+    AUTH_DISABLED_THIS_RUN = "auth_disabled_this_run"
     MISSING_API_KEY = "missing_api_key"
     UNSUPPORTED_PROTOCOL = "unsupported_protocol"
     MISSING_TOOLS = "missing_tools"

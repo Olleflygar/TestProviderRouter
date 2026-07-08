@@ -12,9 +12,11 @@ from nygen_router.errors import (
     ProviderHTTPError,
     ProviderResponseError,
     ProviderTimeoutError,
+    RouterExhaustedError,
     UnsupportedProtocolError,
 )
 from nygen_router.filters import filter_eligible_providers
+from nygen_router.policies import RoundRobinPolicy
 from nygen_router.router import ProviderRouter
 from nygen_router.types import (
     ChatMessage,
@@ -45,6 +47,8 @@ __all__ = [
     "ProviderResponseError",
     "ProviderRouter",
     "ProviderTimeoutError",
+    "RoundRobinPolicy",
+    "RouterExhaustedError",
     "RouterRequest",
     "RouterResponse",
     "TokenUsage",

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from enum import StrEnum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import httpx
 
-    from nygen_router.types import EligibilityResult
+    from nygen_router.types import EligibilityResult, ProviderAttempt
 
 
 class NygenRouterError(Exception):
@@ -62,6 +63,21 @@ class NoEligibleProvidersError(NygenRouterError):
         self.exclusions = exclusions
         detail = "; ".join(f"{result.provider_name}: {result.detail}" for result in exclusions)
         super().__init__(f"No eligible providers for this request: {detail}.")
+
+
+class RouterExhaustedError(NygenRouterError):
+    """Every eligible provider that was actually tried failed.
+
+    Per the transparency principle, the message enumerates each attempted
+    provider with its own real, distinct failure rather than a single blended
+    summary; the structured attempts (each with its unwrapped error object)
+    stay available on ``.attempts``.
+    """
+
+    def __init__(self, attempts: list[ProviderAttempt]) -> None:
+        self.attempts = attempts
+        detail = "; ".join(f"{attempt.provider_name}: {attempt.error}" for attempt in attempts)
+        super().__init__(f"All attempted providers failed: {detail}.")
 
 
 class ProviderError(NygenRouterError):
@@ -166,3 +182,34 @@ def _http_reason(status_code: int) -> str:
         return HTTPStatus(status_code).phrase
     except ValueError:
         return ""
+
+
+class ErrorCategory(StrEnum):
+    """How a provider failure is classified to decide fallback behavior.
+
+    Internal to the router's fallback loop; not part of any public response
+    schema.
+    """
+
+    TIMEOUT = "timeout"
+    RATE_LIMIT = "rate_limit"
+    AUTH = "auth"
+    SERVER_ERROR = "server_error"
+    BAD_REQUEST = "bad_request"
+    UNKNOWN = "unknown"
+
+
+def categorize_error(exc: Exception) -> ErrorCategory:
+    """Classify a provider failure so the fallback loop can decide what to do."""
+    if isinstance(exc, ProviderTimeoutError):
+        return ErrorCategory.TIMEOUT
+    if isinstance(exc, ProviderHTTPError):
+        status = exc.status_code
+        if status == 429:
+            return ErrorCategory.RATE_LIMIT
+        if status in (401, 403):
+            return ErrorCategory.AUTH
+        if status >= 500:
+            return ErrorCategory.SERVER_ERROR
+        return ErrorCategory.BAD_REQUEST
+    return ErrorCategory.UNKNOWN

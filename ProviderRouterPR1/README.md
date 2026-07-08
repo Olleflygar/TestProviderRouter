@@ -3,11 +3,11 @@
 `nygen-router` is a lightweight foundation for routing a request to one of several
 providers that can serve the same model. It validates provider configuration,
 normalizes input, filters out providers that cannot satisfy the request (hard
-filters), and calls the first eligible OpenAI-compatible provider with `httpx`.
+filters), rotates between the eligible OpenAI-compatible providers (round robin),
+and falls back to another eligible provider when one fails — all with `httpx`.
 
-Only OpenAI-compatible `chat/completions` is implemented so far. Round robin,
-fallback, SQLite memory, scoring, the Responses API, and framework adapters are
-future PRs.
+Only OpenAI-compatible `chat/completions` is implemented so far. SQLite memory,
+scoring, the Responses API, and framework adapters are future PRs.
 
 ## Local Development
 
@@ -75,9 +75,9 @@ excluded, not ranked lower.
 
 Every response reports what happened, so routing is never a black box:
 
-- `response.attempts` — one `ProviderAttempt` per provider actually invoked. In
-  this PR that is always exactly one (the provider that served the call);
-  fallback across providers arrives in a later PR.
+- `response.attempts` — one `ProviderAttempt` per provider actually invoked, in
+  order. With fallback this can be several: each failed attempt carries the
+  provider's real, unwrapped error object, and the last one is the success.
 - `response.excluded` — one `EligibilityResult` per provider filtered out before
   any call, each carrying a specific `FilterReason` and human-readable `detail`.
   Populated on every call, success or not.
@@ -91,6 +91,39 @@ response = router.invoke("Hello")
 print(response.text)
 print([a.provider_name for a in response.attempts])          # provider(s) called
 print([(e.provider_name, e.reason) for e in response.excluded])  # who was filtered, and why
+```
+
+## Round robin and fallback
+
+The router rotates between eligible providers across successive `invoke()` calls
+(round robin), so load is spread rather than always hitting the first provider.
+Rotation is per-process only — there is no persistence across restarts yet.
+
+When a selected provider fails, the router falls back to the next eligible
+provider instead of failing the whole request. Failures are classified to decide
+what happens next:
+
+- **Timeout, rate limit (HTTP 429), server error (5xx), or unknown** — try the
+  next eligible provider.
+- **Auth (HTTP 401/403)** — record the failure, try the next provider, and bench
+  the failing provider for the rest of this process. It is then excluded from
+  later calls on the same router with `FilterReason.AUTH_DISABLED_THIS_RUN`.
+- **Bad request (other 4xx, e.g. 400)** — stop immediately. A malformed request
+  is unlikely to fare better on another provider, and trying more would only
+  bury the real cause under unrelated failures.
+
+If every provider actually tried fails (or a bad request stops the run early),
+`invoke()` raises `RouterExhaustedError`, whose message enumerates each attempted
+provider with its own real, distinct failure; the structured attempts (each with
+its unwrapped error) stay on `error.attempts`.
+
+Round robin plus fallback is the default with no configuration. To override the
+selection order, pass a `policy` to the constructor:
+
+```python
+from nygen_router import ProviderRouter, RoundRobinPolicy
+
+router = ProviderRouter(providers=[...], policy=RoundRobinPolicy())
 ```
 
 ## Errors
@@ -108,7 +141,8 @@ debugging. The contract:
   `__cause__`.
 - **The error type names the stage.** `ConfigError` / `MissingApiKeyError`
   (configuration), `NoProvidersConfiguredError` (no providers configured),
-  `NoEligibleProvidersError` (all providers filtered out), `ProviderTimeoutError`
+  `NoEligibleProvidersError` (all providers filtered out before any call),
+  `RouterExhaustedError` (every provider tried failed), `ProviderTimeoutError`
   / `ProviderConnectionError` / `ProviderError` (transport), `ProviderHTTPError`
   (HTTP status), `ProviderResponseError` (unparseable 2xx). Messages always name
   the provider and model.
