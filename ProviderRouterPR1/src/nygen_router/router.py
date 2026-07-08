@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 
 from nygen_router.adapters.base import ProviderAdapter
 from nygen_router.adapters.openai_compatible import OpenAICompatibleAdapter
@@ -32,10 +32,18 @@ class ProviderRouter:
         providers: list[ProviderConfig],
         adapter_factory: AdapterFactory | None = None,
         policy: Policy | None = None,
+        supported_protocols: Collection[ApiProtocol] | None = None,
     ):
         self.providers = list(providers)
         self._adapter_factory = adapter_factory or self._default_adapter_for
         self._policy = policy or RoundRobinPolicy()
+        # A custom adapter_factory that serves more protocols must pass the
+        # matching set here, or the eligibility filter keeps excluding them.
+        self._supported_protocols = (
+            frozenset(supported_protocols)
+            if supported_protocols is not None
+            else SUPPORTED_PROTOCOLS
+        )
         # Per-run provider health, visible to the eligibility filter and any
         # policy. Not persisted across process restarts (PR3 scope).
         self._health: dict[str, ProviderHealthState] = {}
@@ -49,7 +57,7 @@ class ProviderRouter:
         eligible, excluded = filter_eligible_providers(
             self.providers,
             request,
-            supported_protocols=SUPPORTED_PROTOCOLS,
+            supported_protocols=self._supported_protocols,
             disabled_this_run=self._auth_disabled_names(),
         )
         if not eligible:

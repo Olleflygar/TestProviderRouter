@@ -5,7 +5,8 @@ real request to the provider configured below. It auto-skips when the API key
 environment variable is not set, so plain ``pytest`` stays free and offline on
 machines without credentials.
 
-To run it: ``export OPENAI_API_KEY=sk-...`` then ``pytest tests/test_live_provider.py``.
+To run it: set the env var named by ``LIVE_API_KEY_ENV`` below (directly or via
+a ``.env`` file), then ``pytest tests/test_live_provider.py``.
 """
 
 from __future__ import annotations

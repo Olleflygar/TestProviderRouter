@@ -5,6 +5,5 @@ pydantic<3,>=2
 coverage<8,>=7
 mypy<2,>=1
 pytest<9,>=7
-pytest-asyncio<1,>=0.23
-respx<1,>=0.20
+python-dotenv<2,>=1
 ruff<1,>=0.6

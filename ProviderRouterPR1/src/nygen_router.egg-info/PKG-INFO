@@ -10,18 +10,18 @@ Provides-Extra: dev
 Requires-Dist: coverage<8,>=7; extra == "dev"
 Requires-Dist: mypy<2,>=1; extra == "dev"
 Requires-Dist: pytest<9,>=7; extra == "dev"
-Requires-Dist: pytest-asyncio<1,>=0.23; extra == "dev"
-Requires-Dist: respx<1,>=0.20; extra == "dev"
+Requires-Dist: python-dotenv<2,>=1; extra == "dev"
 Requires-Dist: ruff<1,>=0.6; extra == "dev"
 
 # nygen-router
 
 `nygen-router` is a lightweight foundation for routing a request to one of several
-providers that can serve the same model. PR 1 intentionally keeps behavior simple:
-it validates provider configuration, normalizes input, checks basic requested
-capabilities, and calls the first enabled OpenAI-compatible provider with `httpx`.
+providers that can serve the same model. It validates provider configuration,
+normalizes input, filters out providers that cannot satisfy the request (hard
+filters), rotates between the eligible OpenAI-compatible providers (round robin),
+and falls back to another eligible provider when one fails — all with `httpx`.
 
-PR 1 only supports OpenAI-compatible `chat/completions`. Round robin, SQLite,
+Only OpenAI-compatible `chat/completions` is implemented so far. SQLite memory,
 scoring, the Responses API, and framework adapters are future PRs.
 
 ## Local Development
@@ -80,6 +80,73 @@ export PROVIDER_A_API_KEY="your-key"
 API keys can also be passed explicitly with `api_key`, but keys are never printed
 or included in router responses.
 
+## Hard filtering and response transparency
+
+Before routing, the router filters the full provider list down to providers that
+can satisfy the request. Filters are hard, not scores: a provider that fails an
+essential check — disabled, no API key available, unsupported protocol, or a
+missing required capability (tool-calling, streaming, or JSON mode) — is
+excluded, not ranked lower.
+
+Note: the `requires_tools` / `requires_streaming` / `requires_json_mode` request
+flags affect provider *eligibility* only. The adapter does not yet send the
+corresponding request parameters (`stream`, `tools`, `response_format`) — those
+arrive with the PRs that implement each feature, so today the call itself is
+always a plain, non-streamed chat completion.
+
+Every response reports what happened, so routing is never a black box:
+
+- `response.attempts` — one `ProviderAttempt` per provider actually invoked, in
+  order. With fallback this can be several: each failed attempt carries the
+  provider's real, unwrapped error object, and the last one is the success.
+- `response.excluded` — one `EligibilityResult` per provider filtered out before
+  any call, each carrying a specific `FilterReason` and human-readable `detail`.
+  Populated on every call, success or not.
+
+If filtering removes every configured provider, `invoke()` raises
+`NoEligibleProvidersError`, whose message enumerates each excluded provider with
+its own specific reason rather than a single blended summary.
+
+```python
+response = router.invoke("Hello")
+print(response.text)
+print([a.provider_name for a in response.attempts])          # provider(s) called
+print([(e.provider_name, e.reason) for e in response.excluded])  # who was filtered, and why
+```
+
+## Round robin and fallback
+
+The router rotates between eligible providers across successive `invoke()` calls
+(round robin), so load is spread rather than always hitting the first provider.
+Rotation is per-process only — there is no persistence across restarts yet.
+
+When a selected provider fails, the router falls back to the next eligible
+provider instead of failing the whole request. Failures are classified to decide
+what happens next:
+
+- **Timeout, rate limit (HTTP 429), server error (5xx), or unknown** — try the
+  next eligible provider.
+- **Auth (HTTP 401/403)** — record the failure, try the next provider, and bench
+  the failing provider for the rest of this process. It is then excluded from
+  later calls on the same router with `FilterReason.AUTH_DISABLED_THIS_RUN`.
+- **Bad request (other 4xx, e.g. 400)** — stop immediately. A malformed request
+  is unlikely to fare better on another provider, and trying more would only
+  bury the real cause under unrelated failures.
+
+If every provider actually tried fails (or a bad request stops the run early),
+`invoke()` raises `RouterExhaustedError`, whose message enumerates each attempted
+provider with its own real, distinct failure; the structured attempts (each with
+its unwrapped error) stay on `error.attempts`.
+
+Round robin plus fallback is the default with no configuration. To override the
+selection order, pass a `policy` to the constructor:
+
+```python
+from nygen_router import ProviderRouter, RoundRobinPolicy
+
+router = ProviderRouter(providers=[...], policy=RoundRobinPolicy())
+```
+
 ## Errors
 
 The router is deliberately transparent about failures — no "peel the onion"
@@ -94,12 +161,12 @@ debugging. The contract:
   `response`. The standard `httpx.HTTPStatusError` stays reachable via
   `__cause__`.
 - **The error type names the stage.** `ConfigError` / `MissingApiKeyError`
-  (configuration), `CapabilityError` (requested capability unavailable),
-  `NoProvidersConfiguredError` (selection), `UnsupportedProtocolError` (adapter
-  selection), `ProviderTimeoutError` / `ProviderConnectionError` /
-  `ProviderError` (transport), `ProviderHTTPError` (HTTP status),
-  `ProviderResponseError` (unparseable 2xx). Messages always name the provider
-  and model.
+  (configuration), `NoProvidersConfiguredError` (no providers configured),
+  `NoEligibleProvidersError` (all providers filtered out before any call),
+  `RouterExhaustedError` (every provider tried failed), `ProviderTimeoutError`
+  / `ProviderConnectionError` / `ProviderError` (transport), `ProviderHTTPError`
+  (HTTP status), `ProviderResponseError` (unparseable 2xx). Messages always name
+  the provider and model.
 - **Originals are chained, never re-wrapped.** Transport failures keep the exact
   `httpx` exception type in the message and attach it as both `__cause__` and
   `.original`.

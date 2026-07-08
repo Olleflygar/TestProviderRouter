@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 
 class ChatMessage(BaseModel):
@@ -13,6 +13,14 @@ class ChatMessage(BaseModel):
 
 
 class RouterRequest(BaseModel):
+    """One normalized request for the router to place with a provider.
+
+    The ``requires_*`` flags express eligibility requirements only: they decide
+    which providers pass the hard filter, but the adapter does not yet send the
+    corresponding request parameters (``stream``, ``tools``, ``response_format``)
+    -- those arrive with the PRs that implement each feature.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     messages: list[ChatMessage]
@@ -74,6 +82,11 @@ class ProviderAttempt(BaseModel):
     provider_name: str
     success: bool
     error: Exception | None = None
+
+    @field_serializer("error", when_used="json")
+    def _serialize_error(self, error: Exception | None) -> str | None:
+        """JSON dumps get "TypeName: message"; attribute access keeps the real object."""
+        return None if error is None else f"{type(error).__name__}: {error}"
 
 
 class RouterResponse(BaseModel):

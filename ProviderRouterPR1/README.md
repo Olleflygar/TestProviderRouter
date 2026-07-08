@@ -73,6 +73,12 @@ essential check — disabled, no API key available, unsupported protocol, or a
 missing required capability (tool-calling, streaming, or JSON mode) — is
 excluded, not ranked lower.
 
+Note: the `requires_tools` / `requires_streaming` / `requires_json_mode` request
+flags affect provider *eligibility* only. The adapter does not yet send the
+corresponding request parameters (`stream`, `tools`, `response_format`) — those
+arrive with the PRs that implement each feature, so today the call itself is
+always a plain, non-streamed chat completion.
+
 Every response reports what happened, so routing is never a black box:
 
 - `response.attempts` — one `ProviderAttempt` per provider actually invoked, in

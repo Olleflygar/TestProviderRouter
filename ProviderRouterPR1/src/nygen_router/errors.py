@@ -200,7 +200,13 @@ class ErrorCategory(StrEnum):
 
 
 def categorize_error(exc: Exception) -> ErrorCategory:
-    """Classify a provider failure so the fallback loop can decide what to do."""
+    """Classify a provider failure so the fallback loop can decide what to do.
+
+    Only 400/422 count as BAD_REQUEST (the request itself is malformed, so no
+    provider will do better). Other 4xx like 404/413 are provider-specific --
+    wrong base_url, model not hosted there, smaller payload limits -- and must
+    not stop the run while valid providers remain.
+    """
     if isinstance(exc, ProviderTimeoutError):
         return ErrorCategory.TIMEOUT
     if isinstance(exc, ProviderHTTPError):
@@ -209,7 +215,11 @@ def categorize_error(exc: Exception) -> ErrorCategory:
             return ErrorCategory.RATE_LIMIT
         if status in (401, 403):
             return ErrorCategory.AUTH
+        if status == 408:
+            return ErrorCategory.TIMEOUT
         if status >= 500:
             return ErrorCategory.SERVER_ERROR
-        return ErrorCategory.BAD_REQUEST
+        if status in (400, 422):
+            return ErrorCategory.BAD_REQUEST
+        return ErrorCategory.UNKNOWN
     return ErrorCategory.UNKNOWN

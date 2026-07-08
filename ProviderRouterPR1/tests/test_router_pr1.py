@@ -104,6 +104,36 @@ def test_router_excludes_provider_with_unsupported_protocol() -> None:
     assert exc_info.value.exclusions[0].reason is FilterReason.UNSUPPORTED_PROTOCOL
 
 
+def test_router_supports_custom_protocol_via_supported_protocols_param() -> None:
+    """A custom adapter_factory can widen protocol support by passing the matching set."""
+
+    class FakeAnthropicAdapter:
+        def __init__(self, config: ProviderConfig):
+            self.config = config
+
+        def invoke(self, request: RouterRequest) -> RouterResponse:
+            return RouterResponse(
+                provider_name=self.config.name, model=self.config.model, text="ok"
+            )
+
+    router = ProviderRouter(
+        providers=[
+            ProviderConfig(
+                name="anthropic",
+                protocol=ApiProtocol.ANTHROPIC_MESSAGES,
+                model="claude-model",
+                api_key="secret",
+            )
+        ],
+        adapter_factory=FakeAnthropicAdapter,
+        supported_protocols={ApiProtocol.ANTHROPIC_MESSAGES},
+    )
+
+    response = router.invoke("Hello")
+
+    assert response.provider_name == "anthropic"
+
+
 def test_router_excludes_tool_request_when_provider_lacks_tool_support() -> None:
     """PR2: a missing required capability excludes the provider instead of raising."""
 

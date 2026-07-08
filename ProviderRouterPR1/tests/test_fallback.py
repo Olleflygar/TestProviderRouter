@@ -99,6 +99,27 @@ def test_fallback_tries_second_provider_on_rate_limit() -> None:
     assert invoked == ["provider_a", "provider_b"]
 
 
+def test_fallback_tries_second_provider_on_not_found() -> None:
+    """A 404 is provider-specific (typo'd base_url, model not hosted) -- fall back."""
+    providers = [_config("provider_a"), _config("provider_b")]
+    router, invoked = _router(providers, {"provider_a": _http("provider_a", 404)})
+
+    response = router.invoke("hi")
+
+    assert response.provider_name == "provider_b"
+    assert invoked == ["provider_a", "provider_b"]
+
+
+def test_fallback_tries_second_provider_on_http_408_timeout() -> None:
+    providers = [_config("provider_a"), _config("provider_b")]
+    router, invoked = _router(providers, {"provider_a": _http("provider_a", 408)})
+
+    response = router.invoke("hi")
+
+    assert response.provider_name == "provider_b"
+    assert invoked == ["provider_a", "provider_b"]
+
+
 def test_fallback_tries_second_provider_on_server_error() -> None:
     providers = [_config("provider_a"), _config("provider_b")]
     router, invoked = _router(providers, {"provider_a": _http("provider_a", 503)})
@@ -179,6 +200,18 @@ def test_all_providers_fail_raises_with_each_distinct_reason() -> None:
     assert "timed out" in message
     assert "429" in message
     assert [a.provider_name for a in exc_info.value.attempts] == ["provider_a", "provider_b"]
+
+
+def test_fallback_response_is_json_serializable() -> None:
+    """A live exception in attempts must not break model_dump_json()."""
+    providers = [_config("provider_a"), _config("provider_b")]
+    router, _ = _router(providers, {"provider_a": _timeout("provider_a")})
+
+    response = router.invoke("hi")
+    dumped = response.model_dump_json()
+
+    assert "ProviderTimeoutError" in dumped
+    assert response.attempts[0].error is not None  # real object still on the model
 
 
 def test_successful_fallback_records_real_unwrapped_error_for_failed_attempt() -> None:
