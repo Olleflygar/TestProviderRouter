@@ -232,6 +232,13 @@ router = ProviderRouter(
             model="some-model",
             base_url="https://provider-a.example.com/v1",
             api_key_env="PROVIDER_A_API_KEY",
+            capabilities={
+                "supports_chat": True,
+                "supports_responses_api": False,
+                "supports_tools": False,
+                "supports_streaming": False,
+                "supports_json_mode": False,
+            },
         ),
         ProviderConfig(
             name="provider_b",
@@ -239,6 +246,13 @@ router = ProviderRouter(
             model="some-model",
             base_url="https://provider-b.example.com/v1",
             api_key_env="PROVIDER_B_API_KEY",
+            capabilities={
+                "supports_chat": True,
+                "supports_responses_api": False,
+                "supports_tools": False,
+                "supports_streaming": False,
+                "supports_json_mode": False,
+            },
         ),
     ]
 )
