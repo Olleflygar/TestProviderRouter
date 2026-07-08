@@ -36,7 +36,7 @@ def main() -> None:
         ]
     )
 
-    response = router.invoke("Write a short story about a cat")
+    response = router.invoke("Tell a short joke")
     print(f"{response.provider_name} / {response.model}:")
     print(response.text)
 

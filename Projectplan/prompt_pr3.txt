@@ -1,0 +1,331 @@
+You are implementing PR 3 ("Round robin with current-run memory only") of the
+nygen-router package.
+
+You are working inside the existing repository, modifying it in place. Do not
+create a new sibling folder.
+
+Before writing any code, read these in full:
+
+1. Projectplan/ProjectPlan.md — especially: Project goal, Core design
+   principles, Testing philosophy, and the PR 3 section. The Testing
+   philosophy and the transparency principle are binding for this PR.
+2. The current source under src/nygen_router/ and the tests under tests/.
+   PR 2 already shipped filter_eligible_providers, FilterReason,
+   EligibilityResult, ProviderAttempt, RouterResponse.attempts/excluded, and
+   NoEligibleProvidersError exactly as the plan assumes — there is no PR1/PR2
+   schema gap to reconcile this time.
+
+⸻
+
+Git workflow
+
+Work directly on the current branch (main) in this folder.
+
+Before changing anything:
+- Confirm the working tree is clean; if not, stop and report what is pending.
+- Ensure a tag named pr2-complete exists. If it does not, create it on the
+  current commit: git tag pr2-complete
+
+Commit at logical milestones with clear messages. When every quality gate
+below passes, create the tag pr3-complete on the final commit.
+
+⸻
+
+Design decisions already made for you
+
+The plan describes PR 3's goal and required tests precisely, but leaves
+several implementation choices open. These have already been decided — do
+not re-derive or second-guess them, just implement them:
+
+1. ProviderRouter gains an optional `policy` constructor argument now (not
+   deferred to PR9). Default: `RoundRobinPolicy()`. This gives the round-robin
+   collaborator its own constructor-level seam, per the Testing philosophy
+   rule that every new collaborator needs one (tests inject a fake Policy
+   instead of patching internals).
+
+2. The Policy's only job is ordering: given the eligible providers for this
+   call, return the order to try them in. It does NOT own the fallback loop,
+   error categorization, or health-state mutation — those stay in
+   ProviderRouter.invoke(). Interface (src/nygen_router/policies/base.py):
+
+   class Policy(Protocol):
+       def order(self, eligible: list[ProviderConfig]) -> list[ProviderConfig]:
+           """Return eligible providers in the order to attempt them this call."""
+           ...
+
+3. RoundRobinPolicy (src/nygen_router/policies/round_robin.py) keeps an
+   internal counter starting at 0. Each call to order(eligible) rotates the
+   *starting point* within that call's eligible list:
+   `i = self._index % len(eligible)`, return `eligible[i:] + eligible[:i]`,
+   then increment `self._index`. The counter indexes into whatever is
+   eligible *this call* — it is not tied to position in the original config
+   list. This is deliberately the simpler of two options: it's always a
+   valid index and self-heals if a provider becomes eligible again later, at
+   the minor cost of the rotation "jumping" a slot if the eligible set
+   changes between calls (acceptable — PR3 is current-run memory only, no
+   persistence, and round robin only promises rough fairness over many
+   calls).
+
+4. Per-run provider health state lives on ProviderRouter itself, not inside
+   RoundRobinPolicy, so it stays visible to the eligibility filter and to any
+   future policy (PR9's ScoreBasedPolicy). New module
+   src/nygen_router/health.py:
+
+   @dataclass
+   class ProviderHealthState:
+       auth_disabled: bool = False
+
+   ProviderRouter holds `self._health: dict[str, ProviderHealthState] = {}`.
+   PR5 extends this type in place later (cooldowns, consecutive-failure
+   counts) — do not relocate it once created.
+
+5. A provider disabled this run for an auth failure gets its OWN new
+   FilterReason — do not reuse FilterReason.DISABLED. Add
+   FilterReason.AUTH_DISABLED_THIS_RUN = "auth_disabled_this_run" to
+   types.py. Rationale: config-disabled and disabled-after-an-auth-failure
+   are different facts a caller may need to act on differently, and the
+   plan's transparency principle calls for every exclusion to carry its own
+   specific reason, not a blended one.
+
+6. filter_eligible_providers gains a new optional keyword-only parameter:
+
+   def filter_eligible_providers(
+       providers: list[ProviderConfig],
+       request: RouterRequest,
+       *,
+       supported_protocols: Collection[ApiProtocol],
+       disabled_this_run: Collection[str] = frozenset(),
+   ) -> tuple[list[ProviderConfig], list[EligibilityResult]]:
+
+   filters.py does not need to know about ProviderHealthState or import
+   health.py — ProviderRouter computes the plain set of currently-disabled
+   provider names from its own self._health and passes it in. Check this
+   filter right after the "enabled" check and before the API-key check
+   (reason: FilterReason.AUTH_DISABLED_THIS_RUN, detail e.g. "disabled after
+   an auth failure earlier this run").
+
+7. Error categorization. Add to errors.py (this is an internal
+   decision-making detail, not part of the public response schema — do not
+   add a "category" field to ProviderAttempt):
+
+   class ErrorCategory(StrEnum):
+       TIMEOUT = "timeout"
+       RATE_LIMIT = "rate_limit"
+       AUTH = "auth"
+       SERVER_ERROR = "server_error"
+       BAD_REQUEST = "bad_request"
+       UNKNOWN = "unknown"
+
+   def categorize_error(exc: Exception) -> ErrorCategory:
+       ...
+
+   Mapping:
+   - ProviderTimeoutError -> TIMEOUT
+   - ProviderHTTPError with status_code == 429 -> RATE_LIMIT
+   - ProviderHTTPError with status_code in (401, 403) -> AUTH
+   - ProviderHTTPError with status_code >= 500 -> SERVER_ERROR
+   - ProviderHTTPError with any other 4xx status_code -> BAD_REQUEST
+   - everything else (ProviderConnectionError, ProviderResponseError, the
+     generic ProviderError, any non-router exception) -> UNKNOWN
+
+8. Per-category fallback behavior in ProviderRouter.invoke()'s loop over
+   `policy.order(eligible)`:
+   - TIMEOUT, RATE_LIMIT, SERVER_ERROR, UNKNOWN: record the failed attempt,
+     try the next provider in order. (Principle 9: one provider failure must
+     not fail the whole request if another eligible provider exists.)
+   - AUTH: record the failed attempt, set
+     self._health[provider.name] = ProviderHealthState(auth_disabled=True)
+     (so it is excluded by the filter on the *next* invoke() call, not this
+     one), and still try the next provider in the current call's order —
+     same fallback as the categories above, plus this side effect.
+   - BAD_REQUEST: stop immediately. Record the failed attempt, then do not
+     try any further eligible provider, even if more remain. Rationale: a
+     400 almost always means something about the request itself is invalid,
+     not the specific provider — trying another provider is unlikely to
+     help, and doing so anyway just adds an unrelated second failure that
+     makes the real problem harder to spot in the final error. Stopping
+     immediately keeps the reported failure focused on the one attempt that
+     actually explains what went wrong.
+
+   If the loop runs out of providers to try (whether by exhausting the
+   order, or by the BAD_REQUEST immediate-stop rule triggering), raise
+   RouterExhaustedError(attempts) — never a blended message. attempts
+   contains every attempt actually made up to that point (so a BAD_REQUEST
+   that occurs after an earlier timeout still shows both in order), it just
+   won't contain an attempt for every eligible provider when the stop rule
+   fired early.
+
+⸻
+
+Goal
+
+Make the router actually rotate between providers and fall back to another
+eligible provider when one fails, within a single Python process. No
+persistence across process restarts.
+
+⸻
+
+New module: src/nygen_router/policies/__init__.py, base.py, round_robin.py
+
+As specified above in "Design decisions."
+
+⸻
+
+New module: src/nygen_router/health.py
+
+As specified above in "Design decisions."
+
+⸻
+
+errors.py additions
+
+- ErrorCategory enum and categorize_error() — see "Design decisions" #7.
+- RouterExhaustedError(NygenRouterError): every eligible provider that was
+  actually tried failed. Constructor takes `attempts: list[ProviderAttempt]`,
+  stores it as `.attempts`, and the message enumerates each attempted
+  provider with its own real, distinct failure — e.g.
+  "provider_a: <str of provider_a's real error>; provider_b: <str of
+  provider_b's real error>" — never a single blended "all providers failed"
+  message. Follow the same pattern as NoEligibleProvidersError.
+
+⸻
+
+filters.py changes
+
+Add the `disabled_this_run` parameter and the new filter check — see "Design
+decisions" #5 and #6. Existing PR2 filter order (enabled, api key, protocol,
+capabilities) gets the new auth-disabled check inserted right after
+"enabled."
+
+⸻
+
+router.py control flow change
+
+ProviderRouter constructor gains `policy: Policy | None = None`, defaulting
+to `RoundRobinPolicy()`. Add `self._health: dict[str, ProviderHealthState] = {}`.
+
+invoke() changes from "filter, then call exactly the first eligible
+provider" to:
+
+1. Filter the whole provider list (as PR2), now also passing
+   disabled_this_run computed from self._health.
+2. If nothing eligible, raise NoEligibleProvidersError(excluded) (unchanged
+   from PR2).
+3. Ask self._policy.order(eligible) for the attempt order.
+4. Loop through that order, applying the per-category fallback behavior in
+   "Design decisions" #8, appending a ProviderAttempt (success or failure,
+   real error object, never rewrapped) for every provider actually invoked.
+5. On the first success, return response.model_copy(update={"attempts":
+   attempts_so_far, "excluded": excluded}) — attempts must include every
+   provider tried this call, in order, not just the one that succeeded.
+6. If the loop ends without a success (exhausted, or the BAD_REQUEST
+   bounded-stop rule fired), raise RouterExhaustedError(attempts).
+
+⸻
+
+__init__.py exports
+
+Add: RouterExhaustedError, RoundRobinPolicy. (ErrorCategory,
+categorize_error, and ProviderHealthState are internal implementation
+details of the fallback loop, not part of the public response schema — they
+do not need to be added to __all__ unless you find a concrete reason a
+caller needs them directly.)
+
+This must keep working with no optional dependencies installed:
+
+from nygen_router import ProviderRouter
+
+⸻
+
+Out of scope — do not implement
+
+- SQLite or metrics storage (PR4)
+- cooldowns / consecutive-failure counts on ProviderHealthState (PR5 extends
+  it later, in place — do not build that now)
+- scoring / ScoreBasedPolicy (PR8+/PR9)
+- persistence of round-robin index or health state across process restarts
+- new adapters or protocols
+- a "category" field on ProviderAttempt or any other public schema change
+  beyond what's specified above
+
+⸻
+
+Testing rules (binding, from the plan's Testing philosophy)
+
+- No monkeypatching of internal collaborators: no monkeypatch.setattr or
+  unittest.mock.patch reaching into modules to swap classes/functions. Use
+  constructor seams: OpenAICompatibleAdapter(config,
+  transport=httpx.MockTransport(handler)), ProviderRouter(providers,
+  adapter_factory=..., policy=...). A fake adapter that raises a scripted
+  sequence of exceptions per provider (via adapter_factory) is the right way
+  to simulate timeouts/rate limits/auth failures/bad requests — do not patch
+  OpenAICompatibleAdapter or httpx internals to do this.
+  monkeypatch.setenv / monkeypatch.delenv for environment variables remain
+  allowed.
+
+- Do not delete existing tests. Do not weaken tests_filters.py or
+  test_router_pr1.py's PR2 assertions.
+
+New test files: tests/test_round_robin.py and tests/test_fallback.py. Cover
+at minimum:
+
+tests/test_round_robin.py
+- round robin rotates the starting provider across successive invoke() calls
+- round robin ignores filtered-out providers (only eligible providers are
+  ever selected/rotated among)
+- a fake Policy injected via the `policy=` constructor argument is honored
+  by ProviderRouter (proves the constructor seam works without patching
+  RoundRobinPolicy)
+
+tests/test_fallback.py
+- fallback tries a second provider on a timeout
+- fallback tries a second provider on a rate limit (HTTP 429)
+- an auth error (HTTP 401/403) disables that provider for the current run:
+  it is excluded (with FilterReason.AUTH_DISABLED_THIS_RUN) on a subsequent
+  invoke() call on the same router instance
+- a bad-request failure (HTTP 400) stops the call immediately: the router
+  does not try any further eligible provider, even if more remain, and
+  raises RouterExhaustedError containing only the attempt(s) actually made
+- a bad-request failure that occurs after an earlier retryable failure
+  (e.g. provider A times out, provider B returns 400) still records both
+  attempts, in order, before stopping — the earlier attempt is not lost
+- all attempted providers fail raises RouterExhaustedError, and the error
+  message names each attempted provider with its own real, distinct failure
+  (never a blended "all providers failed" message)
+- a successful fallback populates RouterResponse.attempts with every
+  provider tried, in order, including the real (unwrapped) error for the
+  ones that failed first
+
+⸻
+
+Docs
+
+- Update README.md: describe round-robin rotation, fallback, the `policy`
+  constructor argument and RoundRobinPolicy, per-run auth-disable behavior,
+  and RouterExhaustedError. Remove "Round robin, fallback... future PRs"
+  since it is no longer future work; add note for what's still future
+  (SQLite memory, scoring, Responses API, framework adapters).
+- Update AGENT.md where it describes PR1/PR2-only behavior.
+
+⸻
+
+Quality gates
+
+All of these must pass before you declare PR 3 done. Use the project's own
+virtual environment (.venv in the repo), not the system Python:
+
+ruff format .
+ruff check .
+mypy src
+pytest
+coverage run -m pytest
+coverage report
+
+⸻
+
+Completion report
+
+End with: files changed; the behavior changes made; confirmation that each
+of the 8 "Design decisions" items above was implemented as specified (flag
+any place you had to deviate and why); and the verbatim results of the
+quality-gate commands.
