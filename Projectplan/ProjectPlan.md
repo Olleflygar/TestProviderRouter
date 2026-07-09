@@ -15,6 +15,18 @@ too fast to scrape reliably at this project's scale). Manually-configured
 token pricing may be added later as an optional, user-supplied customization
 (see PR 6), but it is deferred and does not gate the core sprint.
 
+Implementation status (as of 2026-07-09)
+-----------------------------------------
+PR 1, PR 2, and PR 3 are implemented and merged (ProviderRouterPR1/src/nygen_router/).
+The three PR sections below are rewritten from "planned" to "shipped": they
+describe what the code and tests actually do, verified directly against the
+source and test suite, not restated from the original proposal. PR 4 onward
+is still the forward-looking plan and is unchanged here.
+
+Verified: `ruff check .`, `mypy src` (strict mode), and `pytest` all pass;
+combined coverage across PR1-3 is 93% (branch coverage on), meeting the 90%+
+target set in the supervisor meeting.
+
 Core design principles
 ----------------------
 1. Keep the main import lightweight:
@@ -111,6 +123,16 @@ These rules apply to every PR from here on, not just PR 1.
    intentional behavior; do not delete it outright, and do not delete or
    weaken tests just because they are inconvenient to keep passing.
 
+Review process
+--------------
+Per the supervisor meeting: share progress via GitHub and tag a PR for review
+only when it's ready. Keep each PR small and scoped to one module, with a
+short (~10 minute) intro when handing it off for review, rather than
+bundling several modules' worth of change into one PR. PR1, PR2, and PR3
+(and the prompt files that drove them, Projectplan/prompt.txt,
+prompt_pr2.txt, prompt_pr3.txt) already follow this pattern -- keep doing so
+for PR4 onward.
+
 Recommended package structure
 -----------------------------
 nygen_router/
@@ -120,6 +142,8 @@ nygen_router/
   config.py
   errors.py
   capabilities.py
+  filters.py
+  health.py
   scoring.py
   metrics.py
 
@@ -154,54 +178,83 @@ nygen_router/
     opentelemetry.py
     logfire.py
 
-PR 1: Provider configs and real provider calls
-----------------------------------------------
+As of PR3, the implemented files are: __init__.py, router.py, types.py,
+config.py, errors.py, capabilities.py, filters.py, health.py,
+adapters/{__init__.py, base.py, openai_compatible.py}, and
+policies/{__init__.py, base.py, round_robin.py}. Everything else in this
+tree (scoring.py, metrics.py, storage/, integrations/, observability/, the
+remaining adapters, and score_based.py) is still planned, starting at PR4.
+
+PR 1: Provider configs and real provider calls -- SHIPPED
+------------------------------------------------------------
 Goal:
-Get the first real providers up and running.
+Get the first real providers up and running, and prove the router can call
+provider APIs through user-supplied provider configs and API keys.
 
-This PR should prove that the router can call provider APIs through user-supplied provider configs and API keys.
+What shipped (verified against src/nygen_router/):
+- ApiProtocol StrEnum with three members: OPENAI_CHAT, OPENAI_RESPONSES,
+  ANTHROPIC_MESSAGES. Only OPENAI_CHAT has a working adapter; the other two
+  are reserved now (this addresses the supervisor meeting's requirement to
+  support both the OpenAI protocol convention and the Response API -- the
+  enum slot exists so the PR12 adapter doesn't need a breaking change) --
+  see the Response API discussion note below.
+- ProviderCapabilities and ProviderConfig, both Pydantic models, live in
+  config.py (not a separate capabilities.py -- that file is reserved for
+  PR2's hard-filter helper, see below). ProviderConfig validates: name/model
+  non-empty, base_url required for OPENAI_CHAT, at least one of api_key
+  (SecretStr) / api_key_env required, timeout_seconds > 0.
+  resolve_api_key() prefers the explicit key and falls back to the named
+  environment variable, raising MissingApiKeyError with a setup hint
+  otherwise -- this is exactly the "explicit code-level key vs.
+  environment-variable" option pair from the supervisor meeting, both
+  wired through one method.
+- RouterRequest, ChatMessage, TokenUsage, RouterResponse in types.py
+  (Pydantic, extra="forbid"). RouterResponse.attempts (list[ProviderAttempt])
+  and RouterResponse.excluded (list[EligibilityResult]) shipped in the
+  schema from PR1 as planned, always empty/single-entry until PR2/PR3
+  populate them for real.
+- ProviderAdapter Protocol (adapters/base.py) and OpenAICompatibleAdapter
+  (adapters/openai_compatible.py), built directly on httpx -- no OpenAI SDK
+  dependency. Takes an injectable transport: httpx.BaseTransport, so tests
+  use httpx.MockTransport instead of patching anything internal.
+- errors.py error hierarchy: NygenRouterError base; ConfigError,
+  MissingApiKeyError, UnsupportedProtocolError, NoProvidersConfiguredError
+  for setup problems; ProviderError, ProviderTimeoutError,
+  ProviderConnectionError, ProviderHTTPError, ProviderResponseError for call
+  failures. ProviderHTTPError/ProviderResponseError carry the provider's
+  verbatim message, HTTP status + reason phrase, and any error type/code
+  field the provider returned, chained from the original httpx exception via
+  raise ... from -- nothing is rephrased into a generic router message.
+- ProviderRouter (router.py): constructor takes providers plus
+  adapter_factory and policy as constructor-injectable seams (used by every
+  test instead of patching an internal class). invoke() wraps a plain
+  string into a RouterRequest and returns a RouterResponse.
 
-Scope:
-- ProviderConfig
-- RouterRequest
-- RouterResponse
-- ApiProtocol enum
-- ProviderAdapter base protocol
-- OpenAI-compatible adapter
-- basic ProviderRouter class
-- config validation
-- API key loading from environment
-- tests
+Response API discussion (from the supervisor meeting, not yet resolved):
+the meeting notes flag the Response API as "the emerging standard, most
+tools moving toward it, OpenAI itself now adopting it." The current plan
+only adds an OPENAI_RESPONSES adapter at PR12, after round robin (PR3),
+SQLite (PR4), health/cooldowns (PR5), and scoring (PR6-10). Given the
+emphasis in the meeting, it may be worth moving the Responses adapter
+earlier in the sequence (e.g. right after PR3, before storage/scoring) --
+this is a scope/sequencing question, not something resolved by this
+rewrite, and is worth a explicit decision before PR4 starts.
 
-Response transparency (schema added now, populated fully by later PRs):
-- RouterResponse.attempts: list[ProviderAttempt], one entry per provider actually
-  invoked during this call (provider name, success flag, and the real
-  underlying error object if it failed -- never a router-rephrased summary).
-  In PR1 this is always exactly one entry, since PR1 has no fallback yet.
-- RouterResponse.excluded: list[EligibilityResult], one entry per provider that
-  was filtered out before any call was made, with its specific reason. Always
-  populated, even on a successful call. In PR1 this is always empty, since
-  hard filtering does not exist until PR2.
-- Adding both fields now (rather than in PR2/PR3, when they first have real
-  content) avoids a breaking schema change to a public response type later.
-
-Suggested files:
+Files actually added by PR1:
 ProviderRouterPR1/
   pyproject.toml
   README.md
   AGENT.md
-  src/
-    nygen_router/
+  src/nygen_router/
+    __init__.py
+    config.py
+    types.py
+    errors.py
+    router.py
+    adapters/
       __init__.py
-      config.py
-      types.py
-      errors.py
-      router.py
-      capabilities.py
-      adapters/
-        __init__.py
-        base.py
-        openai_compatible.py
+      base.py
+      openai_compatible.py
   tests/
     test_config.py
     test_openai_compatible_adapter.py
@@ -221,8 +274,12 @@ Key implementation decisions:
   raise its own error, and that error must still enumerate each provider's
   real, distinct reason rather than a single blended message.
 
-Minimum usage example:
-from nygen_router import ProviderRouter, ProviderConfig, ApiProtocol
+Minimum usage example (updated to build capabilities as a
+ProviderCapabilities model, matching how config.py and the real tests do it
+-- not a raw dict, per the supervisor meeting's "avoid raw dicts, use
+dataclasses/enums/Pydantic models" rule):
+
+from nygen_router import ProviderRouter, ProviderConfig, ProviderCapabilities, ApiProtocol
 
 router = ProviderRouter(
     providers=[
@@ -232,13 +289,7 @@ router = ProviderRouter(
             model="some-model",
             base_url="https://provider-a.example.com/v1",
             api_key_env="PROVIDER_A_API_KEY",
-            capabilities={
-                "supports_chat": True,
-                "supports_responses_api": False,
-                "supports_tools": False,
-                "supports_streaming": False,
-                "supports_json_mode": False,
-            },
+            capabilities=ProviderCapabilities(supports_chat=True),
         ),
         ProviderConfig(
             name="provider_b",
@@ -246,13 +297,7 @@ router = ProviderRouter(
             model="some-model",
             base_url="https://provider-b.example.com/v1",
             api_key_env="PROVIDER_B_API_KEY",
-            capabilities={
-                "supports_chat": True,
-                "supports_responses_api": False,
-                "supports_tools": False,
-                "supports_streaming": False,
-                "supports_json_mode": False,
-            },
+            capabilities=ProviderCapabilities(supports_chat=True),
         ),
     ]
 )
@@ -260,21 +305,38 @@ router = ProviderRouter(
 response = router.invoke("Say hello")
 print(response.text)
 
-Tests:
-- valid provider config
-- missing provider name
-- missing model
-- missing base URL for OpenAI-compatible provider
-- explicit API key resolution
-- environment API key resolution
-- missing API key error
-- adapter builds correct HTTP payload
-- adapter parses basic chat/completions response
-- router invokes first enabled provider
-- unsupported protocol raises clean error
+Tests (tests/test_config.py, tests/test_openai_compatible_adapter.py,
+tests/test_router_pr1.py):
+- valid config accepted; empty name/model rejected; missing base_url
+  rejected for OPENAI_CHAT; missing api_key and api_key_env together rejected
+- explicit api_key resolves; api_key_env resolves from the environment; a
+  missing env var raises MissingApiKeyError
+- adapter builds the chat/completions payload (model, messages, bearer auth
+  header); parses response text and token usage; rejects null/missing content
+- adapter maps httpx timeout/connection/HTTP errors onto
+  ProviderTimeoutError/ProviderConnectionError/ProviderHTTPError, preserving
+  the original exception as __cause__
+- router invokes the first enabled provider and normalizes a plain string
+  into a RouterRequest
 
-PR 2: Essential hard filters
-----------------------------
+Note on CapabilityError: an earlier iteration of PR1 raised a dedicated
+CapabilityError directly from capabilities.py when a provider lacked a
+required capability (tool calls, streaming, JSON mode). It was retired the
+moment PR2 landed (commit 137764e) and replaced by the EligibilityResult /
+FilterReason exclusion model described below -- confirmed by diffing
+errors.py across that commit. test_router_pr1.py was updated in place (not
+deleted) to match, per the testing-philosophy rule that a test may change
+when a later PR deliberately changes the behavior it asserts.
+
+Also added, not in the original plan: tests/test_live_provider.py -- a live
+integration test that sends one real request to a configured
+OpenAI-compatible provider (DeepInfra by default) and asserts on the reply.
+It is skipped via pytest.mark.skipif when its API key env var is unset, so
+plain pytest stays offline and passes without credentials, while still
+giving a way to prove real connectivity when a key is present.
+
+PR 2: Essential hard filters -- SHIPPED
+-----------------------------------------
 Goal:
 Before routing, filter out providers that cannot satisfy the request.
 
