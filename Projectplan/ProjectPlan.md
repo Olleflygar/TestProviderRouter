@@ -25,7 +25,7 @@ is still the forward-looking plan and is unchanged here.
 
 Verified: `ruff check .`, `mypy src` (strict mode), and `pytest` all pass;
 combined coverage across PR1-3 is 93% (branch coverage on), meeting the 90%+
-target set in the supervisor meeting.
+target set. 
 
 Core design principles
 ----------------------
