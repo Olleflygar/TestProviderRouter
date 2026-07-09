@@ -238,7 +238,7 @@ SQLite (PR4), health/cooldowns (PR5), and scoring (PR6-10). Given the
 emphasis in the meeting, it may be worth moving the Responses adapter
 earlier in the sequence (e.g. right after PR3, before storage/scoring) --
 this is a scope/sequencing question, not something resolved by this
-rewrite, and is worth a explicit decision before PR4 starts.
+rewrite, and is worth an explicit decision before PR4 starts.
 
 Files actually added by PR1:
 ProviderRouterPR1/
@@ -340,158 +340,195 @@ PR 2: Essential hard filters -- SHIPPED
 Goal:
 Before routing, filter out providers that cannot satisfy the request.
 
-Scope:
-- ProviderCapabilities
-- RequestRequirements
-- EligibilityResult
-- filter_eligible_providers
+What shipped (verified against src/nygen_router/):
+- capabilities.py: missing_capability(config, request) -- returns the first
+  FilterReason the provider fails against the request's requires_tools /
+  requires_streaming / requires_json_mode flags, or None if every required
+  capability is present. (ProviderCapabilities itself, the Pydantic model,
+  already shipped in PR1's config.py -- this file only holds the PR2 filter
+  helper, contrary to the original suggested-files list which implied the
+  model lived here.)
+- filters.py: filter_eligible_providers(providers, request,
+  supported_protocols=..., disabled_this_run=...) -- splits providers into
+  (eligible, excluded). Checks in order: enabled, not auth-disabled this run
+  (see PR3's health.py), API key resolvable, protocol supported, then
+  missing_capability(). Each excluded provider yields exactly one
+  EligibilityResult with its first failing FilterReason and a
+  human-readable detail string.
+- FilterReason (StrEnum) and EligibilityResult live in types.py, alongside
+  the other response-schema types (not a separate file): DISABLED,
+  AUTH_DISABLED_THIS_RUN, MISSING_API_KEY, UNSUPPORTED_PROTOCOL,
+  MISSING_TOOLS, MISSING_STREAMING, MISSING_JSON_MODE.
+- ProviderRouter.invoke() changed exactly as planned: filter the whole
+  provider list first, then order/select among survivors, instead of
+  validating only the first provider. If filtering excludes everyone,
+  invoke() raises NoEligibleProvidersError(excluded), whose message
+  enumerates every excluded provider with its own specific reason -- never
+  one blended message.
+- disabled_this_run is supplied by the router from its own per-run health
+  state (ProviderHealthState, shipped in PR3 below), so an auth failure
+  earlier in the run also becomes a hard-filter exclusion on the next call,
+  through the same EligibilityResult/FilterReason machinery as a static
+  config problem.
 
-Essential filters:
-- provider enabled
-- API key available
-- protocol supported
-- model configured
-- tool-calling support if required
-- streaming support if required
-- JSON mode support if required
+Confirmed: CapabilityError -- raised directly from capabilities.py in an
+earlier PR1 iteration -- was retired the moment this PR landed (commit
+137764e), replaced by the exclusion model above. See the note in PR1.
 
-Suggested files:
+Files actually added by PR2:
 src/nygen_router/capabilities.py
 src/nygen_router/filters.py
 tests/test_filters.py
 
-Important principle:
-Hard filters are not scores. A provider that cannot support tools should be excluded for tool requests, not ranked lower.
+(FilterReason/EligibilityResult additions to types.py, and the invoke()
+control-flow change in router.py, are part of PR2 too, but land in files
+PR1 already created.)
 
-Control flow change from PR1:
-ProviderRouter.invoke() changes from "pick the first enabled provider, then
-validate capabilities against only that one provider" to "filter the whole
-provider list down to eligible candidates first, then select among survivors."
-CapabilityError is retired as something invoke() raises directly -- it is no
-longer reachable from the normal invoke() path. Each exclusion becomes an
-EligibilityResult carrying a FilterReason enum (per the enums-for-capability-
-flags principle) plus a specific human-readable detail, e.g. "missing
-tool-calling support". These results populate RouterResponse.excluded on
-every call (see PR1), success or failure.
+Tests (tests/test_filters.py):
+- disabled provider excluded; provider without a resolvable API key
+  excluded; unsupported protocol excluded
+- provider without tools/streaming/JSON-mode excluded when the request
+  requires them; a fully capable provider is eligible
+- all providers filtered out raises NoEligibleProvidersError, whose message
+  names each excluded provider with its own specific reason
+- a successful call still reports every filtered-out provider in
+  RouterResponse.excluded, and populates RouterResponse.attempts with the
+  one provider actually invoked
 
-If filtering excludes every configured provider, invoke() raises
-NoEligibleProvidersError. Per the transparency principle, this error must
-enumerate every excluded provider with its own specific FilterReason/detail
-(e.g. "provider_a: missing tool-calling support; provider_c: disabled"),
-never a single generic "no eligible providers" message.
-
-Tests:
-- provider without API key is excluded
-- disabled provider is excluded
-- provider without tools is excluded when tools are required
-- provider without streaming is excluded when streaming is required
-- all providers filtered out raises NoEligibleProvidersError, and the error
-  message names each excluded provider with its own specific reason
-- a successful call still reports any filtered-out providers in
-  RouterResponse.excluded
-
-PR 3: Round robin with current-run memory only
-----------------------------------------------
+PR 3: Round robin with current-run memory only -- SHIPPED
+-------------------------------------------------------------
 Goal:
-Make the router actually rotate between providers during the current Python process.
+Make the router actually rotate between providers during the current Python
+process, and fall back to the next eligible provider on a retryable failure.
 
-Scope:
-- RoundRobinPolicy
-- current-run round-robin index
-- fallback to next provider on retryable error
-- basic provider attempt record in memory
+What shipped (verified against src/nygen_router/):
+- policies/base.py: Policy as a typing.Protocol with one method,
+  order(eligible) -> list[ProviderConfig] -- not an abstract base class.
+- policies/round_robin.py: RoundRobinPolicy. Holds a private _index counter;
+  order() rotates eligible so a different provider leads each call
+  (i = index % len(eligible), then index += 1). It indexes into whatever is
+  eligible right now, not into the original config list, so it self-heals
+  automatically if the eligible set shrinks or grows between calls. No
+  persistence -- the counter lives only for the life of the
+  RoundRobinPolicy instance / Python process, exactly as planned.
+- ProviderRouter(providers=[...]) needs no code change to get rotation +
+  fallback: the constructor defaults policy to RoundRobinPolicy() when none
+  is passed, matching the "same call signature as PR1" requirement. policy
+  is an explicit constructor argument for swapping in a different policy
+  later (PR9).
+- health.py: ProviderHealthState, a dataclass with one field so far
+  (auth_disabled: bool = False). Held on ProviderRouter as
+  self._health: dict[str, ProviderHealthState], not inside the policy --
+  exactly as planned, so the same state is visible to
+  filter_eligible_providers (via disabled_this_run) and to any policy. PR5
+  will extend this dataclass in place with cooldown_until /
+  consecutive_failures rather than relocating it.
+- ErrorCategory (StrEnum: TIMEOUT, RATE_LIMIT, AUTH, SERVER_ERROR,
+  BAD_REQUEST, UNKNOWN) and categorize_error(exc) in errors.py. HTTP status
+  mapping: 429->RATE_LIMIT, 401/403->AUTH, 408->TIMEOUT, >=500->SERVER_ERROR,
+  400/422->BAD_REQUEST, everything else->UNKNOWN; an httpx-level timeout
+  (ProviderTimeoutError) is always TIMEOUT.
+- ProviderRouter.invoke()'s fallback loop iterates self._policy.order(eligible);
+  on each provider's exception it records a ProviderAttempt(success=False,
+  error=exc) (the real exception object, never rephrased), then branches by
+  categorize_error(exc):
+  - AUTH: marks self._health[provider.name] = ProviderHealthState(auth_disabled=True)
+    (benches it starting next call -- this call already had it selected)
+    and continues to the next provider.
+  - BAD_REQUEST: stops the whole loop immediately (break) rather than
+    continuing to the next provider. This is a real design decision beyond
+    what the original plan specified -- the plan only said BAD_REQUEST
+    "usually do not retry" without saying whether that meant "skip this
+    provider" or "stop the whole call"; the shipped behavior is the latter,
+    documented in AGENT.md and in router.py's comments: a 400/422 is almost
+    always the request itself, so trying other providers would just add
+    noise, not a fix.
+  - everything else (TIMEOUT, RATE_LIMIT, SERVER_ERROR, UNKNOWN): continues
+    to the next eligible provider.
+  If every tried provider fails (or BAD_REQUEST cut the loop short),
+  invoke() raises RouterExhaustedError(attempts), whose message enumerates
+  each attempted provider with its own real failure.
+- On success, the response is returned via
+  response.model_copy(update={"attempts": attempts, "excluded": excluded})
+  -- attempts contains every provider tried this call, in order, each with
+  its real outcome.
 
-Suggested files:
+Files actually added by PR3:
+src/nygen_router/health.py
+src/nygen_router/policies/__init__.py
 src/nygen_router/policies/base.py
 src/nygen_router/policies/round_robin.py
 tests/test_round_robin.py
 tests/test_fallback.py
 
-Behavior:
-For a loop like this:
-
-for _ in range(10):
-    router.invoke("hello")
-
-The selected provider should rotate during that Python process.
-
-No persistence yet.
-
-Default policy (no API change required from PR1/PR2 callers):
-Round-robin + fallback becomes the automatic default the moment PR3 ships.
-ProviderRouter(providers=[...]) -- the exact same call signature as PR1 --
-starts rotating and falling back with no code change. ProviderRouter gains an
-optional `policy` constructor argument (e.g. policy=RoundRobinPolicy()) only
-for explicitly overriding the default later (PR9's ScoreBasedPolicy).
-
-Shared health/disablement state:
-Per-run provider health state (starting with "auth-disabled this run" here,
-extended by PR5 with cooldowns/consecutive-failure counts) lives on
-ProviderRouter itself as a small tracker (e.g. self._health: dict[str,
-ProviderHealthState]), not inside RoundRobinPolicy. This is so the same state
-is visible to the eligibility filter (PR2) and to any policy, including
-PR9's ScoreBasedPolicy later -- state must not be lost if the policy is
-swapped. PR5 extends ProviderHealthState in place; it does not relocate it.
-
-RouterResponse.attempts (see PR1) is populated with one entry per provider
-actually invoked during fallback, in order, each carrying its real
-success/failure outcome and the provider's real error object (never
-rewrapped) if it failed.
-
-Required fallback behavior:
-provider A selected
-provider A times out
-router tries provider B
-provider B succeeds
-router returns provider B response (with attempts = [A: failed w/ real
-error, B: succeeded])
-
-Error categories:
-- TIMEOUT
-- RATE_LIMIT
-- AUTH
-- SERVER_ERROR
-- BAD_REQUEST
-- UNKNOWN
-
-Suggested retry behavior:
-- TIMEOUT: try next provider
-- RATE_LIMIT: try next provider
-- SERVER_ERROR: try next provider
-- AUTH: disable provider for current run
-- BAD_REQUEST: usually do not retry, because the request itself may be invalid
-
 Tests:
-- round robin rotates
-- round robin ignores filtered providers
-- fallback tries second provider on timeout
-- fallback tries second provider on rate limit
-- auth error disables provider for current run
-- all providers fail raises RouterExhaustedError, and the error message names
-  each attempted provider with its own real, distinct failure (never a
-  blended "all providers failed" message)
-- a successful fallback populates RouterResponse.attempts with every
-  provider tried, including the real error for ones that failed first
+- tests/test_round_robin.py: rotation advances the starting provider across
+  successive calls; rotation only considers eligible providers; an injected
+  custom policy is honored instead of the default; ordering an empty
+  eligible list returns empty
+- tests/test_fallback.py: fallback tries the next provider on timeout, rate
+  limit (429), a plain 404, HTTP 408 (treated as timeout), a 5xx server
+  error, and an unrecognized/unknown error; an auth error (401/403) disables
+  the provider for the rest of the run; a bad request (400/422) stops the
+  run immediately without trying further providers, even after an earlier
+  provider already failed; when every attempted provider fails,
+  RouterExhaustedError names each one with its own distinct reason; a
+  successful fallback's RouterResponse is JSON-serializable and keeps the
+  real unwrapped error on the failed attempt(s)
 
-PR 4: SQLite memory
--------------------
+Verified: pytest -q -> 55 passed; coverage report -> 93% (branch coverage
+on) across PR1-3; ruff check . -> all checks passed; mypy src (strict) -> no
+issues in 14 source files.
+
+PR 4: DuckDB-backed metrics storage (default), behind a swappable interface
+-----------------------------------------------------------------------------
 Goal:
-Persist observational metrics locally using the Python standard library sqlite3 module.
+Persist observational metrics so score-based routing (PR7-10) has real
+history to work from, using DuckDB as the embedded, no-server-to-run default
+-- swappable for SQLite or any other SQL-compatible backend behind one
+shared interface.
+
+Revision note (supervisor meeting, 2026-07-09): the original plan defaulted
+to Python's stdlib sqlite3 module here, with any storage-backend abstraction
+deferred to PR13 and DuckDB arriving later still (PR14) as an optional
+analytics-only backend. The supervisor's meeting notes call for DuckDB as
+the default local option and for a design that lets users plug in any
+SQL-compatible database. This section is rewritten accordingly: DuckDB is
+now the default, behind a small MetricsStore protocol introduced in this PR
+(scoped to exactly what PR4 needs: record + query), so swapping backends
+later is a matter of passing a different metrics_store, not a rewrite. This
+does not pull PR13's full scope (schema versioning, migrations, a heavier
+storage framework) forward -- PR13 is unchanged and still comes later, on
+top of the same seam this PR establishes.
 
 Scope:
-- MetricsEvent
-- SQLiteMetricsStore
-- schema initialization
-- record attempt event
-- query recent attempts
-
-Suggested files:
-src/nygen_router/metrics.py
-src/nygen_router/storage/base.py
-src/nygen_router/storage/sqlite.py
-tests/test_sqlite_storage.py
-
-First SQLite table:
+- storage/base.py: MetricsStore protocol -- record_attempt(event:
+  MetricsEvent) -> None and query_recent(...) -> list[MetricsEvent]. This is
+  the minimum interface every backend (DuckDB, SQLite, and later Postgres/
+  Supabase) implements, so callers switch backends by passing a different
+  metrics_store, never by changing router code.
+- MetricsEvent: a dataclass (not a raw dict) describing one row.
+- storage/duckdb.py: DuckDBMetricsStore, the new default. Lazy-imports
+  duckdb inside its own methods (never at module import time), following the
+  same lazy-SDK-import pattern already used for provider adapters -- so
+  `from nygen_router import ProviderRouter` keeps working with duckdb not
+  installed (the project's non-negotiable lightweight-import rule).  Backed
+  by a fixed file under the user's home directory (~/.nygen_router/metrics.duckdb),
+  created on first use -- a real file, not an in-memory database, so history
+  survives across separate runs of a script (needed for the "router learns
+  over time" demo target).
+- storage/sqlite.py: SQLiteMetricsStore, kept as a fully-supported
+  alternative (Python stdlib only, no extra install) implementing the same
+  MetricsStore protocol -- for users who want a single-file store without
+  installing the duckdb package.
+- New optional dependency group: `pip install nygen-router[duckdb]`.
+  Without it, ProviderRouter still constructs and invoke() still works: the
+  default DuckDBMetricsStore's write attempt fails with an ImportError,
+  which the storage-failure handling below treats like any other storage
+  failure -- the successful provider response is still returned (a warning
+  is logged once PR19 ships). Document nygen-router[duckdb] in the README as
+  the recommended "batteries-included" install.
+- First table (provider_attempts), same columns regardless of engine:
 CREATE TABLE provider_attempts (
     id TEXT PRIMARY KEY,
     timestamp TEXT NOT NULL,
@@ -507,32 +544,41 @@ CREATE TABLE provider_attempts (
     request_size_bucket TEXT NOT NULL
 );
 
-Important behavior:
-Storage failure should not break a successful LLM response. If the provider succeeds but metrics storage fails, return the provider response.
+Suggested files:
+src/nygen_router/metrics.py
+src/nygen_router/storage/base.py
+src/nygen_router/storage/duckdb.py
+src/nygen_router/storage/sqlite.py
+tests/test_metrics_store.py (shared protocol-conformance tests, parametrized
+  over both backends)
+tests/test_duckdb_storage.py
+tests/test_sqlite_storage.py
 
-Default storage (works out of the box, no config required):
-ProviderRouter defaults to a SQLiteMetricsStore backed by a fixed file under
-the user's home directory (~/.nygen_router/metrics.db), created automatically
-on first use. This is a real file on disk, not an in-memory ":memory:"
-database -- in-memory SQLite only lives for the current process and would
-not persist across separate runs of a script, which would defeat the "router
-learns over time" goal (PR9's final demo target). Using a fixed user-level
-path (rather than a path relative to the current working directory) means
-history is reused correctly regardless of which directory the program is
-run from. `metrics_store` remains overridable: pass an explicit
-SQLiteMetricsStore(path) for a custom location/backend, or metrics_store=None
-to disable persistence entirely.
+Important behavior:
+Storage failure should not break a successful LLM response. If the provider
+succeeds but metrics storage fails -- including "duckdb is not installed" --
+return the provider response.
+
+Default storage (works out of the box once the duckdb extra is installed;
+degrades to no persistence, not a crash, otherwise):
+ProviderRouter defaults to metrics_store=DuckDBMetricsStore() pointed at
+~/.nygen_router/metrics.duckdb. `metrics_store` remains fully overridable:
+pass SQLiteMetricsStore(path), a different MetricsStore implementation, or
+metrics_store=None to disable persistence entirely.
 
 Tests:
-- creates schema
-- records success event
-- records failure event
-- queries recent events
-- ignores events outside lookback window
-- router continues if metrics store fails
-- default metrics_store writes to ~/.nygen_router/metrics.db when not
-  otherwise configured
+- MetricsStore protocol conformance run against both DuckDBMetricsStore and
+  SQLiteMetricsStore, so the two backends can't silently diverge in behavior
+- creates schema; records success event; records failure event; queries
+  recent events; ignores events outside the lookback window
+- router continues if metrics storage fails, including a simulated "duckdb
+  not installed" ImportError
+- default metrics_store writes to ~/.nygen_router/metrics.duckdb when not
+  otherwise configured and duckdb is installed
 - metrics_store=None disables persistence with no file created
+- DuckDB-specific tests are skipped (not failed) when the duckdb package is
+  not installed, matching the pattern already planned for PR14's other
+  optional backends
 
 PR 5: Health state and cooldowns
 --------------------------------
