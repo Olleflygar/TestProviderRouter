@@ -1,19 +1,36 @@
-## Onboarding: plug Nygen Router into your existing workflow
+## Onboarding: replace the LLM object with Nygen Router
 
-Nygen Router is designed to be used where you would normally use an LLM or model client.
+Without Nygen Router, an application usually calls one provider directly. Nygen Router is designed to replace the LLM or model object in your existing workflow.
+
+### Before: using one LLM provider directly
 
 ```python
+from some_ai_framework import LLM
+
+llm = LLM(
+    model="some-model",
+    base_url="https://provider-a.example.com/v1",
+    api_key_env="PROVIDER_A_API_KEY",
+)
+
+response = llm.invoke("Write a short product description.")
+
+print(response.text)
+```
+
+### After: using Nygen Router
+
+```python
+from nygen_router import ProviderRouter
+
 router = ProviderRouter(...)
 
-# Use router where you would normally use an LLM/model client.
 response = router.invoke("Write a short product description.")
 
 print(response.text)
 ```
 
-Instead of hard-coding one provider, you give Nygen Router multiple provider options. The router can then choose which provider should handle each request based on eligibility, recent performance, latency, cost, and other application-specific metrics.
-
----
+The application still calls `.invoke(...)` in the same way. The difference is that the single hard-coded LLM provider is replaced by Nygen Router, which can choose between configured providers based on eligibility, recent performance, latency, cost, and other application-specific metrics.
 
 ## Plain Python
 
