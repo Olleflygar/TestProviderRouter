@@ -1,12 +1,6 @@
 from __future__ import annotations
 
-from nygen_router import (
-    ApiProtocol,
-    ProviderConfig,
-    ProviderRouter,
-    RoundRobinPolicy,
-    RouterResponse,
-)
+from nygen_router import ApiProtocol, CallVariant, ProviderConfig, ProviderRouter, RoundRobinPolicy
 
 
 def _config(name: str, *, enabled: bool = True) -> ProviderConfig:
@@ -20,14 +14,24 @@ def _config(name: str, *, enabled: bool = True) -> ProviderConfig:
     )
 
 
+def _calls() -> list[CallVariant]:
+    return [
+        CallVariant(
+            protocol=ApiProtocol.OPENAI_CHAT,
+            operation="chat.completions.create",
+            arguments={"messages": [{"role": "user", "content": "hi"}]},
+        )
+    ]
+
+
 class _EchoAdapter:
-    """Always succeeds, reporting which provider served the call."""
+    """Always succeeds, echoing back which provider served the call."""
 
     def __init__(self, config: ProviderConfig):
         self.config = config
 
-    def invoke(self, request: object) -> RouterResponse:
-        return RouterResponse(provider_name=self.config.name, model=self.config.model, text="ok")
+    def invoke(self, operation: str, arguments: dict[str, object]) -> str:
+        return self.config.name
 
 
 class _ReversePolicy:
@@ -41,7 +45,7 @@ def test_round_robin_rotates_starting_provider() -> None:
     providers = [_config("provider_a"), _config("provider_b"), _config("provider_c")]
     router = ProviderRouter(providers=providers, adapter_factory=_EchoAdapter)
 
-    selected = [router.invoke("hi").provider_name for _ in range(4)]
+    selected = [router.invoke(_calls()) for _ in range(4)]
 
     assert selected == ["provider_a", "provider_b", "provider_c", "provider_a"]
 
@@ -54,7 +58,7 @@ def test_round_robin_only_rotates_among_eligible_providers() -> None:
     ]
     router = ProviderRouter(providers=providers, adapter_factory=_EchoAdapter)
 
-    selected = [router.invoke("hi").provider_name for _ in range(4)]
+    selected = [router.invoke(_calls()) for _ in range(4)]
 
     assert "provider_b" not in selected
     assert selected == ["provider_a", "provider_c", "provider_a", "provider_c"]
@@ -70,8 +74,8 @@ def test_injected_policy_is_honored() -> None:
     )
 
     # Reverse order puts provider_b first, and it succeeds immediately every call.
-    assert router.invoke("hi").provider_name == "provider_b"
-    assert router.invoke("hi").provider_name == "provider_b"
+    assert router.invoke(_calls()) == "provider_b"
+    assert router.invoke(_calls()) == "provider_b"
 
 
 def test_round_robin_order_of_empty_eligible_is_empty() -> None:

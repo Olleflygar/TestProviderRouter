@@ -1,7 +1,6 @@
 README.md
 pyproject.toml
 src/nygen_router/__init__.py
-src/nygen_router/capabilities.py
 src/nygen_router/config.py
 src/nygen_router/errors.py
 src/nygen_router/filters.py

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Collection
+from typing import Any
 
 from nygen_router.adapters.base import ProviderAdapter
 from nygen_router.adapters.openai_compatible import OpenAICompatibleAdapter
 from nygen_router.config import ApiProtocol, ProviderConfig
 from nygen_router.errors import (
+    DuplicateCallVariantProtocolError,
     ErrorCategory,
+    ModelArgumentConflictError,
     NoEligibleProvidersError,
     NoProvidersConfiguredError,
     RouterExhaustedError,
@@ -16,7 +19,7 @@ from nygen_router.errors import (
 from nygen_router.filters import filter_eligible_providers
 from nygen_router.health import ProviderHealthState
 from nygen_router.policies import Policy, RoundRobinPolicy
-from nygen_router.types import ProviderAttempt, RouterRequest, RouterResponse
+from nygen_router.types import CallVariant, ProviderAttempt
 
 AdapterFactory = Callable[[ProviderConfig], ProviderAdapter]
 
@@ -24,6 +27,12 @@ AdapterFactory = Callable[[ProviderConfig], ProviderAdapter]
 # (e.g. OPENAI_RESPONSES in PR12) means registering its protocol here so the
 # eligibility filter stops excluding it.
 SUPPORTED_PROTOCOLS = frozenset({ApiProtocol.OPENAI_CHAT})
+
+# Failure categories that abort the whole run immediately instead of falling
+# back to the next eligible provider: the call itself is broken (malformed
+# request, bad operation, mismatched arguments, missing SDK), so no other
+# provider trying the same broken call would fare any better.
+_STOP_CATEGORIES = frozenset({ErrorCategory.BAD_REQUEST, ErrorCategory.INVALID_OPERATION})
 
 
 class ProviderRouter:
@@ -48,16 +57,23 @@ class ProviderRouter:
         # policy. Not persisted across process restarts (PR3 scope).
         self._health: dict[str, ProviderHealthState] = {}
 
-    def invoke(self, input: str | RouterRequest) -> RouterResponse:
-        """Filter, order eligible providers, then try them in turn with fallback."""
-        request = RouterRequest.from_input(input)
+    def invoke(self, calls: list[CallVariant]) -> Any:
+        """Filter, order eligible providers, then try them in turn with fallback.
+
+        Returns the raw native response object the winning provider's SDK
+        returned -- untouched, with nothing attached. Every attempt and
+        exclusion is still tracked internally, so a total failure still
+        raises an error enumerating each provider's own real reason.
+        """
         if not self.providers:
             raise NoProvidersConfiguredError("No providers configured.")
 
+        variants_by_protocol = self._prepare_variants(calls)
+
         eligible, excluded = filter_eligible_providers(
             self.providers,
-            request,
             supported_protocols=self._supported_protocols,
+            requested_protocols=variants_by_protocol.keys(),
             disabled_this_run=self._auth_disabled_names(),
         )
         if not eligible:
@@ -65,9 +81,11 @@ class ProviderRouter:
 
         attempts: list[ProviderAttempt] = []
         for provider in self._policy.order(eligible):
+            variant = variants_by_protocol[provider.protocol]
+            arguments = {**variant.arguments, "model": provider.model}
             adapter = self._adapter_for(provider)
             try:
-                response = adapter.invoke(request)
+                response = adapter.invoke(variant.operation, arguments)
             except Exception as exc:
                 attempts.append(
                     ProviderAttempt(provider_name=provider.name, success=False, error=exc)
@@ -77,16 +95,33 @@ class ProviderRouter:
                     # Bench it for the rest of the run; the filter excludes it
                     # on the next invoke() call, not this one.
                     self._health[provider.name] = ProviderHealthState(auth_disabled=True)
-                if category is ErrorCategory.BAD_REQUEST:
-                    # A 400 is almost always the request itself, not this
-                    # provider -- stop rather than obscure it with more failures.
+                if category in _STOP_CATEGORIES:
                     break
                 continue
 
             attempts.append(ProviderAttempt(provider_name=provider.name, success=True))
-            return response.model_copy(update={"attempts": attempts, "excluded": excluded})
+            return response
 
         raise RouterExhaustedError(attempts)
+
+    @staticmethod
+    def _prepare_variants(calls: list[CallVariant]) -> dict[ApiProtocol, CallVariant]:
+        """Validate every CallVariant once, upfront, before any provider is contacted.
+
+        Never mutates a CallVariant's arguments -- the same variant is reused
+        across every provider attempt of its protocol in the fallback loop, so
+        the model-conflict check runs once here, against the caller's
+        original arguments only.
+        """
+        variants_by_protocol: dict[ApiProtocol, CallVariant] = {}
+        for call in calls:
+            if call.protocol in variants_by_protocol:
+                raise DuplicateCallVariantProtocolError(call.protocol)
+            variants_by_protocol[call.protocol] = call
+        for variant in variants_by_protocol.values():
+            if "model" in variant.arguments:
+                raise ModelArgumentConflictError(variant.protocol, variant.operation)
+        return variants_by_protocol
 
     def _auth_disabled_names(self) -> frozenset[str]:
         """Names of providers benched this run for an auth failure."""

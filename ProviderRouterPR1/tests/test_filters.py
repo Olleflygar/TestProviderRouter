@@ -4,18 +4,16 @@ import pytest
 
 from nygen_router import (
     ApiProtocol,
-    ChatMessage,
+    CallVariant,
     FilterReason,
-    ProviderCapabilities,
+    NoEligibleProvidersError,
     ProviderConfig,
     ProviderRouter,
-    RouterRequest,
-    RouterResponse,
 )
-from nygen_router.errors import NoEligibleProvidersError
 from nygen_router.filters import filter_eligible_providers
 
 SUPPORTED = frozenset({ApiProtocol.OPENAI_CHAT})
+REQUESTED = frozenset({ApiProtocol.OPENAI_CHAT})
 
 
 def _config(
@@ -24,7 +22,6 @@ def _config(
     enabled: bool = True,
     api_key: str | None = "secret",
     api_key_env: str | None = None,
-    capabilities: ProviderCapabilities | None = None,
 ) -> ProviderConfig:
     return ProviderConfig(
         name=name,
@@ -34,25 +31,35 @@ def _config(
         api_key=api_key,
         api_key_env=api_key_env,
         enabled=enabled,
-        capabilities=capabilities or ProviderCapabilities(),
     )
 
 
-def _text_request() -> RouterRequest:
-    return RouterRequest(messages=[ChatMessage(role="user", content="hi")])
+def _calls() -> list[CallVariant]:
+    return [
+        CallVariant(
+            protocol=ApiProtocol.OPENAI_CHAT,
+            operation="chat.completions.create",
+            arguments={"messages": [{"role": "user", "content": "hi"}]},
+        )
+    ]
 
 
-class _FakeAdapter:
-    def __init__(self, config: ProviderConfig):
+class _TrackingAdapter:
+    """Records which provider was actually invoked and echoes its name back."""
+
+    def __init__(self, config: ProviderConfig, invoked: list[str] | None = None):
         self.config = config
+        self._invoked = invoked
 
-    def invoke(self, request: RouterRequest) -> RouterResponse:
-        return RouterResponse(provider_name=self.config.name, model=self.config.model, text="ok")
+    def invoke(self, operation: str, arguments: dict[str, object]) -> str:
+        if self._invoked is not None:
+            self._invoked.append(self.config.name)
+        return self.config.name
 
 
 def test_disabled_provider_is_excluded() -> None:
     eligible, excluded = filter_eligible_providers(
-        [_config(enabled=False)], _text_request(), supported_protocols=SUPPORTED
+        [_config(enabled=False)], supported_protocols=SUPPORTED, requested_protocols=REQUESTED
     )
 
     assert eligible == []
@@ -64,7 +71,7 @@ def test_provider_without_api_key_is_excluded(monkeypatch: pytest.MonkeyPatch) -
     provider = _config(api_key=None, api_key_env="NYGEN_TEST_MISSING_KEY")
 
     eligible, excluded = filter_eligible_providers(
-        [provider], _text_request(), supported_protocols=SUPPORTED
+        [provider], supported_protocols=SUPPORTED, requested_protocols=REQUESTED
     )
 
     assert eligible == []
@@ -80,100 +87,68 @@ def test_unsupported_protocol_is_excluded() -> None:
     )
 
     eligible, excluded = filter_eligible_providers(
-        [provider], _text_request(), supported_protocols=SUPPORTED
+        [provider], supported_protocols=SUPPORTED, requested_protocols=REQUESTED
     )
 
     assert eligible == []
     assert excluded[0].reason is FilterReason.UNSUPPORTED_PROTOCOL
 
 
-def test_provider_without_tools_excluded_when_tools_required() -> None:
-    request = RouterRequest(messages=[ChatMessage(role="user", content="hi")], requires_tools=True)
+def test_provider_without_matching_call_variant_is_excluded() -> None:
+    """The router supports the protocol in general, but this call has no CallVariant for it."""
+    provider = _config()
 
     eligible, excluded = filter_eligible_providers(
-        [_config()], request, supported_protocols=SUPPORTED
+        [provider], supported_protocols=SUPPORTED, requested_protocols=frozenset()
     )
 
     assert eligible == []
-    assert excluded[0].reason is FilterReason.MISSING_TOOLS
-    assert "tool-calling" in excluded[0].detail
+    assert excluded[0].reason is FilterReason.NO_MATCHING_CALL_VARIANT
 
 
-def test_provider_without_streaming_excluded_when_streaming_required() -> None:
-    request = RouterRequest(
-        messages=[ChatMessage(role="user", content="hi")], requires_streaming=True
-    )
+def test_fully_eligible_provider_passes() -> None:
+    provider = _config()
 
     eligible, excluded = filter_eligible_providers(
-        [_config()], request, supported_protocols=SUPPORTED
+        [provider], supported_protocols=SUPPORTED, requested_protocols=REQUESTED
     )
 
-    assert eligible == []
-    assert excluded[0].reason is FilterReason.MISSING_STREAMING
-
-
-def test_provider_without_json_mode_excluded_when_json_required() -> None:
-    request = RouterRequest(
-        messages=[ChatMessage(role="user", content="hi")], requires_json_mode=True
-    )
-
-    eligible, excluded = filter_eligible_providers(
-        [_config()], request, supported_protocols=SUPPORTED
-    )
-
-    assert eligible == []
-    assert excluded[0].reason is FilterReason.MISSING_JSON_MODE
-
-
-def test_capable_provider_is_eligible() -> None:
-    provider = _config(capabilities=ProviderCapabilities(supports_tools=True))
-    request = RouterRequest(messages=[ChatMessage(role="user", content="hi")], requires_tools=True)
-
-    eligible, excluded = filter_eligible_providers(
-        [provider], request, supported_protocols=SUPPORTED
-    )
-
-    assert [provider.name for provider in eligible] == ["provider_a"]
+    assert [p.name for p in eligible] == ["provider_a"]
     assert excluded == []
 
 
-def test_all_providers_filtered_out_raises_with_each_specific_reason() -> None:
+def test_all_providers_filtered_out_raises_with_each_specific_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NYGEN_TEST_MISSING_KEY_2", raising=False)
     providers = [
         _config("provider_a", enabled=False),
-        _config("provider_c"),  # enabled, but lacks tool support
+        _config("provider_c", api_key=None, api_key_env="NYGEN_TEST_MISSING_KEY_2"),
     ]
     router = ProviderRouter(providers=providers)
-    request = RouterRequest(messages=[ChatMessage(role="user", content="hi")], requires_tools=True)
 
     with pytest.raises(NoEligibleProvidersError) as exc_info:
-        router.invoke(request)
+        router.invoke(_calls())
 
     message = str(exc_info.value)
     assert "provider_a: provider is disabled" in message
-    assert "provider_c: missing tool-calling support" in message
+    assert "provider_c: no API key available" in message
     assert {result.provider_name for result in exc_info.value.exclusions} == {
         "provider_a",
         "provider_c",
     }
 
 
-def test_successful_call_still_reports_filtered_providers_in_excluded() -> None:
+def test_successful_call_only_invokes_eligible_provider() -> None:
+    """A disabled provider is filtered out and never invoked; the eligible one serves the call."""
+    invoked: list[str] = []
     providers = [_config("provider_a", enabled=False), _config("provider_b")]
-    router = ProviderRouter(providers=providers, adapter_factory=_FakeAdapter)
+    router = ProviderRouter(
+        providers=providers,
+        adapter_factory=lambda config: _TrackingAdapter(config, invoked),
+    )
 
-    response = router.invoke("hi")
+    response = router.invoke(_calls())
 
-    assert response.provider_name == "provider_b"
-    assert [result.provider_name for result in response.excluded] == ["provider_a"]
-    assert response.excluded[0].reason is FilterReason.DISABLED
-
-
-def test_successful_call_populates_attempts_with_invoked_provider() -> None:
-    router = ProviderRouter(providers=[_config("provider_b")], adapter_factory=_FakeAdapter)
-
-    response = router.invoke("hi")
-
-    assert len(response.attempts) == 1
-    assert response.attempts[0].provider_name == "provider_b"
-    assert response.attempts[0].success is True
-    assert response.attempts[0].error is None
+    assert response == "provider_b"
+    assert invoked == ["provider_b"]  # provider_a was excluded, never invoked

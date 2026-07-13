@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import httpx
 
+    from nygen_router.config import ApiProtocol
     from nygen_router.types import EligibilityResult, ProviderAttempt
 
 
@@ -44,6 +45,45 @@ class UnsupportedProtocolError(NygenRouterError):
         super().__init__(
             f"Provider {provider_name!r} uses protocol {str(protocol)!r}, which is not "
             f"supported yet (PR 1 supports only 'openai_chat')."
+        )
+
+
+class ModelArgumentConflictError(ConfigError):
+    """A CallVariant's arguments already contain "model"; the router always injects it."""
+
+    def __init__(self, protocol: ApiProtocol, operation: str) -> None:
+        self.protocol = protocol
+        self.operation = operation
+        super().__init__(
+            f"CallVariant for protocol {str(protocol)!r} operation {operation!r} already "
+            f"has a 'model' key in its arguments -- the router always supplies the "
+            f"provider's configured model; remove 'model' from arguments."
+        )
+
+
+class DuplicateCallVariantProtocolError(ConfigError):
+    """Two CallVariants in one invoke() call share the same protocol."""
+
+    def __init__(self, protocol: ApiProtocol) -> None:
+        self.protocol = protocol
+        super().__init__(
+            f"More than one CallVariant was supplied for protocol {str(protocol)!r} in a "
+            f"single invoke() call; each protocol must appear at most once."
+        )
+
+
+class ProviderSDKNotInstalledError(ConfigError):
+    """The provider SDK a protocol's adapter needs is not installed."""
+
+    def __init__(
+        self, provider_name: str, package: str, original: BaseException | None = None
+    ) -> None:
+        self.provider_name = provider_name
+        self.package = package
+        self.original = original
+        super().__init__(
+            f"Provider {provider_name!r} requires the {package!r} package, which is not "
+            f'installed: pip install "nygen-router[{package}]".'
         )
 
 
@@ -109,6 +149,14 @@ class ProviderConnectionError(ProviderError):
     """A provider request could not establish a connection."""
 
 
+class UnsupportedOperationError(ProviderError):
+    """A CallVariant's ``operation`` does not resolve on the provider's SDK client."""
+
+
+class InvalidOperationArgumentsError(ProviderError):
+    """A CallVariant's ``arguments`` do not match its resolved operation's signature."""
+
+
 class ProviderHTTPError(ProviderError):
     """A provider returned a non-2xx HTTP status.
 
@@ -153,29 +201,6 @@ class ProviderHTTPError(ProviderError):
         )
 
 
-class ProviderResponseError(ProviderError):
-    """A provider returned a 2xx response the router could not interpret."""
-
-    def __init__(
-        self,
-        provider_name: str,
-        model: str,
-        problem: str,
-        *,
-        body: Any = None,
-        response: httpx.Response | None = None,
-    ) -> None:
-        self.problem = problem
-        self.body = body
-        self.response = response
-        super().__init__(
-            f"Provider {provider_name!r} returned an unexpected response for model "
-            f"{model!r}: {problem}",
-            provider_name=provider_name,
-            model=model,
-        )
-
-
 def _http_reason(status_code: int) -> str:
     """Map a status code to its standard reason phrase, or "" if unknown."""
     try:
@@ -196,6 +221,7 @@ class ErrorCategory(StrEnum):
     AUTH = "auth"
     SERVER_ERROR = "server_error"
     BAD_REQUEST = "bad_request"
+    INVALID_OPERATION = "invalid_operation"
     UNKNOWN = "unknown"
 
 
@@ -205,8 +231,19 @@ def categorize_error(exc: Exception) -> ErrorCategory:
     Only 400/422 count as BAD_REQUEST (the request itself is malformed, so no
     provider will do better). Other 4xx like 404/413 are provider-specific --
     wrong base_url, model not hosted there, smaller payload limits -- and must
-    not stop the run while valid providers remain.
+    not stop the run while valid providers remain. INVALID_OPERATION covers
+    caller/config mistakes discovered before any provider request is even
+    sent (a bad operation string, arguments that don't match it, or a missing
+    provider SDK) -- every provider sharing that protocol would fail
+    identically, so the run stops rather than burying the real cause.
     """
+    invalid_operation_errors = (
+        UnsupportedOperationError,
+        InvalidOperationArgumentsError,
+        ProviderSDKNotInstalledError,
+    )
+    if isinstance(exc, invalid_operation_errors):
+        return ErrorCategory.INVALID_OPERATION
     if isinstance(exc, ProviderTimeoutError):
         return ErrorCategory.TIMEOUT
     if isinstance(exc, ProviderHTTPError):

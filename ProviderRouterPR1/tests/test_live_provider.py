@@ -1,7 +1,7 @@
 """Live integration test: proves the provider configuration works against a real API.
 
-Unlike the adapter tests (which use httpx.MockTransport), this test sends one
-real request to the provider configured below. It auto-skips when the API key
+Unlike the adapter tests (which mock the transport), this test sends one real
+request to the provider configured below. It auto-skips when the API key
 environment variable is not set, so plain ``pytest`` stays free and offline on
 machines without credentials.
 
@@ -17,7 +17,7 @@ import string
 import pytest
 from dotenv import load_dotenv
 
-from nygen_router import ApiProtocol, ChatMessage, ProviderConfig, RouterRequest
+from nygen_router import ApiProtocol, CallVariant, ProviderConfig
 from nygen_router.router import ProviderRouter
 
 load_dotenv()
@@ -55,19 +55,28 @@ def _normalize(text: str) -> str:
 def test_live_provider_returns_hello() -> None:
     router = ProviderRouter(providers=[_live_config()])
 
-    request = RouterRequest(
-        messages=[
-            ChatMessage(
-                role="user",
-                content="Return only the word Hello if the connection is working, nothing else.",
+    response = router.invoke(
+        [
+            CallVariant(
+                protocol=ApiProtocol.OPENAI_CHAT,
+                operation="chat.completions.create",
+                arguments={
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Return only the word Hello if the connection is "
+                                "working, nothing else."
+                            ),
+                        }
+                    ],
+                    "temperature": 0.0,
+                    "max_tokens": 10,
+                },
             )
-        ],
-        temperature=0.0,
-        max_tokens=10,
+        ]
     )
 
-    response = router.invoke(request)
-
-    assert response.provider_name == LIVE_PROVIDER_NAME
     assert response.model == LIVE_MODEL
-    assert _normalize(response.text) == "hello", f"unexpected reply: {response.text!r}"
+    text = response.choices[0].message.content
+    assert _normalize(text) == "hello", f"unexpected reply: {text!r}"

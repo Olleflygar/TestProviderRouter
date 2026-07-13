@@ -1,19 +1,20 @@
 from __future__ import annotations
 
-import json
+import sys
 from typing import Any
 
 import httpx
 import pytest
 
-from nygen_router import ApiProtocol, ChatMessage, ProviderConfig, RouterRequest
+from nygen_router import ApiProtocol, ProviderConfig
 from nygen_router.adapters.openai_compatible import OpenAICompatibleAdapter
 from nygen_router.errors import (
+    InvalidOperationArgumentsError,
     ProviderConnectionError,
-    ProviderError,
     ProviderHTTPError,
-    ProviderResponseError,
+    ProviderSDKNotInstalledError,
     ProviderTimeoutError,
+    UnsupportedOperationError,
 )
 
 
@@ -27,131 +28,128 @@ def _config() -> ProviderConfig:
     )
 
 
-def _request() -> RouterRequest:
-    return RouterRequest(messages=[ChatMessage(role="user", content="Hello")])
+def _client(handler: Any) -> httpx.Client:
+    return httpx.Client(transport=httpx.MockTransport(handler))
 
 
-def test_adapter_sends_request_to_chat_completions() -> None:
+def _arguments() -> dict[str, object]:
+    return {"model": "model-a", "messages": [{"role": "user", "content": "Hello"}]}
+
+
+def _completion_body(content: str = "Hi") -> dict[str, object]:
+    return {
+        "id": "x",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "model-a",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
+def test_adapter_sends_request_to_configured_endpoint() -> None:
     captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["url"] = str(request.url)
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": "Hi"}}]},
-        )
+        return httpx.Response(200, json=_completion_body())
 
-    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
+    adapter = OpenAICompatibleAdapter(_config(), http_client=_client(handler))
 
-    adapter.invoke(_request())
+    adapter.invoke("chat.completions.create", _arguments())
 
     assert captured["url"] == "https://api.example.com/v1/chat/completions"
 
 
-def test_adapter_includes_model_and_messages() -> None:
+def test_adapter_sends_arguments_and_authorization_header() -> None:
     captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
         captured["payload"] = json.loads(request.content.decode())
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": "Hi"}}]},
-        )
+        captured["authorization"] = request.headers["Authorization"]
+        return httpx.Response(200, json=_completion_body())
 
-    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
+    adapter = OpenAICompatibleAdapter(_config(), http_client=_client(handler))
 
-    adapter.invoke(_request())
+    adapter.invoke("chat.completions.create", _arguments())
 
     assert captured["payload"] == {
         "model": "model-a",
         "messages": [{"role": "user", "content": "Hello"}],
     }
-
-
-def test_adapter_includes_authorization_header() -> None:
-    captured: dict[str, str] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["authorization"] = request.headers["Authorization"]
-        captured["content_type"] = request.headers["Content-Type"]
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": "Hi"}}]},
-        )
-
-    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
-
-    adapter.invoke(_request())
-
     assert captured["authorization"] == "Bearer secret"
-    assert captured["content_type"] == "application/json"
 
 
-def test_adapter_parses_response_text() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": "Hello back"}}]},
-        )
+def test_adapter_returns_raw_sdk_response_untouched() -> None:
+    """The adapter must not parse/transform the response -- it's the real SDK object."""
 
-    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
-
-    response = adapter.invoke(_request())
-
-    assert response.text == "Hello back"
-    assert response.provider_name == "provider_a"
-    assert response.model == "model-a"
-
-
-def test_adapter_allows_empty_content() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": ""}}]},
-        )
-
-    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
-
-    response = adapter.invoke(_request())
-
-    assert response.text == ""
-
-
-def test_adapter_rejects_null_content() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": None}}]},
-        )
-
-    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
-
-    with pytest.raises(ProviderResponseError):
-        adapter.invoke(_request())
-
-
-def test_adapter_parses_usage() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             json={
-                "choices": [{"message": {"content": "Hello back"}}],
-                "usage": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 20,
-                    "total_tokens": 30,
-                },
+                **_completion_body("Hello back"),
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
             },
         )
 
-    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
+    adapter = OpenAICompatibleAdapter(_config(), http_client=_client(handler))
 
-    response = adapter.invoke(_request())
+    response = adapter.invoke("chat.completions.create", _arguments())
 
+    assert type(response).__module__.startswith("openai.")
+    assert response.choices[0].message.content == "Hello back"
     assert response.usage is not None
-    assert response.usage.input_tokens == 10
-    assert response.usage.output_tokens == 20
+    assert response.usage.prompt_tokens == 10
     assert response.usage.total_tokens == 30
+
+
+def test_unsupported_operation_raises_for_bad_operation_path() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - never reached
+        raise AssertionError("no request should be sent")
+
+    adapter = OpenAICompatibleAdapter(_config(), http_client=_client(handler))
+
+    with pytest.raises(UnsupportedOperationError) as exc_info:
+        adapter.invoke("chat.completions.creat", _arguments())
+
+    assert exc_info.value.provider_name == "provider_a"
+    assert isinstance(exc_info.value.__cause__, AttributeError)
+    assert exc_info.value.original is exc_info.value.__cause__
+
+
+def test_invalid_operation_arguments_raises_for_bad_kwargs() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - never reached
+        raise AssertionError("no request should be sent")
+
+    adapter = OpenAICompatibleAdapter(_config(), http_client=_client(handler))
+
+    with pytest.raises(InvalidOperationArgumentsError) as exc_info:
+        adapter.invoke("chat.completions.create", {"bogus_kwarg": 1})
+
+    assert exc_info.value.provider_name == "provider_a"
+    assert isinstance(exc_info.value.__cause__, TypeError)
+    assert exc_info.value.original is exc_info.value.__cause__
+
+
+def test_sdk_not_installed_raises_provider_sdk_not_installed_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "openai", None)
+    adapter = OpenAICompatibleAdapter(_config())
+
+    with pytest.raises(ProviderSDKNotInstalledError) as exc_info:
+        adapter.invoke("chat.completions.create", _arguments())
+
+    assert exc_info.value.provider_name == "provider_a"
+    assert exc_info.value.package == "openai"
+    assert isinstance(exc_info.value.original, ModuleNotFoundError)
 
 
 @pytest.mark.parametrize("status_code", [401, 429])
@@ -164,31 +162,29 @@ def test_http_errors_raise_provider_http_error(status_code: int) -> None:
             json={"error": {"message": "provider rejected request"}},
         )
 
-    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
+    adapter = OpenAICompatibleAdapter(_config(), http_client=_client(handler))
 
     with pytest.raises(ProviderHTTPError) as exc_info:
-        adapter.invoke(_request())
+        adapter.invoke("chat.completions.create", _arguments())
 
     assert exc_info.value.provider_name == "provider_a"
     assert exc_info.value.status_code == status_code
 
 
 def test_http_error_preserves_verbatim_message_and_structured_fields() -> None:
-    body = {
-        "error": {
-            "message": "model gpt-4o-mini does not exist",
-            "type": "invalid_request_error",
-            "code": "model_not_found",
-        }
+    error_body = {
+        "message": "model gpt-4o-mini does not exist",
+        "type": "invalid_request_error",
+        "code": "model_not_found",
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404, json=body)
+        return httpx.Response(404, json={"error": error_body})
 
-    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
+    adapter = OpenAICompatibleAdapter(_config(), http_client=_client(handler))
 
     with pytest.raises(ProviderHTTPError) as exc_info:
-        adapter.invoke(_request())
+        adapter.invoke("chat.completions.create", _arguments())
 
     error = exc_info.value
     # The provider's exact message is front-and-center, no unwrapping needed.
@@ -197,28 +193,58 @@ def test_http_error_preserves_verbatim_message_and_structured_fields() -> None:
     assert "HTTP 404 Not Found" in str(error)
     assert error.error_type == "invalid_request_error"
     assert error.error_code == "model_not_found"
-    assert error.body == body
+    assert error.body == error_body
     assert error.status_code == 404
-    # The standard httpx error stays reachable as the chained cause.
-    assert isinstance(error.__cause__, httpx.HTTPStatusError)
+    # The openai SDK's own status error stays reachable as the chained cause.
+    assert isinstance(error.__cause__, Exception)
+    assert type(error.__cause__).__name__ == "NotFoundError"
     assert error.response is not None
     assert error.model == "model-a"
+
+
+def test_http_error_falls_back_to_synthesized_message_for_nonstandard_body() -> None:
+    """When the body has no "message" key, fall back to the SDK's own summary string."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"foo": "bar"})
+
+    adapter = OpenAICompatibleAdapter(_config(), http_client=_client(handler))
+
+    with pytest.raises(ProviderHTTPError) as exc_info:
+        adapter.invoke("chat.completions.create", _arguments())
+
+    assert "Error code: 500" in exc_info.value.message
+
+
+def test_http_error_falls_back_to_synthesized_message_for_non_json_body() -> None:
+    """A non-JSON error body parses to a plain string, not a dict -- fall back too."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, content=b"plain text error, not json")
+
+    adapter = OpenAICompatibleAdapter(_config(), http_client=_client(handler))
+
+    with pytest.raises(ProviderHTTPError) as exc_info:
+        adapter.invoke("chat.completions.create", _arguments())
+
+    # exc.body is a plain str here (not a dict), so _verbatim_message falls back to
+    # exc.message -- which the SDK sets to the raw body text for a non-JSON response.
+    assert exc_info.value.message == "plain text error, not json"
 
 
 def test_timeout_raises_provider_timeout_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("read timed out", request=request)
 
-    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
+    adapter = OpenAICompatibleAdapter(_config(), http_client=_client(handler))
 
     with pytest.raises(ProviderTimeoutError) as exc_info:
-        adapter.invoke(_request())
+        adapter.invoke("chat.completions.create", _arguments())
 
     error = exc_info.value
     assert error.provider_name == "provider_a"
     assert error.model == "model-a"
-    assert "ReadTimeout" in str(error)
-    assert isinstance(error.__cause__, httpx.ReadTimeout)
+    assert type(error.__cause__).__name__ == "APITimeoutError"
     assert error.original is error.__cause__
 
 
@@ -226,36 +252,24 @@ def test_connection_failure_raises_provider_connection_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused", request=request)
 
-    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
+    adapter = OpenAICompatibleAdapter(_config(), http_client=_client(handler))
 
     with pytest.raises(ProviderConnectionError) as exc_info:
-        adapter.invoke(_request())
+        adapter.invoke("chat.completions.create", _arguments())
 
-    assert isinstance(exc_info.value.__cause__, httpx.ConnectError)
-    assert "ConnectError" in str(exc_info.value)
+    assert type(exc_info.value.__cause__).__name__ == "APIConnectionError"
 
 
-def test_other_transport_error_raises_provider_error() -> None:
+def test_other_transport_error_also_raises_provider_connection_error() -> None:
+    """The openai SDK folds every non-timeout transport failure into APIConnectionError."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.RemoteProtocolError("protocol error", request=request)
 
-    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
+    adapter = OpenAICompatibleAdapter(_config(), http_client=_client(handler))
 
-    with pytest.raises(ProviderError) as exc_info:
-        adapter.invoke(_request())
+    with pytest.raises(ProviderConnectionError) as exc_info:
+        adapter.invoke("chat.completions.create", _arguments())
 
-    assert not isinstance(exc_info.value, (ProviderTimeoutError, ProviderConnectionError))
-    assert isinstance(exc_info.value.__cause__, httpx.RemoteProtocolError)
-
-
-def test_malformed_response_raises_provider_response_error() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"not_choices": []})
-
-    adapter = OpenAICompatibleAdapter(_config(), transport=httpx.MockTransport(handler))
-
-    with pytest.raises(ProviderResponseError) as exc_info:
-        adapter.invoke(_request())
-
-    assert exc_info.value.provider_name == "provider_a"
-    assert exc_info.value.model == "model-a"
+    assert not isinstance(exc_info.value, ProviderTimeoutError)
+    assert type(exc_info.value.__cause__).__name__ == "APIConnectionError"

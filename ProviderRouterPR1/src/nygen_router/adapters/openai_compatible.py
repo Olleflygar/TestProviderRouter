@@ -1,59 +1,78 @@
 from __future__ import annotations
 
-from typing import Any, NoReturn, cast
-
-import httpx
+from typing import TYPE_CHECKING, Any
 
 from nygen_router.config import ProviderConfig
 from nygen_router.errors import (
-    ConfigError,
+    InvalidOperationArgumentsError,
     ProviderConnectionError,
     ProviderError,
     ProviderHTTPError,
-    ProviderResponseError,
+    ProviderSDKNotInstalledError,
     ProviderTimeoutError,
+    UnsupportedOperationError,
 )
-from nygen_router.types import RouterRequest, RouterResponse, TokenUsage
+
+if TYPE_CHECKING:
+    import httpx
 
 
 class OpenAICompatibleAdapter:
-    def __init__(self, config: ProviderConfig, transport: httpx.BaseTransport | None = None):
-        self.config = config
-        self._transport = transport
+    """Dispatches a prepared (operation, arguments) pair to the openai SDK.
 
-    def invoke(self, request: RouterRequest) -> RouterResponse:
-        """POST the request to /chat/completions and normalize the response or raise."""
+    Lazily imports ``openai`` so the core package stays importable without it
+    installed. Deliberately thin: the router decides which CallVariant
+    applies and injects the model before calling in here -- this adapter's
+    only job is dynamic dispatch and mapping the SDK's own exceptions onto
+    the router's error hierarchy, never re-shaping the request itself.
+    """
+
+    def __init__(self, config: ProviderConfig, http_client: httpx.Client | None = None) -> None:
+        self.config = config
+        self._http_client = http_client
+
+    def invoke(self, operation: str, arguments: dict[str, object]) -> Any:
+        """Resolve operation on an openai client and call it with arguments, or raise."""
         name = self.config.name
         model = self.config.model
 
-        # Resolve the key first so a missing key surfaces as a configuration
-        # error (MissingApiKeyError), never as a transport failure.
-        api_key = self.config.resolve_api_key()
-        url = self._endpoint()
+        try:
+            import openai
+        except ModuleNotFoundError as exc:
+            raise ProviderSDKNotInstalledError(name, "openai", original=exc) from exc
 
-        payload: dict[str, object] = {
-            "model": model,
-            "messages": [message.model_dump() for message in request.messages],
-        }
-        if request.temperature is not None:
-            payload["temperature"] = request.temperature
-        if request.max_tokens is not None:
-            payload["max_tokens"] = request.max_tokens
+        client = openai.OpenAI(
+            api_key=self.config.resolve_api_key(),
+            base_url=self.config.base_url,
+            timeout=self.config.timeout_seconds,
+            max_retries=0,  # the router's own cross-provider fallback is the sole retry path
+            http_client=self._http_client,
+        )
+
+        target: Any = client
+        try:
+            for part in operation.split("."):
+                target = getattr(target, part)
+        except AttributeError as exc:
+            raise UnsupportedOperationError(
+                f"Provider {name!r} has no operation {operation!r} on its openai client "
+                f"({type(exc).__name__}): {exc}",
+                provider_name=name,
+                model=model,
+                original=exc,
+            ) from exc
 
         try:
-            with httpx.Client(
-                timeout=self.config.timeout_seconds,
-                transport=self._transport,
-            ) as client:
-                response = client.post(
-                    url,
-                    json=payload,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                )
-        except httpx.TimeoutException as exc:
+            return target(**arguments)
+        except TypeError as exc:
+            raise InvalidOperationArgumentsError(
+                f"Provider {name!r} operation {operation!r} rejected the given arguments for "
+                f"model {model!r} ({type(exc).__name__}): {exc}",
+                provider_name=name,
+                model=model,
+                original=exc,
+            ) from exc
+        except openai.APITimeoutError as exc:
             raise ProviderTimeoutError(
                 f"Provider {name!r} timed out after {self.config.timeout_seconds}s for model "
                 f"{model!r} ({type(exc).__name__}): {exc}",
@@ -61,7 +80,7 @@ class OpenAICompatibleAdapter:
                 model=model,
                 original=exc,
             ) from exc
-        except httpx.ConnectError as exc:
+        except openai.APIConnectionError as exc:
             raise ProviderConnectionError(
                 f"Provider {name!r} could not connect for model {model!r} "
                 f"({type(exc).__name__}): {exc}",
@@ -69,7 +88,21 @@ class OpenAICompatibleAdapter:
                 model=model,
                 original=exc,
             ) from exc
-        except httpx.HTTPError as exc:
+        except openai.APIStatusError as exc:
+            raise ProviderHTTPError(
+                provider_name=name,
+                model=model,
+                status_code=exc.status_code,
+                message=_verbatim_message(exc.body, fallback=exc.message),
+                error_type=exc.type,
+                error_code=exc.code,
+                body=exc.body,
+                response=exc.response,
+                original=exc,
+            ) from exc
+        except openai.OpenAIError as exc:  # pragma: no cover
+            # Defensive: every realistic SDK failure through .create() is already caught
+            # by a more specific branch above; kept for a future SDK version's new type.
             raise ProviderError(
                 f"Provider {name!r} request failed for model {model!r} "
                 f"({type(exc).__name__}): {exc}",
@@ -78,152 +111,18 @@ class OpenAICompatibleAdapter:
                 original=exc,
             ) from exc
 
-        if response.status_code >= 400:
-            _raise_http_error(self.config, response)
 
-        raw = _decode_json(response, name, model)
-        return RouterResponse(
-            provider_name=name,
-            model=model,
-            text=_extract_text(raw, name, model),
-            raw=raw,
-            usage=_extract_usage(raw),
-        )
+def _verbatim_message(body: object, *, fallback: str) -> str:
+    """Pull the provider's own error text out of the SDK's parsed body.
 
-    def _endpoint(self) -> str:
-        """Build the chat/completions URL, or raise if base_url is missing."""
-        if self.config.base_url is None:
-            raise ConfigError(f"Provider {self.config.name!r} has no base_url configured.")
-        return f"{self.config.base_url.rstrip('/')}/chat/completions"
-
-
-def _raise_http_error(config: ProviderConfig, response: httpx.Response) -> NoReturn:
-    """Turn a non-2xx response into a ProviderHTTPError, chained from httpx's own error."""
-    message, error_type, error_code, body = _parse_provider_error(response)
-    try:
-        # Produces a standard httpx.HTTPStatusError we chain from, so the
-        # familiar httpx error (with .request/.response) stays reachable.
-        response.raise_for_status()
-    except httpx.HTTPStatusError as status_error:
-        raise ProviderHTTPError(
-            provider_name=config.name,
-            model=config.model,
-            status_code=response.status_code,
-            message=message,
-            error_type=error_type,
-            error_code=error_code,
-            body=body,
-            response=response,
-            original=status_error,
-        ) from status_error
-    raise ProviderHTTPError(  # pragma: no cover - status >= 400 always raises above
-        provider_name=config.name,
-        model=config.model,
-        status_code=response.status_code,
-        message=message,
-        error_type=error_type,
-        error_code=error_code,
-        body=body,
-        response=response,
-    )
-
-
-def _parse_provider_error(
-    response: httpx.Response,
-) -> tuple[str, str | None, str | None, Any]:
-    """Extract the provider's verbatim error message and structured fields.
-
-    Handles the OpenAI-style ``{"error": {"message", "type", "code"}}`` shape,
-    a top-level ``{"message": ...}``, and falls back to the raw response text.
+    ``APIStatusError.message`` is a summary the SDK synthesizes itself
+    ("Error code: 404 - {...}"), not the provider's text -- the real message
+    lives in ``body`` (already unwrapped from any ``{"error": {...}}``
+    envelope by the SDK). Falls back to the synthesized summary if the body
+    isn't shaped as expected, so a message is always available.
     """
-    try:
-        payload = response.json()
-    except ValueError:
-        return response.text, None, None, None
-
-    if isinstance(payload, dict):
-        error = payload.get("error")
-        if isinstance(error, dict):
-            message = error.get("message")
-            error_type = error.get("type")
-            error_code = error.get("code")
-            return (
-                message if isinstance(message, str) else response.text,
-                error_type if isinstance(error_type, str) else None,
-                str(error_code) if error_code is not None else None,
-                payload,
-            )
-        message = payload.get("message")
+    if isinstance(body, dict):
+        message = body.get("message")
         if isinstance(message, str):
-            return message, None, None, payload
-    return response.text, None, None, payload
-
-
-def _decode_json(response: httpx.Response, provider_name: str, model: str) -> dict[str, object]:
-    """Parse the body as a JSON object, or raise ProviderResponseError."""
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise ProviderResponseError(
-            provider_name,
-            model,
-            "response body is not valid JSON",
-            body=response.text,
-            response=response,
-        ) from exc
-
-    if not isinstance(payload, dict):
-        raise ProviderResponseError(
-            provider_name,
-            model,
-            "response JSON is not an object",
-            body=payload,
-            response=response,
-        )
-    return cast(dict[str, object], payload)
-
-
-def _extract_text(raw: dict[str, object], provider_name: str, model: str) -> str:
-    """Pull the assistant's message content out of the choices[0] shape."""
-    choices = raw.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise ProviderResponseError(provider_name, model, "response is missing 'choices'", body=raw)
-
-    first_choice = choices[0]
-    if not isinstance(first_choice, dict):
-        raise ProviderResponseError(
-            provider_name, model, "response choice is not an object", body=raw
-        )
-
-    message = first_choice.get("message")
-    if not isinstance(message, dict):
-        raise ProviderResponseError(
-            provider_name, model, "response choice is missing 'message'", body=raw
-        )
-
-    content = message.get("content")
-    if not isinstance(content, str):
-        raise ProviderResponseError(
-            provider_name, model, "response message is missing 'content'", body=raw
-        )
-
-    return content
-
-
-def _extract_usage(raw: dict[str, object]) -> TokenUsage | None:
-    """Read token usage from the response if the provider included it."""
-    usage = raw.get("usage")
-    if not isinstance(usage, dict):
-        return None
-
-    return TokenUsage(
-        input_tokens=_optional_int(usage.get("prompt_tokens")),
-        output_tokens=_optional_int(usage.get("completion_tokens")),
-        total_tokens=_optional_int(usage.get("total_tokens")),
-    )
-
-
-def _optional_int(value: Any) -> int | None:
-    if isinstance(value, int):
-        return value
-    return None
+            return message
+    return fallback

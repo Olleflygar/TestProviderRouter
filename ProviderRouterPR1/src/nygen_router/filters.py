@@ -2,31 +2,35 @@ from __future__ import annotations
 
 from collections.abc import Collection
 
-from nygen_router.capabilities import missing_capability
 from nygen_router.config import ApiProtocol, ProviderConfig
 from nygen_router.errors import MissingApiKeyError
-from nygen_router.types import EligibilityResult, FilterReason, RouterRequest
+from nygen_router.types import EligibilityResult, FilterReason
 
 
 def filter_eligible_providers(
     providers: list[ProviderConfig],
-    request: RouterRequest,
     *,
     supported_protocols: Collection[ApiProtocol],
+    requested_protocols: Collection[ApiProtocol],
     disabled_this_run: Collection[str] = frozenset(),
 ) -> tuple[list[ProviderConfig], list[EligibilityResult]]:
-    """Split providers into those that can satisfy the request and those that cannot.
+    """Split providers into those that can satisfy this call and those that cannot.
 
     Hard filters, not scores: a provider that fails any essential check is
     excluded with a specific FilterReason, not ranked lower. Each excluded
     provider yields exactly one EligibilityResult carrying its first failing
-    reason. ``disabled_this_run`` names providers benched for the current run
+    reason. ``requested_protocols`` is the set of protocols present in this
+    call's CallVariants -- a provider whose protocol isn't among them is
+    excluded from this call, even if the router supports that protocol in
+    general. ``disabled_this_run`` names providers benched for the current run
     (e.g. after an auth failure); the router supplies it from its health state.
     """
     eligible: list[ProviderConfig] = []
     excluded: list[EligibilityResult] = []
     for provider in providers:
-        exclusion = _first_failing_reason(provider, request, supported_protocols, disabled_this_run)
+        exclusion = _first_failing_reason(
+            provider, supported_protocols, requested_protocols, disabled_this_run
+        )
         if exclusion is None:
             eligible.append(provider)
         else:
@@ -39,8 +43,8 @@ def filter_eligible_providers(
 
 def _first_failing_reason(
     provider: ProviderConfig,
-    request: RouterRequest,
     supported_protocols: Collection[ApiProtocol],
+    requested_protocols: Collection[ApiProtocol],
     disabled_this_run: Collection[str],
 ) -> tuple[FilterReason, str] | None:
     """Return the first essential filter this provider fails, or None if eligible."""
@@ -55,7 +59,12 @@ def _first_failing_reason(
         return FilterReason.MISSING_API_KEY, "no API key available"
     if provider.protocol not in supported_protocols:
         return FilterReason.UNSUPPORTED_PROTOCOL, f"protocol {provider.protocol} is not supported"
-    return missing_capability(provider, request)
+    if provider.protocol not in requested_protocols:
+        return (
+            FilterReason.NO_MATCHING_CALL_VARIANT,
+            f"no CallVariant for protocol {provider.protocol} was supplied to this call",
+        )
+    return None
 
 
 def _has_resolvable_api_key(provider: ProviderConfig) -> bool:

@@ -4,12 +4,12 @@ import pytest
 
 from nygen_router import (
     ApiProtocol,
-    ChatMessage,
+    CallVariant,
+    DuplicateCallVariantProtocolError,
     FilterReason,
+    ModelArgumentConflictError,
     ProviderConfig,
     ProviderRouter,
-    RouterRequest,
-    RouterResponse,
 )
 from nygen_router.errors import (
     NoEligibleProvidersError,
@@ -28,11 +28,21 @@ def _openai_config(name: str = "provider_a", *, enabled: bool = True) -> Provide
     )
 
 
+def _calls() -> list[CallVariant]:
+    return [
+        CallVariant(
+            protocol=ApiProtocol.OPENAI_CHAT,
+            operation="chat.completions.create",
+            arguments={"messages": [{"role": "user", "content": "Hello"}]},
+        )
+    ]
+
+
 def test_router_raises_no_providers_configured_with_no_providers() -> None:
     router = ProviderRouter(providers=[])
 
     with pytest.raises(NoProvidersConfiguredError):
-        router.invoke("Hello")
+        router.invoke(_calls())
 
 
 def test_router_invokes_first_enabled_openai_compatible_provider() -> None:
@@ -43,13 +53,9 @@ def test_router_invokes_first_enabled_openai_compatible_provider() -> None:
         def __init__(self, config: ProviderConfig):
             self.config = config
 
-        def invoke(self, request: RouterRequest) -> RouterResponse:
+        def invoke(self, operation: str, arguments: dict[str, object]) -> str:
             called_with["provider_name"] = self.config.name
-            return RouterResponse(
-                provider_name=self.config.name,
-                model=self.config.model,
-                text=request.messages[0].content,
-            )
+            return self.config.name
 
     router = ProviderRouter(
         providers=[
@@ -59,33 +65,14 @@ def test_router_invokes_first_enabled_openai_compatible_provider() -> None:
         adapter_factory=FakeAdapter,
     )
 
-    response = router.invoke("Hello")
+    response = router.invoke(_calls())
 
     assert called_with["provider_name"] == "provider_b"
-    assert response.provider_name == "provider_b"
-
-
-def test_router_normalizes_string_input_into_user_message() -> None:
-    class FakeAdapter:
-        def __init__(self, config: ProviderConfig):
-            self.config = config
-
-        def invoke(self, request: RouterRequest) -> RouterResponse:
-            return RouterResponse(
-                provider_name=self.config.name,
-                model=self.config.model,
-                text=f"{request.messages[0].role}:{request.messages[0].content}",
-            )
-
-    router = ProviderRouter(providers=[_openai_config()], adapter_factory=FakeAdapter)
-
-    response = router.invoke("Hello")
-
-    assert response.text == "user:Hello"
+    assert response == "provider_b"
 
 
 def test_router_excludes_provider_with_unsupported_protocol() -> None:
-    """PR2: an unsupported protocol is a hard filter, not a raised UnsupportedProtocolError."""
+    """An unsupported protocol is a hard filter, not a raised UnsupportedProtocolError."""
     router = ProviderRouter(
         providers=[
             ProviderConfig(
@@ -98,7 +85,7 @@ def test_router_excludes_provider_with_unsupported_protocol() -> None:
     )
 
     with pytest.raises(NoEligibleProvidersError) as exc_info:
-        router.invoke("Hello")
+        router.invoke(_calls())
 
     assert "anthropic" in str(exc_info.value)
     assert exc_info.value.exclusions[0].reason is FilterReason.UNSUPPORTED_PROTOCOL
@@ -111,10 +98,8 @@ def test_router_supports_custom_protocol_via_supported_protocols_param() -> None
         def __init__(self, config: ProviderConfig):
             self.config = config
 
-        def invoke(self, request: RouterRequest) -> RouterResponse:
-            return RouterResponse(
-                provider_name=self.config.name, model=self.config.model, text="ok"
-            )
+        def invoke(self, operation: str, arguments: dict[str, object]) -> str:
+            return self.config.name
 
     router = ProviderRouter(
         providers=[
@@ -129,30 +114,63 @@ def test_router_supports_custom_protocol_via_supported_protocols_param() -> None
         supported_protocols={ApiProtocol.ANTHROPIC_MESSAGES},
     )
 
-    response = router.invoke("Hello")
+    response = router.invoke(
+        [
+            CallVariant(
+                protocol=ApiProtocol.ANTHROPIC_MESSAGES,
+                operation="messages.create",
+                arguments={"messages": [{"role": "user", "content": "hi"}]},
+            )
+        ]
+    )
 
-    assert response.provider_name == "anthropic"
+    assert response == "anthropic"
 
 
-def test_router_excludes_tool_request_when_provider_lacks_tool_support() -> None:
-    """PR2: a missing required capability excludes the provider instead of raising."""
-
+def test_model_argument_conflict_raises_before_any_provider_is_contacted() -> None:
     class FakeAdapter:
         def __init__(self, config: ProviderConfig):
             self.config = config
 
-        def invoke(self, request: RouterRequest) -> RouterResponse:
+        def invoke(self, operation: str, arguments: dict[str, object]) -> str:
             raise AssertionError("adapter should not be called")
 
     router = ProviderRouter(providers=[_openai_config()], adapter_factory=FakeAdapter)
-    request = RouterRequest(
-        messages=[ChatMessage(role="user", content="Use a tool")],
-        requires_tools=True,
-    )
 
-    with pytest.raises(NoEligibleProvidersError) as exc_info:
-        router.invoke(request)
+    with pytest.raises(ModelArgumentConflictError):
+        router.invoke(
+            [
+                CallVariant(
+                    protocol=ApiProtocol.OPENAI_CHAT,
+                    operation="chat.completions.create",
+                    arguments={"model": "sneaky", "messages": []},
+                )
+            ]
+        )
 
-    assert "provider_a" in str(exc_info.value)
-    assert "tool-calling" in str(exc_info.value)
-    assert exc_info.value.exclusions[0].reason is FilterReason.MISSING_TOOLS
+
+def test_duplicate_call_variant_protocol_raises_before_any_provider_is_contacted() -> None:
+    class FakeAdapter:
+        def __init__(self, config: ProviderConfig):
+            self.config = config
+
+        def invoke(self, operation: str, arguments: dict[str, object]) -> str:
+            raise AssertionError("adapter should not be called")
+
+    router = ProviderRouter(providers=[_openai_config()], adapter_factory=FakeAdapter)
+
+    with pytest.raises(DuplicateCallVariantProtocolError):
+        router.invoke(
+            [
+                CallVariant(
+                    protocol=ApiProtocol.OPENAI_CHAT,
+                    operation="chat.completions.create",
+                    arguments={"messages": []},
+                ),
+                CallVariant(
+                    protocol=ApiProtocol.OPENAI_CHAT,
+                    operation="chat.completions.create",
+                    arguments={"messages": []},
+                ),
+            ]
+        )

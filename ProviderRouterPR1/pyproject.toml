@@ -9,14 +9,18 @@ description = "Lightweight provider router foundation."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "httpx>=0.24,<1",
     "pydantic>=2,<3",
 ]
 
 [project.optional-dependencies]
+openai = [
+    "openai>=1,<2",
+]
 dev = [
     "coverage>=7,<8",
+    "httpx>=0.24,<1",
     "mypy>=1,<2",
+    "openai>=1,<2",
     "pytest>=7,<9",
     "python-dotenv>=1,<2",
     "ruff>=0.6,<1",

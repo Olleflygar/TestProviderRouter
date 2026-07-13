@@ -3,38 +3,42 @@ from __future__ import annotations
 from nygen_router.config import ApiProtocol, ProviderCapabilities, ProviderConfig
 from nygen_router.errors import (
     ConfigError,
+    DuplicateCallVariantProtocolError,
+    InvalidOperationArgumentsError,
     MissingApiKeyError,
+    ModelArgumentConflictError,
     NoEligibleProvidersError,
     NoProvidersConfiguredError,
     NygenRouterError,
     ProviderConnectionError,
     ProviderError,
     ProviderHTTPError,
-    ProviderResponseError,
+    ProviderSDKNotInstalledError,
     ProviderTimeoutError,
     RouterExhaustedError,
+    UnsupportedOperationError,
     UnsupportedProtocolError,
 )
 from nygen_router.filters import filter_eligible_providers
 from nygen_router.policies import RoundRobinPolicy
 from nygen_router.router import ProviderRouter
 from nygen_router.types import (
-    ChatMessage,
+    CallVariant,
     EligibilityResult,
     FilterReason,
     ProviderAttempt,
-    RouterRequest,
-    RouterResponse,
-    TokenUsage,
 )
 
 __all__ = [
     "ApiProtocol",
-    "ChatMessage",
+    "CallVariant",
     "ConfigError",
+    "DuplicateCallVariantProtocolError",
     "EligibilityResult",
     "FilterReason",
+    "InvalidOperationArgumentsError",
     "MissingApiKeyError",
+    "ModelArgumentConflictError",
     "NoEligibleProvidersError",
     "NoProvidersConfiguredError",
     "NygenRouterError",
@@ -44,14 +48,12 @@ __all__ = [
     "ProviderConnectionError",
     "ProviderError",
     "ProviderHTTPError",
-    "ProviderResponseError",
     "ProviderRouter",
+    "ProviderSDKNotInstalledError",
     "ProviderTimeoutError",
     "RoundRobinPolicy",
     "RouterExhaustedError",
-    "RouterRequest",
-    "RouterResponse",
-    "TokenUsage",
+    "UnsupportedOperationError",
     "UnsupportedProtocolError",
     "filter_eligible_providers",
 ]

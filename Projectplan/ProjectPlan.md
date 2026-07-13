@@ -15,13 +15,24 @@ too fast to scrape reliably at this project's scale). Manually-configured
 token pricing may be added later as an optional, user-supplied customization
 (see PR 6), but it is deferred and does not gate the core sprint.
 
-Implementation status (as of 2026-07-09)
+Implementation status (as of 2026-07-13)
 -----------------------------------------
 PR 1, PR 2, and PR 3 are implemented and merged (ProviderRouterPR1/src/nygen_router/).
 The three PR sections below are rewritten from "planned" to "shipped": they
 describe what the code and tests actually do, verified directly against the
-source and test suite, not restated from the original proposal. PR 4 onward
-is still the forward-looking plan and is unchanged here.
+source and test suite, not restated from the original proposal.
+
+Superseded (2026-07-13): the normalized RouterRequest/ChatMessage/TokenUsage/
+RouterResponse request-response model and the request-driven capability hard
+filter described in the PR 1-3 sections below were replaced by the
+CallVariant / openai-SDK redesign (its own section, placed immediately after
+PR 3). The PR 1-3 sections are left as-is below, not rewritten again -- they
+remain an accurate historical record of what those PRs shipped at the time,
+per this doc's own rule of updating a test/description only when a later PR
+deliberately changes the behavior it describes, never deleting the record of
+what came before. PR 4 onward is still the forward-looking plan and is
+unchanged by the redesign except for the two new backlog entries it adds
+(PR 21, PR 22), appended after PR 20.
 
 Verified: `ruff check .`, `mypy src` (strict mode), and `pytest` all pass;
 combined coverage across PR1-3 is 93% (branch coverage on), meeting the 90%+
@@ -234,7 +245,7 @@ Response API discussion (from the supervisor meeting, not yet resolved):
 the meeting notes flag the Response API as "the emerging standard, most
 tools moving toward it, OpenAI itself now adopting it." The current plan
 only adds an OPENAI_RESPONSES adapter at PR12, after round robin (PR3),
-SQLite (PR4), health/cooldowns (PR5), and scoring (PR6-10). Given the
+DuckDB-backed storage (PR4), health/cooldowns (PR5), and scoring (PR6-10). Given the
 emphasis in the meeting, it may be worth moving the Responses adapter
 earlier in the sequence (e.g. right after PR3, before storage/scoring) --
 this is a scope/sequencing question, not something resolved by this
@@ -479,6 +490,122 @@ Tests:
 Verified: pytest -q -> 55 passed; coverage report -> 93% (branch coverage
 on) across PR1-3; ruff check . -> all checks passed; mypy src (strict) -> no
 issues in 14 source files.
+
+PR 3R: CallVariant / openai-SDK request-response redesign -- SHIPPED
+----------------------------------------------------------------------
+Goal:
+Replace the normalized RouterRequest/RouterResponse request-response model
+from PR1-3 with native, provider-specific pass-through, per a supervisor-
+supplied design doc (Provider_router_design.pdf): "the router chooses where a
+native API call is executed, it does not replace the provider API with a
+generalized LLM interface." This is a full pivot of the request/response
+contract every other module was built on, not an additive PR, so it lands as
+one cohesive change rather than split across several.
+
+What shipped (verified against src/nygen_router/):
+- types.py: RouterRequest, ChatMessage, TokenUsage, RouterResponse deleted.
+  New CallVariant(protocol, operation, arguments) -- a Pydantic model
+  (extra="forbid") carrying a dotted SDK operation string (e.g.
+  "chat.completions.create") and an opaque arguments: dict[str, object],
+  never inspected or validated beyond basic shape. ProviderRouter.invoke()
+  now takes calls: list[CallVariant] and returns Any -- the winning
+  provider's raw SDK response object (e.g. openai.types.chat.ChatCompletion),
+  completely untouched. There is no response wrapper: a successful call has
+  no .attempts/.excluded anymore (that data is still tracked internally
+  during the call, for RouterExhaustedError/NoEligibleProvidersError's
+  enumerated messages, just not attached to a success).
+- adapters/openai_compatible.py: the PR1 httpx-based adapter was scrapped
+  entirely (not migrated incrementally) and rebuilt on the official `openai`
+  Python SDK, lazily imported inside invoke() so the core package stays
+  importable without it (pip install "nygen-router[openai]"). Dispatch is
+  dynamic: CallVariant.operation is split on "." and walked via getattr onto
+  an openai.OpenAI(base_url=..., api_key=...) client (used against any
+  OpenAI-compatible base_url, not just OpenAI itself) -- chosen over a
+  hardcoded per-operation method map so a new operation needs zero adapter
+  changes. The router (not the adapter) resolves which CallVariant applies
+  per provider attempt and injects the provider's configured model into
+  arguments["model"] fresh each attempt (never mutating the CallVariant in
+  place, since the same variant is reused across every same-protocol attempt
+  in one fallback loop); a CallVariant whose arguments already contains
+  "model" raises ModelArgumentConflictError before any provider is contacted.
+  httpx is no longer a core dependency (it arrives transitively via the
+  openai extra, and is used directly only as an injectable http_client test
+  seam, the same role transport played in PR1).
+- errors.py: new UnsupportedOperationError / InvalidOperationArgumentsError
+  (ProviderError subclasses -- a bad operation string or arguments that don't
+  match its resolved signature, discovered lazily at dispatch time, chained
+  from the real AttributeError/TypeError); ModelArgumentConflictError /
+  DuplicateCallVariantProtocolError (ConfigError subclasses, raised once
+  upfront before any provider is contacted); ProviderSDKNotInstalledError
+  (ConfigError, wraps a ModuleNotFoundError with an install hint). deleted
+  ProviderResponseError (dead code once responses are never parsed).
+  categorize_error() gained ErrorCategory.INVALID_OPERATION, grouped with
+  BAD_REQUEST in the STOP set. openai SDK exceptions map onto the existing
+  error hierarchy exactly like PR1's httpx-based mapping did (APITimeoutError
+  -> ProviderTimeoutError, APIConnectionError -> ProviderConnectionError,
+  APIStatusError -> ProviderHTTPError, everything else -> ProviderError), all
+  chained via raise ... from so the original SDK exception stays reachable as
+  __cause__/.original -- the "one base type catches everything" contract is
+  preserved for every case, including dispatch failures. One correctness
+  fix discovered while building this: openai.APIStatusError.message is an
+  SDK-synthesized summary ("Error code: 404 - {...}"), not the provider's own
+  text -- the verbatim message has to be pulled out of exc.body instead (see
+  _verbatim_message in adapters/openai_compatible.py).
+- filters.py/capabilities.py: capability-based hard filtering (the PR2
+  requires_tools/requires_streaming/requires_json_mode mechanism) is dropped
+  -- capabilities.py's missing_capability() had no other purpose and was
+  deleted as dead code. filter_eligible_providers() dropped its request
+  param and gained a keyword-only requested_protocols param; a provider whose
+  protocol has an adapter but no matching CallVariant in this call is
+  excluded via a new FilterReason.NO_MATCHING_CALL_VARIANT, through the same
+  EligibilityResult machinery as every other exclusion. ProviderCapabilities
+  (the Pydantic model on ProviderConfig) is unchanged and still there --
+  simply unused by any filter for now; see PR 21 below.
+- Test suite: every test file was updated in place (none deleted wholesale);
+  three individual tests were deleted because the specific behavior they
+  asserted was deliberately removed by this redesign, not because they were
+  inconvenient: a response-JSON-serializability test (no more returned
+  wrapper object to serialize), a string-to-message-normalization test (no
+  more normalization -- arguments is opaque), and a capability-exclusion test
+  (capability filtering is gone, see above). tests/test_openai_compatible_adapter.py
+  was rewritten essentially from scratch: httpx.MockTransport is now wrapped
+  in an httpx.Client and injected via the adapter's http_client constructor
+  param (openai.OpenAI's own documented test seam, the direct analogue of
+  PR1's transport param), and HTTP-error-family tests drive real openai SDK
+  exceptions end-to-end through mocked HTTP responses rather than
+  constructing router errors by hand.
+
+Two deliberately deferred follow-ups, not part of this redesign -- see their
+own backlog entries below: PR 21 (restoring pre-flight capability filtering,
+now driven from a call's own arguments instead of dedicated boolean flags)
+and PR 22 (pre-flight CallVariant dispatch validation, so a bad operation/
+arguments typo is caught once upfront instead of costing one wasted live
+provider attempt).
+
+Files touched:
+ProviderRouterPR1/
+  pyproject.toml (httpx removed from core deps; openai added as its own
+    extras group and to dev)
+  README.md, AGENT.md (usage examples, hard-filtering and error sections
+    rewritten for the new design)
+  src/nygen_router/
+    __init__.py (export changes)
+    types.py (CallVariant added; RouterRequest/ChatMessage/TokenUsage/
+      RouterResponse removed)
+    errors.py (new error types; ProviderResponseError removed)
+    router.py (new invoke() signature and _prepare_variants() upfront pass)
+    filters.py (requested_protocols param; NO_MATCHING_CALL_VARIANT)
+    capabilities.py (deleted)
+    adapters/base.py, adapters/openai_compatible.py (rewritten)
+  tests/ (all seven files updated; test_openai_compatible_adapter.py
+    rewritten)
+
+Verified: pytest -q -> 53 passed; coverage report -> 97% (branch coverage
+on); ruff format ./ruff check . -> all checks passed; mypy src (strict) ->
+no issues in 13 source files. Also verified in isolated venvs: a bare
+`pip install -e .` (no extras) still allows `from nygen_router import
+ProviderRouter`, and `pip install -e ".[openai]"` (no dev extras) runs a full
+invoke() end-to-end.
 
 PR 4: DuckDB-backed metrics storage (default), behind a swappable interface
 -----------------------------------------------------------------------------
@@ -727,7 +854,8 @@ Tests:
 PR 9: Score-based routing policy
 --------------------------------
 Goal:
-Use SQLite history to rank providers.
+Use the persisted metrics history (DuckDB by default, or whichever
+MetricsStore backend is configured -- see PR4) to rank providers.
 
 Scope:
 - ScoreBasedPolicy
@@ -822,25 +950,37 @@ Tests:
 PR 13: Storage backend abstraction upgrade
 ------------------------------------------
 Goal:
-Prepare for DuckDB, Supabase, Postgres, and other SQL-compatible backends.
+Upgrade the MetricsStore protocol introduced in PR4 (currently just
+record_attempt/query_recent, backing DuckDB and SQLite) to support
+remote/managed SQL-compatible backends -- Supabase, Postgres, and others --
+plus schema versioning as the provider_attempts shape evolves (e.g. PR6's
+estimated_cost_usd column).
 
 Scope:
-- MetricsStore protocol
-- SQL schema versioning
-- storage initialization
-- stats query interface
+- SQL schema versioning / migrations
+- storage initialization for remote/managed backends (connection handling,
+  credentials -- distinct from DuckDB/SQLite's embedded, file-based setup)
+- richer stats query interface
 
-Do not overbuild a full ORM too early. Start with a storage protocol or storage backend abstraction.
+Do not overbuild a full ORM too early. PR4 already established the minimal
+storage protocol and two embedded backends; this PR extends that seam
+rather than introducing it.
 
-PR 14: DuckDB backend
----------------------
+PR 14: Supabase/Postgres backend (cloud default)
+--------------------------------------------------
 Goal:
-Add optional local analytics backend.
+Add the cloud-managed storage option -- Supabase (managed Postgres) as the
+default cloud backend, per the supervisor meeting, for teams that want
+shared/centralized routing history instead of a local DuckDB/SQLite file.
+DuckDB, the local default, already shipped in PR4, so this PR no longer
+needs to add it.
 
 Scope:
-- DuckDBMetricsStore
-- optional dependency group
-- tests skipped if duckdb is not installed
+- PostgresMetricsStore (works against both self-hosted Postgres and
+  Supabase, since Supabase is managed Postgres), implementing PR4's
+  MetricsStore protocol
+- optional dependency group (e.g. pip install nygen-router[postgres])
+- tests skipped if the postgres driver / a live connection is not available
 
 Rule:
 This must not affect:
@@ -942,6 +1082,62 @@ Optional support for:
 Rule:
 No observability dependency in core.
 
+PR 21: Capability-based hard filtering v2 (automatic inference)
+-----------------------------------------------------------------
+Goal:
+Restore pre-flight capability exclusion, dropped by the PR 3R CallVariant
+redesign (see that section above) when the normalized request's requires_tools
+/ requires_streaming / requires_json_mode flags went away.
+
+Scope:
+Infer what a call's own CallVariant.arguments need (e.g. "tools" present in
+arguments, "stream": True, "response_format" present) and compare that
+against each provider's already-shipped, currently-unused
+ProviderConfig.capabilities (supports_tools / supports_streaming /
+supports_json_mode), producing the same EligibilityResult/FilterReason
+exclusion machinery the old requires_* mechanism did -- new FilterReason
+members analogous to the retired MISSING_TOOLS / MISSING_STREAMING /
+MISSING_JSON_MODE. This necessarily means filter_eligible_providers() (or its
+caller) inspects argument keys per protocol to know what a given key implies
+-- a deliberate, scoped exception to the "router never interprets
+provider-shaped arguments" principle, justified because pre-flight exclusion
+is worth the cost of this one narrow translation.
+
+Tests:
+- provider without tools excluded when a CallVariant's arguments include
+  "tools"
+- provider without streaming excluded when arguments include "stream": True
+- provider without JSON mode excluded when arguments include a
+  response_format
+- a fully capable provider remains eligible
+
+PR 22: Pre-flight CallVariant dispatch validation
+----------------------------------------------------
+Goal:
+Deferred from PR 3R (see that section above): catch a bad operation string or
+mismatched arguments once, before the fallback loop starts, instead of
+discovering it lazily on the first live provider attempt.
+
+Scope:
+Before ordering/trying any provider, resolve each supplied CallVariant's
+operation via the same getattr walk the adapter uses, and check arguments
+binds to the resolved callable's real signature via
+inspect.signature(...).bind(...) -- which raises immediately, with no network
+call, if a required keyword is missing or an unexpected one is present. Only
+validate CallVariants for protocols that currently have at least one eligible
+provider (no point validating a variant nobody will use). On failure, raise
+the same UnsupportedOperationError/InvalidOperationArgumentsError used today,
+just before any provider has been attempted -- so a caller's typo never costs
+a wasted provider attempt or triggers an early STOP mid-fallback that strands
+otherwise-untried, still-eligible providers.
+
+Tests:
+- a bad operation string is caught before any provider is invoked
+- arguments that don't bind to the resolved operation's signature are caught
+  before any provider is invoked
+- a CallVariant for a protocol with zero eligible providers is not validated
+- a valid CallVariant still proceeds through the normal fallback loop
+
 Recommended sprint boundary
 ---------------------------
 For an 80% sprint target, aim to complete PR 1 through PR 10.
@@ -951,7 +1147,7 @@ That gives the project:
 - hard filters
 - round robin
 - fallback
-- SQLite memory
+- DuckDB-backed metrics storage
 - health/cooldowns
 - metrics aggregation
 - basic scoring

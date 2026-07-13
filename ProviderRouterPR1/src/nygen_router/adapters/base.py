@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from typing import Protocol
-
-from nygen_router.types import RouterRequest, RouterResponse
+from typing import Any, Protocol
 
 
 class ProviderAdapter(Protocol):
-    def invoke(self, request: RouterRequest) -> RouterResponse:
-        """Send the request to one provider and return a normalized response."""
+    def invoke(self, operation: str, arguments: dict[str, object]) -> Any:
+        """Dispatch operation/arguments to one provider and return its native response."""
         ...
