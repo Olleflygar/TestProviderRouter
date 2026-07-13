@@ -11,7 +11,7 @@ ROUTER_SRC = PROJECT_ROOT / "ProviderRouterPR1" / "src"
 # Makes this script runnable from the IDE play button without installing the package first.
 sys.path.insert(0, str(ROUTER_SRC))
 
-from nygen_router import ApiProtocol, ProviderConfig, ProviderRouter
+from nygen_router import ApiProtocol, CallVariant, ProviderConfig, ProviderRouter
 
 
 def main() -> None:
@@ -36,9 +36,19 @@ def main() -> None:
         ]
     )
 
-    response = router.invoke("Tell a short joke")
-    print(f"{response.provider_name} / {response.model}:")
-    print(response.text)
+    response = router.invoke(
+        [
+            CallVariant(
+                protocol=ApiProtocol.OPENAI_CHAT,
+                operation="chat.completions.create",
+                arguments={
+                    "messages": [{"role": "user", "content": "Tell a short joke"}],
+                },
+            )
+        ]
+    )
+    print(f"{response.model}:")
+    print(response.choices[0].message.content)
 
 
 if __name__ == "__main__":

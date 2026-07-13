@@ -11,7 +11,7 @@ ROUTER_SRC = PROJECT_ROOT / "ProviderRouterPR1" / "src"
 # Makes this script runnable from the IDE play button without installing the package first.
 sys.path.insert(0, str(ROUTER_SRC))
 
-from nygen_router import ApiProtocol, ProviderConfig, ProviderRouter, RoundRobinPolicy
+from nygen_router import ApiProtocol, CallVariant, ProviderConfig, ProviderRouter, RoundRobinPolicy
 
 
 def main() -> None:
@@ -40,9 +40,26 @@ def main() -> None:
     # With the round robin policy the leading provider rotates on each call, so
     # successive iterations should alternate between the configured providers.
     for i in range(4):
-        response = router.invoke("Is this model quantized? Answer very short and concise.")
-        print(f"[{i}] {response.provider_name} / {response.model}:")
-        print(response.text)
+        response = router.invoke(
+            [
+                CallVariant(
+                    protocol=ApiProtocol.OPENAI_CHAT,
+                    operation="chat.completions.create",
+                    arguments={
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Tell me something short."
+                                ),
+                            }
+                        ],
+                    },
+                )
+            ]
+        )
+        print(f"[{i}] {response.model}:")
+        print(response.choices[0].message.content)
         print()
 
 
