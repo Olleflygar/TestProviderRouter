@@ -32,7 +32,10 @@ per this doc's own rule of updating a test/description only when a later PR
 deliberately changes the behavior it describes, never deleting the record of
 what came before. PR 4 onward is still the forward-looking plan and is
 unchanged by the redesign except for the two new backlog entries it adds
-(PR 21, PR 22), appended after PR 20.
+(PR 21, PR 22), appended after PR 20. (Update 2026-07-14: that claim did
+not survive contact with PR 4 -- its schema has since been revised to match
+the redesign, adding backlog entries PR 23 and PR 24; see PR 4's second
+revision note.)
 
 Verified: `ruff check .`, `mypy src` (strict mode), and `pytest` all pass;
 combined coverage across PR1-3 is 93% (branch coverage on), meeting the 90%+
@@ -628,34 +631,89 @@ does not pull PR13's full scope (schema versioning, migrations, a heavier
 storage framework) forward -- PR13 is unchanged and still comes later, on
 top of the same seam this PR establishes.
 
+Revision note (design discussion, 2026-07-14): reconciled this section with
+the PR 3R CallVariant redesign -- the 2026-07-13 superseded-note's claim
+that "PR 4 onward is unchanged by the redesign" did not hold for this PR's
+schema. input_tokens / output_tokens / required_tools / request_size_bucket
+are dropped from the provider_attempts table: post-redesign none of them
+has a data source (the router no longer parses responses, the
+requires_tools flag no longer exists, and size buckets would need argument
+inspection). Each column returns in the PR that creates its data source --
+tokens in PR 24, request_size_bucket in PR 11, required_tools (if still
+wanted) in PR 21 -- via the same additive-schema-change pattern PR 6
+already uses for estimated_cost_usd. The same discussion pinned the
+previously-unspecified details (timestamps, ids, what gets recorded,
+latency measurement, missing-duckdb behavior, write mode, DB path), all
+folded into the scope below. Streaming-specific metrics (TTFT, stream flag,
+total duration, usage capture) belong to PR 23, not here: in this PR a
+streaming call is recorded with latency measured around adapter.invoke()
+(roughly time-to-stream-open) and success meaning "stream started" -- a
+documented approximation PR 23 replaces.
+
 Scope:
 - storage/base.py: MetricsStore protocol -- record_attempt(event:
-  MetricsEvent) -> None and query_recent(...) -> list[MetricsEvent]. This is
-  the minimum interface every backend (DuckDB, SQLite, and later Postgres/
+  MetricsEvent) -> None and query_recent(*, since, provider_name=None,
+  model=None) -> list[MetricsEvent], chronological ascending. This is the
+  minimum interface every backend (DuckDB, SQLite, and later Postgres/
   Supabase) implements, so callers switch backends by passing a different
-  metrics_store, never by changing router code.
-- MetricsEvent: a dataclass (not a raw dict) describing one row.
-- storage/duckdb.py: DuckDBMetricsStore, the new default. Lazy-imports
-  duckdb inside its own methods (never at module import time), following the
-  same lazy-SDK-import pattern already used for provider adapters -- so
-  `from nygen_router import ProviderRouter` keeps working with duckdb not
-  installed (the project's non-negotiable lightweight-import rule).  Backed
-  by a fixed file under the user's home directory (~/.nygen_router/metrics.duckdb),
-  created on first use -- a real file, not an in-memory database, so history
-  survives across separate runs of a script (needed for the "router learns
-  over time" demo target).
-- storage/sqlite.py: SQLiteMetricsStore, kept as a fully-supported
+  metrics_store, never by changing router code. The contract deliberately
+  stays this small: aggregation happens in Python over what query_recent
+  returns (pinned in PR 7), never in per-backend SQL, so a custom backend
+  stays trivial to implement.
+- metrics.py: MetricsEvent, a dataclass (not a raw dict) describing one
+  row: id (uuid4 hex, default_factory), timestamp (timezone-aware UTC
+  datetime via datetime.now(timezone.utc), default_factory), provider_name,
+  model, protocol, success, latency_ms, error_type. Stores serialize the
+  timestamp as ISO-8601 UTC text -- generated in Python, never in SQL -- so
+  TEXT comparison stays chronologically correct and both engines behave
+  identically.
+- storage/duckdb.py: DuckDBMetricsStore(path=...), the new default.
+  Lazy-imports duckdb inside its own methods (never at module import time),
+  following the same lazy-SDK-import pattern already used for provider
+  adapters -- so `from nygen_router import ProviderRouter` keeps working
+  with duckdb not installed (the project's non-negotiable lightweight-
+  import rule). path is a constructor parameter defaulting to
+  ~/.nygen_router/metrics.duckdb, created on first use -- a real file, not
+  an in-memory database, so history survives across separate runs of a
+  script (needed for the "router learns over time" demo target). The
+  default path is documented single-process: DuckDB allows one writing
+  process per file, so a second process sharing the file fails its writes
+  (harmlessly -- see Important behavior below). Users who need several
+  local processes sharing one store are pointed at SQLiteMetricsStore;
+  multi-machine setups at PR 14's Postgres backend.
+- Missing-duckdb warning: DuckDBMetricsStore's constructor checks
+  importlib.util.find_spec("duckdb") (an availability check, not an import,
+  so the lazy-import rule stays intact) and emits one stdlib logging
+  warning with an install hint when the package is absent. Silent
+  no-persistence is not acceptable: without this, a user who believes they
+  have history gets an empty "router learns over time" demo with zero
+  signal. PR 19 remains the PR for the richer per-event logging; this
+  single warning is pulled forward.
+- storage/sqlite.py: SQLiteMetricsStore(path), kept as a fully-supported
   alternative (Python stdlib only, no extra install) implementing the same
-  MetricsStore protocol -- for users who want a single-file store without
-  installing the duckdb package.
+  MetricsStore protocol -- and the recommended option when several local
+  processes must share one store, since SQLite handles cross-process file
+  locking natively (a real differentiator from DuckDB, stated in the
+  README).
+- Writes are synchronous, on the calling thread: one row per provider
+  attempt is sub-millisecond for an embedded database. Deferred idea
+  (backlog, not this PR): async/batched writes behind a bounded in-process
+  queue drained by a background writer thread -- takes writes off the hot
+  path but adds thread lifecycle, shutdown flushing, and test-determinism
+  machinery, and does not solve cross-process locking (the queue lives
+  inside one process). Revisit within PR 13 if synchronous inserts ever
+  show up in practice.
 - New optional dependency group: `pip install nygen-router[duckdb]`.
-  Without it, ProviderRouter still constructs and invoke() still works: the
-  default DuckDBMetricsStore's write attempt fails with an ImportError,
-  which the storage-failure handling below treats like any other storage
-  failure -- the successful provider response is still returned (a warning
-  is logged once PR19 ships). Document nygen-router[duckdb] in the README as
-  the recommended "batteries-included" install.
-- First table (provider_attempts), same columns regardless of engine:
+  Without it, ProviderRouter still constructs (with the construction-time
+  warning above) and invoke() still works: the default DuckDBMetricsStore's
+  write attempt fails with an ImportError, which the storage-failure
+  handling below treats like any other storage failure -- the successful
+  provider response is still returned. Document nygen-router[duckdb] in the
+  README as the recommended "batteries-included" install.
+- First table (provider_attempts), same columns regardless of engine --
+  only columns with a real data source today; later PRs add theirs (tokens:
+  PR 24, request_size_bucket: PR 11, required_tools: PR 21, cost: PR 6,
+  stream/total_duration_ms: PR 23):
 CREATE TABLE provider_attempts (
     id TEXT PRIMARY KEY,
     timestamp TEXT NOT NULL,
@@ -664,22 +722,37 @@ CREATE TABLE provider_attempts (
     protocol TEXT NOT NULL,
     success INTEGER NOT NULL,
     latency_ms REAL,
-    input_tokens INTEGER,
-    output_tokens INTEGER,
-    error_type TEXT,
-    required_tools INTEGER NOT NULL,
-    request_size_bucket TEXT NOT NULL
+    error_type TEXT
 );
+
+What gets recorded, and by whom:
+- The router records exactly one MetricsEvent per ProviderAttempt --
+  successes and failures both -- from the fallback loop, immediately after
+  each attempt resolves. error_type carries the ErrorCategory value string
+  on failure and NULL on success. Exclusions (filtered-out providers) are
+  not recorded: scoring needs attempt outcomes, and exclusions are
+  reconstructible from config/health.
+- latency_ms is one time.perf_counter() window around adapter.invoke(),
+  recorded exactly as measured -- nothing added, subtracted, or adjusted --
+  on failures too (a timeout's duration is itself signal).
+- Every record_attempt call is wrapped in its own try/except so a storage
+  error can never disturb the LLM call, and is skipped entirely when
+  metrics_store=None.
 
 Suggested files:
 src/nygen_router/metrics.py
+src/nygen_router/storage/__init__.py
 src/nygen_router/storage/base.py
 src/nygen_router/storage/duckdb.py
 src/nygen_router/storage/sqlite.py
-tests/test_metrics_store.py (shared protocol-conformance tests, parametrized
-  over both backends)
+tests/test_metrics_store.py (shared protocol-conformance tests,
+  parametrized over both backends -- structured so a user can point the
+  same suite at a custom backend; the README's "bring your own backend"
+  section explains how, part of making swappability practical rather than
+  theoretical)
 tests/test_duckdb_storage.py
 tests/test_sqlite_storage.py
+tests/test_router_metrics.py (router-to-store wiring)
 
 Important behavior:
 Storage failure should not break a successful LLM response. If the provider
@@ -687,21 +760,33 @@ succeeds but metrics storage fails -- including "duckdb is not installed" --
 return the provider response.
 
 Default storage (works out of the box once the duckdb extra is installed;
-degrades to no persistence, not a crash, otherwise):
+degrades to a construction-time warning plus no persistence, not a crash,
+otherwise):
 ProviderRouter defaults to metrics_store=DuckDBMetricsStore() pointed at
-~/.nygen_router/metrics.duckdb. `metrics_store` remains fully overridable:
-pass SQLiteMetricsStore(path), a different MetricsStore implementation, or
-metrics_store=None to disable persistence entirely.
+~/.nygen_router/metrics.duckdb. Because None must keep meaning "disable
+persistence entirely", the constructor distinguishes "not passed" from None
+with a module-level sentinel default rather than None. `metrics_store`
+remains fully overridable: pass SQLiteMetricsStore(path), a different
+MetricsStore implementation, or metrics_store=None to disable persistence
+entirely.
 
 Tests:
 - MetricsStore protocol conformance run against both DuckDBMetricsStore and
   SQLiteMetricsStore, so the two backends can't silently diverge in behavior
-- creates schema; records success event; records failure event; queries
-  recent events; ignores events outside the lookback window
+- creates schema on first use; records success event; records failure event
+  (error_type = the ErrorCategory value string); queries recent events in
+  chronological order; ignores events outside the lookback window
+- timestamps round-trip as timezone-aware UTC; ids are unique
+- the router records one event per attempt, successes and failures both, in
+  fallback order, and records nothing for excluded providers
 - router continues if metrics storage fails, including a simulated "duckdb
-  not installed" ImportError
+  not installed" ImportError (via an injected fake store raising it -- no
+  monkeypatching of import machinery)
+- constructing DuckDBMetricsStore without duckdb available logs one warning
+  (asserted via caplog, driven through a constructor seam) and does not
+  raise
 - default metrics_store writes to ~/.nygen_router/metrics.duckdb when not
-  otherwise configured and duckdb is installed
+  otherwise configured and duckdb is installed; a custom path is honored
 - metrics_store=None disables persistence with no file created
 - DuckDB-specific tests are skipped (not failed) when the duckdb package is
   not installed, matching the pattern already planned for PR14's other
@@ -807,6 +892,12 @@ Stats to compute:
 - rate limit count
 - timeout count
 - recent error count
+
+Aggregation happens in Python over the MetricsEvents that query_recent
+returns -- not in per-backend SQL (pinned 2026-07-14, with PR 4's
+revision). This keeps the MetricsStore contract at record + query so
+custom backends stay trivial to implement; revisit only if event volume
+ever makes Python-side aggregation a real bottleneck.
 
 Note: no cost stat here -- cost is deferred/optional (see PR 6) and is not
 part of the core aggregation this PR needs to produce.
@@ -920,6 +1011,13 @@ Possible first definition:
 
 Why this matters:
 A provider may be excellent on small prompts but slow on large prompts. The router should eventually learn this.
+
+Schema: this PR adds the request_size_bucket column to provider_attempts
+(PR 4 ships without it -- additive schema change, per the PR 6 pattern).
+Estimating request size means inspecting CallVariant.arguments -- the same
+kind of narrow, deliberate exception to the "router never interprets
+provider-shaped arguments" principle that PR 21 makes; reuse PR 21's
+machinery where possible.
 
 Tests:
 - small request gets small bucket
@@ -1103,6 +1201,10 @@ caller) inspects argument keys per protocol to know what a given key implies
 provider-shaped arguments" principle, justified because pre-flight exclusion
 is worth the cost of this one narrow translation.
 
+Schema: if the required_tools metrics column is still wanted, this PR is
+where it gains a data source and gets added to provider_attempts (PR 4
+ships without it -- additive schema change, per the PR 6 pattern).
+
 Tests:
 - provider without tools excluded when a CallVariant's arguments include
   "tools"
@@ -1137,6 +1239,134 @@ Tests:
   before any provider is invoked
 - a CallVariant for a protocol with zero eligible providers is not validated
 - a valid CallVariant still proceeds through the normal fallback loop
+
+PR 23: RouterStream -- streaming fallback and observation
+------------------------------------------------------------
+Goal:
+Make streaming calls first-class (decided 2026-07-14, with PR 4's
+revision). Until this PR, invoke() returns the raw SDK stream and the
+router's involvement ends there: a stream that dies mid-generation after a
+successful start gets no fallback, no specific error, and its PR 4 metrics
+event only says "stream started". For the router's primary use case --
+long-running automated workflows, possibly overnight -- dying without
+fallback after a successful start is the worst failure mode, so mid-stream
+fallback is the default behavior.
+
+Why the logic lives in a wrapper: for a streaming call the failure happens
+after invoke() has already returned -- the exception surfaces inside the
+consumer's own iteration loop, when no router code is on the call stack.
+The only code of ours that runs during streaming is the object being
+iterated, so that object (RouterStream) is the only physically possible
+home for streaming fallback. From the consumer's side nothing changes:
+they write `for chunk in router.invoke(...)` exactly as against the raw
+SDK stream.
+
+Scope:
+- Detection by response type, not argument inspection: after
+  adapter.invoke() returns, if the result is the SDK's stream type the
+  router wraps it in a RouterStream carrying the not-yet-tried ranked
+  providers; otherwise the response is returned untouched exactly as
+  today. The "router never interprets provider-shaped arguments" principle
+  needs no new exception here.
+- RouterStream is a pass-through iterator: yields the raw SDK chunks
+  unchanged (never a router-invented marker object), no buffering, no text
+  accumulation, constant memory over arbitrarily long streams. Per-chunk
+  work is one finish_reason check plus capturing the final usage chunk --
+  microseconds against the 10-50ms network interval between chunks;
+  time-to-first-token is unaffected. close() and context-manager support
+  propagate to the underlying SDK stream, so a consumer's break / Ctrl-C
+  cleans up naturally.
+- Completion contract: a stream succeeded iff iteration ended after a
+  chunk carrying a finish_reason. A stream that ends cleanly without one
+  was silently truncated by the provider -- there is no HTTP status and no
+  SDK exception for this case, so the router synthesizes its own
+  ProviderStreamInterruptedError (new ProviderError subclass, with its own
+  ErrorCategory mapping). Mid-iteration transport/SDK exceptions go
+  through categorize_error as usual. (Verify at implementation time
+  exactly which exception types the openai SDK raises during stream
+  iteration -- flagged medium-confidence in the design discussion.)
+- Fallback at any point: on a mid-stream exception or silent truncation,
+  RouterStream records the failed attempt and continues the same ranked
+  provider order the router computed -- each eligible provider tried at
+  most once (the natural restart guardrail; no separate max-restarts knob
+  unless a real need appears), STOP categories abort immediately as
+  always. A restart after chunks were already yielded means the new
+  provider regenerates from scratch -- generations cannot be spliced -- so
+  the consumer's accumulated partial output must be discarded, which is
+  why:
+- Restarts are observable, never silent: an optional on_restart callback
+  (fired only when chunks had already been yielded -- a restart at zero
+  chunks has nothing to discard), a stdlib logging warning when a restart
+  happens with no callback registered, and a restarts counter on the
+  wrapper. Silently corrupted accumulated output would be worse than a
+  crash for an overnight workflow.
+- stream_failure_policy: StrEnum constructor argument on ProviderRouter --
+  RESTART (default: the behavior above, zero setup configuration required)
+  or RAISE (record the failed attempt, then re-raise the provider's real
+  error, per the transparency principle, for callers who want to stop on
+  any mid-stream failure). STOP categories raise under both policies. An
+  enum rather than a bool so a third mode can be added without a breaking
+  change; no per-call override for now.
+- Metrics (additive schema change to provider_attempts, PR 6 pattern):
+  adds stream INTEGER NOT NULL DEFAULT 0 and total_duration_ms REAL. For
+  streams, latency_ms means time-to-first-token (the right cross-provider
+  responsiveness signal -- total duration depends on output length, which
+  varies call to call); total_duration_ms is recorded for completed
+  streams. A stream's metrics event is written at stream end by
+  RouterStream, not at invoke() return, replacing PR 4's documented
+  "success means stream started" approximation.
+- Usage capture: when the caller's arguments include stream_options
+  {"include_usage": true}, the final chunk carries usage; RouterStream
+  captures it into the token columns (added by PR 24 -- whichever of
+  PR 23 / PR 24 lands second wires both sources into those columns).
+
+Tests:
+- a non-streaming call returns the identical raw response object, exactly
+  as before this PR
+- chunks pass through unchanged and in order
+- a mid-stream exception falls back to the next provider; on_restart fires
+  and the restarts counter increments when chunks had been yielded
+- a failure before any chunk was yielded falls back without firing
+  on_restart
+- a stream ending without finish_reason is recorded as
+  ProviderStreamInterruptedError and falls back
+- a restart with no callback registered logs a warning
+- stream_failure_policy=RAISE re-raises the provider's real error
+  immediately, no fallback
+- a STOP-category failure aborts under both policies
+- exhausting every provider raises RouterExhaustedError enumerating each
+  attempt's own real reason
+- close()/breaking the loop closes the underlying SDK stream
+- for streams: latency_ms records TTFT and stream=1; total_duration_ms
+  recorded on completion; the event is written at stream end; usage
+  captured when include_usage was requested
+
+PR 24: Non-streaming response usage extraction
+-------------------------------------------------
+Goal:
+Restore input_tokens/output_tokens metrics, dropped from PR 4 when the
+PR 3R redesign made responses opaque (decided 2026-07-14, with PR 4's
+revision).
+
+Scope:
+- A best-effort getattr read of response.usage (prompt_tokens /
+  completion_tokens) on the response object the router already holds
+  between adapter.invoke() returning and invoke() returning -- no copy, no
+  wrapper, no mutation; the caller receives the identical raw SDK object.
+  Unfamiliar or absent shapes yield None, never an error.
+- This is a documented, scoped exception to the raw-pass-through rule --
+  reading, never altering -- in the same spirit as PR 21's
+  argument-inspection exception.
+- Adds input_tokens INTEGER and output_tokens INTEGER (both nullable) to
+  provider_attempts (additive schema change, PR 6 pattern). See PR 23 for
+  the streaming side of usage capture.
+
+Tests:
+- usage extracted and recorded when present
+- absent or unfamiliar usage shapes record NULL without error
+- the returned response object is the identical object the adapter
+  produced
+- token columns populated in the recorded MetricsEvent
 
 Recommended sprint boundary
 ---------------------------

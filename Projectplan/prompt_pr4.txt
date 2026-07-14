@@ -1,0 +1,314 @@
+You are implementing PR 4 ("DuckDB-backed metrics storage (default), behind
+a swappable interface") of the nygen-router package.
+
+You are working inside the existing repository, modifying it in place. Do
+not create a new sibling folder.
+
+Before writing any code, read these in full:
+
+1. Projectplan/ProjectPlan.md — especially: Project goal, Core design
+   principles, Testing philosophy, and the PR 4 section INCLUDING BOTH of
+   its revision notes (2026-07-09 and 2026-07-14). The Testing philosophy,
+   the transparency principle, and the lightweight-import rule are binding
+   for this PR.
+2. The current source under src/nygen_router/ and the tests under tests/.
+   Important: the codebase reflects the PR 3R CallVariant redesign —
+   invoke(calls: list[CallVariant]) returns the winning provider's raw SDK
+   response object (Any), there is no RouterResponse wrapper, and the
+   fallback loop in router.py already records ProviderAttempt objects
+   internally. You are adding persistence to that loop, not changing its
+   control flow.
+
+⸻
+
+Goal
+
+Persist one row of observational metrics per provider attempt, so
+score-based routing (PR 7-10) has real history to work from. DuckDB is the
+embedded default backend; SQLite is a fully-supported stdlib alternative;
+both sit behind one minimal MetricsStore protocol so any backend can be
+swapped in by passing a different metrics_store — never by changing router
+code.
+
+⸻
+
+Git workflow
+
+Work directly on the current branch (main) in this folder.
+
+Before changing anything:
+- Confirm the working tree is clean; if not, stop and report what is
+  pending.
+- Ensure a tag named pr4-start exists. If it does not, create it on the
+  current commit: git tag pr4-start
+
+Commit at logical milestones with clear messages. When every quality gate
+below passes, create the tag pr4-complete on the final commit.
+
+⸻
+
+Design decisions already made for you
+
+These were settled in the 2026-07-14 design discussion and folded into the
+plan's PR 4 section. Do not re-derive or second-guess them — implement them
+exactly:
+
+1. MetricsStore protocol (src/nygen_router/storage/base.py), a
+   typing.Protocol with exactly two methods — do NOT add aggregation,
+   delete, or migration methods (PR 7 aggregates in Python over
+   query_recent's output; PR 13 handles migrations later):
+
+   class MetricsStore(Protocol):
+       def record_attempt(self, event: MetricsEvent) -> None: ...
+       def query_recent(
+           self,
+           *,
+           since: datetime,
+           provider_name: str | None = None,
+           model: str | None = None,
+       ) -> list[MetricsEvent]: ...
+
+   query_recent returns events with timestamp >= since (since must be
+   timezone-aware; raise ValueError if it is naive), optionally filtered by
+   provider_name and/or model, in chronological ascending order.
+
+2. MetricsEvent dataclass (src/nygen_router/metrics.py) — a frozen
+   dataclass, not a raw dict, not Pydantic (internal record, per Core
+   design principle 7):
+
+   @dataclass(frozen=True)
+   class MetricsEvent:
+       provider_name: str
+       model: str
+       protocol: ApiProtocol
+       success: bool
+       latency_ms: float | None = None
+       error_type: str | None = None
+       id: str = field(default_factory=lambda: uuid4().hex)
+       timestamp: datetime = field(
+           default_factory=lambda: datetime.now(timezone.utc)
+       )
+
+   timestamp is always timezone-aware UTC. error_type is the
+   ErrorCategory value string on failure, None on success.
+
+3. Schema — identical columns in both engines, created lazily with CREATE
+   TABLE IF NOT EXISTS on first use (no separate init step). Exactly these
+   eight columns, no more: input_tokens/output_tokens (PR 24),
+   required_tools (PR 21), request_size_bucket (PR 11), cost (PR 6), and
+   stream/total_duration_ms (PR 23) all arrive in later PRs with their data
+   sources.
+
+   CREATE TABLE IF NOT EXISTS provider_attempts (
+       id TEXT PRIMARY KEY,
+       timestamp TEXT NOT NULL,
+       provider_name TEXT NOT NULL,
+       model TEXT NOT NULL,
+       protocol TEXT NOT NULL,
+       success INTEGER NOT NULL,
+       latency_ms REAL,
+       error_type TEXT
+   );
+
+   Timestamps are serialized to ISO-8601 UTC text via
+   event.timestamp.isoformat() in Python — never via SQL date functions —
+   and parsed back with datetime.fromisoformat() on query. This keeps TEXT
+   comparison chronologically correct and both engines byte-identical in
+   behavior. protocol is stored as the ApiProtocol value string and parsed
+   back with ApiProtocol(value).
+
+4. DuckDBMetricsStore (src/nygen_router/storage/duckdb.py):
+   - Constructor: DuckDBMetricsStore(path: str | Path | None = None,
+     *, sdk_available: bool | None = None). path defaults to
+     ~/.nygen_router/metrics.duckdb (Path.home() based). The parent
+     directory is created on first connection, not in the constructor.
+   - duckdb is lazy-imported INSIDE methods, never at module import time —
+     same pattern as the openai import in adapters/openai_compatible.py.
+   - Missing-duckdb warning: the constructor checks availability via
+     importlib.util.find_spec("duckdb") (a check, not an import) and, when
+     absent, emits ONE stdlib logging warning (logger name = the module's
+     __name__) telling the user metrics persistence will not work and to
+     `pip install "nygen-router[duckdb]"` or pass a different
+     metrics_store. It does NOT raise. sdk_available is the constructor
+     seam for testing this warning (None = autodetect via find_spec;
+     tests pass False) — this is the same constructor-seam pattern the
+     Testing philosophy mandates instead of monkeypatching import
+     machinery.
+   - One connection, opened lazily on first record/query and kept; a
+     close() method closes it (idempotent).
+   - Single-process by design: DuckDB allows one writing process per file.
+     Do not build any cross-process coordination — the README documents
+     the limitation and points multi-process users at SQLiteMetricsStore.
+
+5. SQLiteMetricsStore (src/nygen_router/storage/sqlite.py):
+   - Constructor: SQLiteMetricsStore(path: str | Path) — path is required;
+     choosing SQLite is a deliberate act, there is no default file.
+   - Python stdlib sqlite3 only, no optional dependency, no lazy-import
+     dance needed. Same lazy connection + close() shape as decision 4.
+   - This is the documented recommendation for several local processes
+     sharing one store (SQLite's native cross-process locking).
+
+6. Router wiring (router.py):
+   - New constructor parameter metrics_store. Because None must mean
+     "disable persistence entirely", distinguish "not passed" from None
+     with a module-level sentinel, e.g.:
+
+     class _UnsetType: ...
+     _UNSET = _UnsetType()
+
+     def __init__(..., metrics_store: MetricsStore | None | _UnsetType = _UNSET):
+         self._metrics_store = (
+             DuckDBMetricsStore() if isinstance(metrics_store, _UnsetType)
+             else metrics_store
+         )
+
+   - In invoke()'s fallback loop, wrap the adapter.invoke() call in one
+     time.perf_counter() window; latency_ms = (end - start) * 1000.0,
+     recorded exactly as measured (success AND failure — a timeout's
+     duration is signal), nothing added or subtracted.
+   - Record exactly one MetricsEvent per ProviderAttempt, immediately
+     after each attempt resolves, successes and failures both, in fallback
+     order. On failure, reuse the ErrorCategory the loop already computes
+     via categorize_error(exc) — do not call it twice — and store its
+     .value as error_type. Excluded providers are NOT recorded; nothing is
+     recorded when NoEligibleProvidersError is raised (no attempts were
+     made).
+   - Every store call is wrapped in its own try/except Exception so a
+     storage failure — including ImportError from a missing duckdb — can
+     never disturb the LLM call. When self._metrics_store is None, skip
+     recording entirely.
+   - A call whose provider returns a stream object is recorded like any
+     other success: latency as measured around adapter.invoke() (roughly
+     time-to-stream-open), success meaning "stream started". This is a
+     documented approximation that PR 23 replaces — do not build anything
+     stream-aware in this PR.
+
+7. Packaging (pyproject.toml): add a `duckdb` optional-dependency group
+   (pip install "nygen-router[duckdb]") and add duckdb to the dev extras
+   so the dev environment runs the DuckDB-backed tests. Core dependencies
+   are unchanged.
+
+8. Exports (__init__.py): add MetricsStore, MetricsEvent,
+   DuckDBMetricsStore, SQLiteMetricsStore. The sentinel stays private.
+   `from nygen_router import ProviderRouter` must keep working with no
+   optional dependencies installed — verify storage/duckdb.py has no
+   module-level duckdb import.
+
+⸻
+
+Out of scope — do not implement
+
+- token columns / usage extraction (PR 24), request_size_bucket (PR 11),
+  required_tools (PR 21), cost (PR 6), stream flag / TTFT semantics /
+  total_duration_ms (PR 23)
+- aggregation, ProviderStats, or any query beyond query_recent (PR 7)
+- schema versioning, migrations, Postgres/Supabase (PR 13, PR 14)
+- async/batched/queued writes — writes are synchronous on the calling
+  thread; the queue idea is an explicitly deferred backlog note
+- logging beyond the single construction-time warning of decision 4
+  (PR 19 owns per-event logging)
+- health/cooldown changes (PR 5)
+
+⸻
+
+Testing rules (binding, from the plan's Testing philosophy)
+
+- No monkeypatching of internal collaborators: no monkeypatch.setattr or
+  unittest.mock.patch reaching into modules to swap classes/functions/
+  import machinery. Use the constructor seams: a fake MetricsStore (plain
+  class implementing the protocol) injected via metrics_store=..., a fake
+  adapter via adapter_factory=..., the sdk_available seam of decision 4.
+  monkeypatch.setenv / monkeypatch.delenv remain allowed — use
+  monkeypatch.setenv("HOME", str(tmp_path)) for the default-path test so
+  no test ever writes to the real home directory.
+- Do not delete or weaken existing tests. All new test files are additive.
+
+New test files and minimum coverage:
+
+tests/test_metrics_store.py — shared protocol-conformance suite,
+parametrized over both backends via a store-factory fixture (DuckDB
+parameter marked skipif when importlib.util.find_spec("duckdb") is None).
+Structure it so the parametrization is the only backend-specific part —
+the README will tell users they can point the same suite at their own
+backend:
+- schema is created on first use (record or query against a fresh file)
+- records a success event and reads it back field-for-field
+- records a failure event; error_type round-trips as the category string
+- query_recent returns events in chronological ascending order
+- query_recent excludes events older than `since`
+- query_recent filters by provider_name and by model
+- query_recent raises ValueError for a naive `since`
+- timestamps round-trip as timezone-aware UTC datetimes
+- ids are unique across events
+- close() is idempotent
+
+tests/test_duckdb_storage.py (skipif duckdb not installed, except the
+warning test which uses the seam and needs no duckdb):
+- default path resolves to ~/.nygen_router/metrics.duckdb under a
+  redirected HOME, and the file plus parent directory are created on
+  first write
+- a custom path is honored
+- constructing with sdk_available=False logs exactly one warning
+  (caplog) mentioning the [duckdb] extra, and does not raise
+
+tests/test_sqlite_storage.py:
+- path is required (no default) and honored
+- works with no optional dependencies installed (stdlib only)
+
+tests/test_router_metrics.py — router-to-store wiring, using a fake
+in-memory MetricsStore injected via metrics_store= and fake adapters via
+adapter_factory=:
+- a successful call records exactly one success event with the provider's
+  name, model, protocol, and a positive latency_ms
+- a fallback run (provider A fails, provider B succeeds) records two
+  events in attempt order: A's failure carrying the ErrorCategory value
+  string, then B's success
+- excluded providers produce no events
+- a store whose record_attempt raises (parametrize at least RuntimeError
+  and ImportError, the simulated "duckdb not installed" case) does not
+  break the call: the provider response is still returned unchanged
+- metrics_store=None records nothing and creates no file
+- when every provider fails, the failure events were still recorded
+  before RouterExhaustedError is raised
+
+⸻
+
+Docs
+
+- README.md: document `pip install "nygen-router[duckdb]"` as the
+  recommended batteries-included install; the metrics_store parameter with
+  its three forms (default DuckDB, any MetricsStore implementation, None
+  to disable); the default DB path and its single-process limitation with
+  SQLiteMetricsStore as the multi-process local recommendation and PR 14's
+  Postgres as the future multi-machine option; and a short "bring your own
+  backend" section — implement the two-method MetricsStore protocol and
+  reuse tests/test_metrics_store.py's conformance suite against it.
+- AGENT.md: update wherever it describes the PR 1-3R feature set to
+  include metrics persistence.
+
+⸻
+
+Quality gates
+
+All of these must pass before you declare PR 4 done. Use the project's own
+virtual environment (.venv in the repo), not the system Python:
+
+ruff format .
+ruff check .
+mypy src
+pytest
+coverage run -m pytest
+coverage report
+
+Also verify the non-negotiable import rule both ways: with duckdb
+installed, and in an environment without it,
+`from nygen_router import ProviderRouter` must succeed.
+
+⸻
+
+Completion report
+
+End with: files changed; the behavior changes made; confirmation that each
+of the 8 "Design decisions" items above was implemented as specified (flag
+any place you had to deviate and why); and the verbatim results of the
+quality-gate commands.
