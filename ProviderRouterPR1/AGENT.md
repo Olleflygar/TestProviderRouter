@@ -10,7 +10,11 @@ Implementation rules for this package:
   `invoke()`). `httpx` is not a core dependency either; it only appears as an
   injectable test seam (`http_client`) and as a transitive dependency of the
   `openai` extra.
-- Do not add LangChain, Pydantic AI, DuckDB, Supabase, or OpenTelemetry yet.
+- Do not add LangChain, Pydantic AI, Supabase, or OpenTelemetry yet. DuckDB
+  shipped in PR4 as the metrics-storage default -- see below -- but it too
+  follows the lazy-import rule: `storage/duckdb.py` never imports `duckdb` at
+  module level, only inside method bodies, so the core import stays clean
+  without it installed.
 - Do not leak API keys in errors, logs, responses, or tests.
 - Use typed models, not raw dictionaries, in core APIs -- `CallVariant`,
   `ProviderConfig`, `EligibilityResult`, etc. The one deliberate exception is
@@ -50,6 +54,9 @@ Implementation rules for this package:
   filter and any policy can see it. When every tried provider fails,
   `RouterExhaustedError` enumerates each real failure rather than blending
   them.
+- Every provider attempt (success or failure) is persisted as one
+  `MetricsEvent` behind the swappable `MetricsStore` protocol -- see
+  "Metrics persistence" below. Excluded providers are not recorded.
 
 ## Design principle (native pass-through, non-negotiable)
 
@@ -87,3 +94,32 @@ Avoid the "peel the onion" debugging that plagues comparable routers:
   original on `.original`. Never wrap an already-wrapped router error again.
 - Prefer common terminology: HTTP status + reason phrase, and the exact
   `openai`/`httpx` exception type name for transport and dispatch failures.
+
+## Metrics persistence (PR4)
+
+`ProviderRouter` records one `MetricsEvent` per provider attempt so
+score-based routing (PR7-10) has real history to work from:
+
+- `MetricsStore` (`storage/base.py`) is a `typing.Protocol` with exactly two
+  methods -- `record_attempt` and `query_recent`. Do not add aggregation,
+  delete, or migration methods to it; aggregation happens in Python over
+  `query_recent`'s output (PR7), never in per-backend SQL.
+- `DuckDBMetricsStore` (`storage/duckdb.py`) is the default, pointed at
+  `~/.nygen_router/metrics.duckdb`. It lazy-imports `duckdb` inside its
+  methods only -- never at module level -- so the core import stays clean
+  without the `duckdb` extra installed. Single-process by design (DuckDB
+  allows one writing process per file); `SQLiteMetricsStore` is the
+  recommended alternative for several local processes sharing one store.
+- `ProviderRouter.__init__`'s `metrics_store` parameter distinguishes "not
+  passed" (defaults to `DuckDBMetricsStore()`) from `metrics_store=None`
+  (disables persistence entirely) via a private module-level sentinel in
+  `router.py` -- `None` must keep meaning "off", so it cannot double as "use
+  the default".
+- Every `record_attempt` call from the router is wrapped in its own
+  `try/except Exception` -- a storage failure (including `duckdb` not being
+  installed) must never disturb a successful LLM response. Latency is one
+  `time.perf_counter()` window around `adapter.invoke()`, recorded exactly as
+  measured, on both success and failure.
+- Do not build cross-process coordination for DuckDB, async/batched writes,
+  schema versioning, or any query beyond `query_recent` -- all explicitly out
+  of scope for PR4; see `Projectplan/ProjectPlan.md`'s PR4/PR7/PR13 sections.

@@ -16,8 +16,12 @@ dependencies = [
 openai = [
     "openai>=1,<2",
 ]
+duckdb = [
+    "duckdb>=0.10,<2",
+]
 dev = [
     "coverage>=7,<8",
+    "duckdb>=0.10,<2",
     "httpx>=0.24,<1",
     "mypy>=1,<2",
     "openai>=1,<2",

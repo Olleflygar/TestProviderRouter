@@ -7,8 +7,11 @@ Description-Content-Type: text/markdown
 Requires-Dist: pydantic<3,>=2
 Provides-Extra: openai
 Requires-Dist: openai<2,>=1; extra == "openai"
+Provides-Extra: duckdb
+Requires-Dist: duckdb<2,>=0.10; extra == "duckdb"
 Provides-Extra: dev
 Requires-Dist: coverage<8,>=7; extra == "dev"
+Requires-Dist: duckdb<2,>=0.10; extra == "dev"
 Requires-Dist: httpx<1,>=0.24; extra == "dev"
 Requires-Dist: mypy<2,>=1; extra == "dev"
 Requires-Dist: openai<2,>=1; extra == "dev"

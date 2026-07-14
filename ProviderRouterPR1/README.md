@@ -12,8 +12,10 @@ provider when one fails.
 
 Only the OpenAI Chat Completions protocol is implemented so far, dispatched via
 the official `openai` Python SDK (used against any OpenAI-compatible `base_url`,
-not just OpenAI itself). SQLite memory, scoring, the Responses API, and
-framework adapters are future PRs.
+not just OpenAI itself). Every provider attempt is recorded as an observational
+metrics event behind a swappable `MetricsStore` (DuckDB by default, SQLite as a
+fully-supported alternative) -- see "Metrics persistence" below. Scoring, the
+Responses API, and framework adapters are future PRs.
 
 ## Local Development
 
@@ -93,6 +95,13 @@ export PROVIDER_A_API_KEY="your-key"
 
 API keys can also be passed explicitly with `api_key`, but keys are never printed
 or included in router errors.
+
+The recommended batteries-included install adds DuckDB too, so metrics
+persistence (see below) works out of the box:
+
+```sh
+pip install "nygen-router[openai,duckdb]"
+```
 
 ## Hard filtering
 
@@ -194,6 +203,58 @@ response = router.invoke(
 
 Each protocol may appear at most once per call -- a second `CallVariant` for a
 protocol already supplied raises `DuplicateCallVariantProtocolError`.
+
+## Metrics persistence
+
+Every provider attempt (success or failure) is recorded as one observational
+`MetricsEvent` -- provider name, model, protocol, success, latency, and error
+type -- so score-based routing (a later PR) has real history to work from.
+Excluded providers are not recorded.
+
+`metrics_store` is a `ProviderRouter` constructor parameter with three forms:
+
+```python
+from nygen_router import DuckDBMetricsStore, ProviderRouter, SQLiteMetricsStore
+
+# 1. Default: not passed at all -- a DuckDBMetricsStore at ~/.nygen_router/metrics.duckdb
+router = ProviderRouter(providers=[...])
+
+# 2. Any MetricsStore implementation, e.g. the bundled SQLite backend
+router = ProviderRouter(providers=[...], metrics_store=SQLiteMetricsStore("metrics.sqlite"))
+
+# 3. Disable persistence entirely
+router = ProviderRouter(providers=[...], metrics_store=None)
+```
+
+`DuckDBMetricsStore` is the default: an embedded, no-server-to-run database,
+requiring `pip install "nygen-router[duckdb]"`. Without that extra installed,
+`ProviderRouter` still constructs (logging one warning) and `invoke()` still
+works -- the write attempt fails with an `ImportError`, which is treated like
+any other storage failure: the successful provider response is still
+returned. **DuckDB is single-process**: it allows only one writing process
+per file. If several local processes need to share one store, use
+`SQLiteMetricsStore(path)` instead, which uses Python's stdlib `sqlite3` (no
+extra install) and handles cross-process file locking natively. For shared,
+multi-machine routing history, a Postgres/Supabase-backed store is a planned
+future backend.
+
+### Bring your own backend
+
+`MetricsStore` is a two-method `typing.Protocol`:
+
+```python
+class MetricsStore(Protocol):
+    def record_attempt(self, event: MetricsEvent) -> None: ...
+    def query_recent(
+        self, *, since: datetime, provider_name: str | None = None, model: str | None = None
+    ) -> list[MetricsEvent]: ...
+```
+
+Implement those two methods against any SQL-compatible (or other) backend and
+pass an instance as `metrics_store=...` -- no router code changes needed. To
+check your implementation against the same conformance suite the bundled
+backends run, point `tests/test_metrics_store.py`'s parametrized `store`
+fixture at a factory for your backend.
 
 ## Errors
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Collection
 from typing import Any
 
@@ -18,7 +19,10 @@ from nygen_router.errors import (
 )
 from nygen_router.filters import filter_eligible_providers
 from nygen_router.health import ProviderHealthState
+from nygen_router.metrics import MetricsEvent
 from nygen_router.policies import Policy, RoundRobinPolicy
+from nygen_router.storage.base import MetricsStore
+from nygen_router.storage.duckdb import DuckDBMetricsStore
 from nygen_router.types import CallVariant, ProviderAttempt
 
 AdapterFactory = Callable[[ProviderConfig], ProviderAdapter]
@@ -35,6 +39,18 @@ SUPPORTED_PROTOCOLS = frozenset({ApiProtocol.OPENAI_CHAT})
 _STOP_CATEGORIES = frozenset({ErrorCategory.BAD_REQUEST, ErrorCategory.INVALID_OPERATION})
 
 
+class _UnsetType:
+    """Sentinel distinguishing "metrics_store not passed" from "metrics_store=None".
+
+    None must keep meaning "disable persistence entirely", so it cannot also
+    mean "use the default" -- a plain default value of None would conflate
+    the two.
+    """
+
+
+_UNSET = _UnsetType()
+
+
 class ProviderRouter:
     def __init__(
         self,
@@ -42,6 +58,7 @@ class ProviderRouter:
         adapter_factory: AdapterFactory | None = None,
         policy: Policy | None = None,
         supported_protocols: Collection[ApiProtocol] | None = None,
+        metrics_store: MetricsStore | None | _UnsetType = _UNSET,
     ):
         self.providers = list(providers)
         self._adapter_factory = adapter_factory or self._default_adapter_for
@@ -56,6 +73,11 @@ class ProviderRouter:
         # Per-run provider health, visible to the eligibility filter and any
         # policy. Not persisted across process restarts (PR3 scope).
         self._health: dict[str, ProviderHealthState] = {}
+        # metrics_store=None disables persistence entirely; not passing it at
+        # all defaults to a DuckDBMetricsStore pointed at its own default path.
+        self._metrics_store: MetricsStore | None = (
+            DuckDBMetricsStore() if isinstance(metrics_store, _UnsetType) else metrics_store
+        )
 
     def invoke(self, calls: list[CallVariant]) -> Any:
         """Filter, order eligible providers, then try them in turn with fallback.
@@ -84,13 +106,18 @@ class ProviderRouter:
             variant = variants_by_protocol[provider.protocol]
             arguments = {**variant.arguments, "model": provider.model}
             adapter = self._adapter_for(provider)
+            start = time.perf_counter()
             try:
                 response = adapter.invoke(variant.operation, arguments)
             except Exception as exc:
+                latency_ms = (time.perf_counter() - start) * 1000.0
                 attempts.append(
                     ProviderAttempt(provider_name=provider.name, success=False, error=exc)
                 )
                 category = categorize_error(exc)
+                self._record_metrics(
+                    provider, success=False, latency_ms=latency_ms, error_type=category.value
+                )
                 if category is ErrorCategory.AUTH:
                     # Bench it for the rest of the run; the filter excludes it
                     # on the next invoke() call, not this one.
@@ -99,10 +126,36 @@ class ProviderRouter:
                     break
                 continue
 
+            latency_ms = (time.perf_counter() - start) * 1000.0
             attempts.append(ProviderAttempt(provider_name=provider.name, success=True))
+            self._record_metrics(provider, success=True, latency_ms=latency_ms, error_type=None)
             return response
 
         raise RouterExhaustedError(attempts)
+
+    def _record_metrics(
+        self,
+        provider: ProviderConfig,
+        *,
+        success: bool,
+        latency_ms: float,
+        error_type: str | None,
+    ) -> None:
+        """Persist one MetricsEvent for this attempt; never let storage disturb the call."""
+        if self._metrics_store is None:
+            return
+        event = MetricsEvent(
+            provider_name=provider.name,
+            model=provider.model,
+            protocol=provider.protocol,
+            success=success,
+            latency_ms=latency_ms,
+            error_type=error_type,
+        )
+        try:
+            self._metrics_store.record_attempt(event)
+        except Exception:
+            pass
 
     @staticmethod
     def _prepare_variants(calls: list[CallVariant]) -> dict[ApiProtocol, CallVariant]:
