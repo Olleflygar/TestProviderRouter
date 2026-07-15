@@ -1061,6 +1061,21 @@ remote/managed SQL-compatible backends -- Supabase, Postgres, and others --
 plus schema versioning as the provider_attempts shape evolves (e.g. PR6's
 estimated_cost_usd column).
 
+Revision note (design discussion, 2026-07-15): two decisions pinned for
+this PR. First, the SQL implementation layer must stay agnostic:
+MetricsStore (PR 4) remains the only abstraction the router and routing
+logic ever see, and whichever SQL technology implements a given store --
+SQLAlchemy Core, SQLAlchemy ORM, or direct DBAPI SQL -- is a private
+detail inside that store. No sessions, engines, ORM models, or raw rows
+appear in any public signature; reads are converted to MetricsEvent (or
+successor) dataclasses before being returned to routing logic. Second,
+the choice between SQLAlchemy Core and SQLAlchemy ORM (or a mixed
+Core/ORM approach) is deliberately left open: it is an explicit
+discussion to have when this PR starts, not something this note resolves.
+Deferring it is safe because the PRs before this one are independent of
+this seam (and largely of each other) -- landing PR 5-12 first does not
+make this PR harder, so the decision loses nothing by waiting.
+
 Scope:
 - SQL schema versioning / migrations
 - storage initialization for remote/managed backends (connection handling,
@@ -1259,6 +1274,20 @@ long-running automated workflows, possibly overnight -- dying without
 fallback after a successful start is the worst failure mode, so mid-stream
 fallback is the default behavior.
 
+Revision note (sequencing decision, 2026-07-15): pulled forward -- this PR
+is implemented immediately after PR 5, before the scoring chain (PR 7-10),
+not at its backlog position. Two reasons: mid-stream death without
+fallback is the worst failure mode for the primary use case (previous
+paragraph), and PR 4 records a streaming call's success at stream open,
+so scoring built in PR 7-10 would otherwise learn from systematically
+optimistic streaming data. Two consequences of landing here: this PR's
+stream / total_duration_ms columns become the first additive schema
+change to hit existing persistent metrics files (ahead of PR 24 and
+PR 6), so this PR establishes the on-init check-and-ALTER-TABLE-ADD-COLUMN
+convention those later PRs reuse; and PR 24 now lands second of the
+PR 23 / PR 24 pair, so PR 24 is the one that wires both usage sources
+into the token columns (per the usage-capture bullet below).
+
 Why the logic lives in a wrapper: for a streaming call the failure happens
 after invoke() has already returned -- the exception surfaces inside the
 consumer's own iteration loop, when no router code is on the call stack.
@@ -1378,6 +1407,10 @@ Tests:
 Recommended sprint boundary
 ---------------------------
 For an 80% sprint target, aim to complete PR 1 through PR 10.
+
+Sequencing update (2026-07-15): PR 23 (RouterStream) is pulled forward and
+implemented immediately after PR 5, before PR 7-10 -- see PR 23's revision
+note. The implementation order is therefore PR 5, PR 23, then PR 7-10.
 
 That gives the project:
 - real provider calls
