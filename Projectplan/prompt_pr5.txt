@@ -1,0 +1,374 @@
+You are Sonnet 5, implementing PR 5 ("Health state and cooldowns") of the
+nygen-router package.
+
+Your task, stated narrowly: using the specification below, implement PR 5
+in the existing repository, in place. This is an implementation task, not
+a design task — every design decision has already been made and is listed
+under "Design decisions already made for you". Do not redesign,
+re-derive, second-guess, or expand them. If the specification and the
+codebase genuinely conflict, stop and report the conflict in the
+completion report instead of inventing a resolution.
+
+You are working inside the existing repository, modifying it in place. Do
+not create a new sibling folder.
+
+Before writing any code, read these in full:
+
+1. Projectplan/ProjectPlan.md — especially: Project goal, Core design
+   principles, Testing philosophy, the transparency principle (in PR 1's
+   "Key implementation decisions"), and the PR 5 section INCLUDING its
+   revision note (design interview, 2026-07-15). The Testing philosophy
+   and the transparency principle are binding for this PR.
+2. The current source under src/nygen_router/ and the tests under
+   tests/. Important context: the codebase reflects the PR 3R CallVariant
+   redesign — invoke(calls: list[CallVariant]) returns the winning
+   provider's raw SDK response object (Any), there is no RouterResponse
+   wrapper, and exclusions are only observable through
+   NoEligibleProvidersError.exclusions. PR 4's metrics recording is
+   already wired into the fallback loop — you are adding health
+   transitions around that loop, not changing recording or control flow.
+
+⸻
+
+Goal
+
+Stop the router from repeatedly calling providers that are temporarily
+bad: a 429 benches its provider immediately; three consecutive counted
+failures bench theirs. Every bench is temporary, visible in logs with the
+provider's verbatim last error, inspectable via health_report(), and
+manually clearable via reset_health(). Nothing is ever benched silently.
+
+⸻
+
+Git workflow
+
+Work directly on the current branch (main) in this folder.
+
+Before changing anything:
+- Confirm the working tree is clean; if not, stop and report what is
+  pending.
+- Ensure a tag named pr5-start exists. If it does not, create it on the
+  current commit: git tag pr5-start
+
+Commit at logical milestones with clear messages. When every quality gate
+below passes, create the tag pr5-complete on the final commit.
+
+⸻
+
+Design decisions already made for you
+
+These were settled in the 2026-07-15 design interview and folded into the
+plan's PR 5 section. Implement them exactly:
+
+1. ProviderHealthState extension (src/nygen_router/health.py). The
+   dataclass gains, alongside the shipped auth_disabled flag:
+   - cooldown_until: float | None = None   (monotonic clock value)
+   - consecutive_failures: int = 0
+   - last_error: str | None = None         (str(exc) of the most recent
+     counted or benching failure — the verbatim router error message,
+     which already carries the provider's own text)
+   plus whatever private flags you need for the logging dedup of
+   decision 7.
+
+   Transition logic lives on the dataclass as methods, not in the router
+   loop:
+   - record_failure(category: ErrorCategory, error_text: str,
+     config: HealthConfig, now: float) -> bool — applies the category
+     rules of decision 3, returns True iff this failure started a new
+     bench (a cooldown began or the auth bench was set).
+   - record_success() -> None — resets consecutive_failures to 0, clears
+     cooldown_until and last_error.
+
+   Router-side writes become get-or-create + mutate. This deliberately
+   fixes a latent bug: router.py currently REPLACES the state object on
+   an auth failure (self._health[name] =
+   ProviderHealthState(auth_disabled=True)), which would silently zero
+   an existing failure count once that field exists. No replace-writes
+   may remain.
+
+2. HealthConfig (src/nygen_router/health.py) — a Pydantic model
+   (extra="forbid"), exported from the package root:
+   - rate_limit_cooldown_seconds: float = 60.0   (validated > 0)
+   - failure_cooldown_seconds: float = 60.0      (validated > 0)
+   - failure_threshold: int = 3                  (validated >= 1)
+   The two durations share a default on purpose; they are separate knobs
+   so they can diverge later.
+
+   ProviderRouter gains a constructor parameter
+   health: HealthConfig | Mapping[str, object] | None = None.
+   None means HealthConfig() — zero configuration by default. A Mapping
+   is validated into HealthConfig at the boundary
+   (HealthConfig.model_validate), so a typo raises immediately and no
+   raw dict flows past the constructor.
+
+3. Behavior per ErrorCategory, applied inside record_failure:
+   - RATE_LIMIT: set cooldown_until = now + rate_limit_cooldown_seconds
+     and last_error. Neither increments nor resets
+     consecutive_failures. Returns True (new bench).
+   - TIMEOUT, SERVER_ERROR, CONNECTION, UNKNOWN (the "counted"
+     categories): increment consecutive_failures, set last_error; if
+     consecutive_failures >= failure_threshold, set cooldown_until =
+     now + failure_cooldown_seconds and return True. Note the emergent
+     probe-per-window property this must preserve: cooldown expiry does
+     NOT reset the count (only success does), so a still-broken
+     provider's first failure after its bench lapses re-benches it
+     immediately.
+   - AUTH: set auth_disabled = True and last_error, exactly the bench
+     PR 3 shipped. Does not increment the counter. Returns True.
+   - BAD_REQUEST, INVALID_OPERATION (the STOP categories): the router
+     must not call record_failure at all — the fault is the call, not
+     the provider. Health state is untouched.
+   - Success path: the router calls record_success() (get-or-create is
+     unnecessary if no state entry exists — no entry means nothing to
+     reset; either handle is fine as long as no bogus entry is created).
+
+4. New ErrorCategory.CONNECTION (src/nygen_router/errors.py):
+   - Add CONNECTION = "connection" to the ErrorCategory StrEnum.
+   - categorize_error() gains an isinstance(exc, ProviderConnectionError)
+     branch (place it alongside the ProviderTimeoutError branch, before
+     the ProviderHTTPError branch) so connection failures stop falling
+     through to UNKNOWN.
+   - It is a counted category (decision 3) and a continue-category in
+     the fallback loop — _STOP_CATEGORIES is unchanged.
+   - Metrics need no schema change: error_type is already TEXT and will
+     now record "connection". Do not touch the metrics code for this.
+
+5. Clock seam (src/nygen_router/router.py): new constructor parameter
+   clock: Callable[[], float] = time.monotonic. ALL cooldown arithmetic
+   (setting cooldown_until, checking expiry, computing remaining
+   seconds) runs on this clock. Never datetime.now(), never time.time(),
+   never a sleep. This is the same constructor-seam pattern as
+   adapter_factory and policy; tests inject a fake clock and advance it.
+   (MetricsEvent timestamps are unrelated and stay as PR 4 built them.)
+
+6. Filtering (src/nygen_router/filters.py, src/nygen_router/types.py):
+   - filter_eligible_providers() replaces its
+     disabled_this_run: Collection[str] parameter with two keyword-only
+     parameters: health: Mapping[str, ProviderHealthState] (default
+     empty mapping) and now: float (default 0.0 is acceptable since an
+     empty health mapping makes it unused). This is a deliberate
+     signature change to an internal function; update its callers and
+     tests in place. The router passes self._health and self._clock().
+     Remove the router's _auth_disabled_names() helper — it has no
+     remaining purpose.
+   - The filter is strictly READ-ONLY over health state: it never
+     mutates, never clears an expired cooldown_until (expiry is simply
+     "now >= cooldown_until means eligible"; the field is cleared by the
+     next record_success or overwritten by the next bench).
+   - Check order within _first_failing_reason: enabled → auth bench →
+     cooldown → API key resolvable → protocol supported → matching
+     CallVariant. (The two health checks slot where the auth check
+     already is.)
+   - New FilterReason.IN_COOLDOWN in types.py — ONE member for both
+     triggers; the detail string differentiates and carries the
+     evidence. Formats (match these shapes; exact wording may vary
+     slightly but must include remaining seconds, the trigger, and the
+     verbatim last error):
+       "in cooldown (12.3s remaining) after 3 consecutive failures;
+        last error: <verbatim>"
+       "in cooldown (12.3s remaining) after rate limiting;
+        last error: <verbatim>"
+   - The AUTH_DISABLED_THIS_RUN detail gains the stored last_error the
+     same way ("disabled after an auth failure earlier this run; last
+     error: <verbatim>"); if last_error is somehow absent, fall back to
+     the current detail text unchanged.
+   - Net effect required by the transparency principle: when every
+     provider is benched, NoEligibleProvidersError's message enumerates
+     each provider's root cause, not just "in cooldown" — and invoke()
+     raises it before any network call.
+
+7. Bench logging (router.py, stdlib logging on the module's existing
+   logger — one slice pulled forward from PR 19, same precedent as
+   PR 4's missing-duckdb warning):
+   - When record_failure returns True (new bench), log: provider name,
+     trigger (rate limit / N consecutive failures / auth), bench
+     duration (or "for the rest of the run" for auth), and the verbatim
+     last error.
+   - Dedup per provider, mirroring PR 4's storage-warning pattern: the
+     FIRST bench of a given provider logs at WARNING; every subsequent
+     bench of that same provider logs at DEBUG; the first success after
+     a bench episode logs ONE INFO recovery line. Track the flags on
+     that provider's ProviderHealthState (exact private field names are
+     yours; the observable log behavior is not). reset_health (decision
+     8) drops state entries, so a reset provider warns again on its next
+     bench — that is correct and intended.
+   - Same-call semantics are unchanged from PR 3's auth behavior: a
+     bench taken mid-invoke() applies from the NEXT call; the current
+     fallback loop already holds its ordered list and simply continues.
+
+8. reset_health (router.py):
+   def reset_health(self, provider_name: str | None = None) -> None
+   - None: clear health state for all providers (reset self._health).
+   - A name: validate it against the configured providers' names; if
+     unknown, raise ConfigError naming the bad input and the valid
+     names — a typo'd reset that silently no-ops is the exact silent
+     failure this PR exists to prevent. If known, drop that entry.
+   - Dropping the entry clears everything: cooldown, counter, auth
+     bench, last_error, logging flags ("treat this provider as brand
+     new").
+   - Must never touch the metrics store — MetricsStore has no delete
+     path; recorded history survives every reset.
+
+9. health_report (router.py + health.py):
+   def health_report(self) -> dict[str, ProviderHealthReport]
+   - ProviderHealthReport is a NEW frozen dataclass in health.py,
+     exported from the package root: auth_disabled: bool,
+     consecutive_failures: int, cooldown_remaining_seconds: float |
+     None, last_error: str | None.
+   - One entry for EVERY configured provider, keyed by name; providers
+     with no health entry (or a clean one) report
+     (False, 0, None, None).
+   - cooldown_remaining_seconds = cooldown_until - now when that is
+     positive, else None (an expired cooldown reads as None, i.e.
+     "not benched"). Computed with the injected clock. Remaining
+     seconds, never absolute deadlines.
+   - The report is built fresh from copies — no live mutable state may
+     escape (frozen dataclass + a new dict per call satisfies this).
+
+10. Exports (src/nygen_router/__init__.py): add HealthConfig and
+    ProviderHealthReport. `from nygen_router import ProviderRouter` must
+    keep working with no optional dependencies installed — nothing in
+    this PR may import an optional package.
+
+⸻
+
+Out of scope — do not implement
+
+- Honoring Retry-After headers on 429s (explicitly deferred backlog)
+- max_attempts_per_call or any global/total failure counter or
+  permanent give-up state (considered and REJECTED in the plan — do not
+  add one)
+- Escalating/exponential cooldowns for repeat benches (deferred)
+- Persisting health state anywhere (it lives and dies with the router
+  instance, in memory — that is pinned, not an oversight)
+- Any metrics/schema change beyond error_type now sometimes reading
+  "connection" (no new columns, no new recording, no recording of
+  exclusions)
+- Logging beyond decision 7's bench/recovery lines (PR 19 owns the
+  rest)
+- Per-provider HealthConfig overrides
+- Changing the fallback loop's control flow, STOP behavior, or PR 4's
+  recording placement
+
+⸻
+
+Testing rules (binding, from the plan's Testing philosophy)
+
+- No monkeypatching of internal collaborators: no monkeypatch.setattr /
+  unittest.mock.patch reaching into modules. Use the constructor seams:
+  fake adapters via adapter_factory=..., a fake or None metrics_store,
+  and the NEW clock=... seam with a controllable fake clock (a tiny
+  class with a .advance(seconds) method is enough). No test may sleep.
+- monkeypatch.setenv / monkeypatch.delenv remain allowed for
+  environment variables.
+- Do not delete existing tests. test_fallback.py, test_filters.py, and
+  test_router_metrics.py may be UPDATED IN PLACE where this PR
+  deliberately changes the behavior they assert (the filter signature
+  change, the enriched auth detail); each such update must track a real
+  behavior change, not convenience.
+
+New test file tests/test_health.py, plus in-place updates. Minimum
+coverage — implement all of these:
+
+- a 429 benches the provider for rate_limit_cooldown_seconds and leaves
+  consecutive_failures untouched
+- three counted failures (cover mixes of timeout / server error /
+  connection / unknown) bench for failure_cooldown_seconds
+- ProviderConnectionError categorizes as CONNECTION and a router-level
+  failure records error_type "connection" in the injected fake store
+- RATE_LIMIT, AUTH, BAD_REQUEST, INVALID_OPERATION do not increment the
+  counter
+- success resets the counter and clears cooldown_until / last_error
+- a benched provider is excluded with FilterReason.IN_COOLDOWN and a
+  detail carrying trigger, remaining seconds, and the verbatim last
+  error
+- the auth-bench exclusion detail carries the verbatim last error
+- advancing the fake clock past the cooldown makes the provider
+  eligible again; its next counted failure re-benches it immediately
+  (probe-per-window: expiry did not reset the count)
+- with every provider benched, invoke() raises NoEligibleProvidersError
+  with zero adapter invocations (assert via a counting adapter
+  factory), enumerating each provider's last error in its message
+- bench logging via caplog: first bench per provider is exactly one
+  WARNING containing the verbatim error; a repeat bench logs DEBUG, not
+  WARNING; the first success after a bench logs one INFO recovery
+- health_report() returns an entry per configured provider (healthy
+  ones read False/0/None/None), reports remaining seconds under the
+  fake clock, and mutating the returned dict does not change router
+  state
+- reset_health() with no argument clears all providers; with a name
+  clears only that provider and makes a benched provider immediately
+  eligible; raises ConfigError on an unknown name; leaves an injected
+  fake store's recorded events untouched
+- an auth failure on a provider that already has a nonzero failure
+  count preserves that count (regression test for the replace-write
+  fix)
+- HealthConfig: defaults apply when nothing is passed; an equivalent
+  dict passed as health=... is accepted and validated; an unknown key,
+  a non-positive duration, and a zero threshold are each rejected
+- a bench taken mid-call does not affect the current call's
+  already-ordered fallback loop; it applies from the next invoke()
+
+⸻
+
+Docs
+
+- README.md: add a "Provider health and cooldowns" section covering:
+  the default behavior (60s / 60s / threshold 3, works with zero
+  configuration); tuning via HealthConfig — typed form shown first,
+  dict form as the quick path; reset_health() with the
+  quota-upgraded/key-fixed use case, including that it never erases
+  recorded metrics; health_report(); the bench logging and how to see
+  it (logging level); the monotonic-clock suspend caveat; and the note
+  that health lives on the router instance — an application creating a
+  new ProviderRouter per request accumulates no health signal.
+- AGENT.md: update wherever it describes the feature set / fallback
+  behavior to include health benching, the new constructor parameters
+  (health, clock), reset_health, health_report, and
+  ErrorCategory.CONNECTION.
+
+⸻
+
+Quality gates
+
+All of these must pass before you declare PR 5 done. Use the project's
+own virtual environment (.venv in the repo), not the system Python:
+
+ruff format .
+ruff check .
+mypy src
+pytest
+coverage run -m pytest
+coverage report
+
+Also verify the non-negotiable import rule:
+`from nygen_router import ProviderRouter` succeeds with no optional
+dependencies installed.
+
+⸻
+
+Completion report — required format
+
+End your final message with exactly these five markdown sections, in
+this order, so the report can be processed downstream:
+
+## Files changed
+One bullet per file: path — one-line summary of what changed in it.
+
+## Design decisions checklist
+One line per numbered decision above, `1.` through `10.`, each ending
+in exactly one of: IMPLEMENTED AS SPECIFIED — or DEVIATED: <one-line
+reason>.
+
+## Behavior changes
+Short prose: what a user of the library observes differently after this
+PR, nothing else.
+
+## Quality gates
+The six commands with their verbatim output (trim pytest to the summary
+lines), plus the import-rule check result.
+
+## Deviations and concerns
+Anything you had to interpret, any conflict between this prompt and the
+codebase, any test you could not write as specified — or the single
+word "None".

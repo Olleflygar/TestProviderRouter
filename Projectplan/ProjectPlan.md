@@ -802,41 +802,222 @@ Tests:
 PR 5: Health state and cooldowns
 --------------------------------
 Goal:
-Avoid repeatedly calling providers that are temporarily bad.
+Avoid repeatedly calling providers that are temporarily bad, and make
+every bench visible with its real cause -- never silently.
 
-Scope:
-- in-memory provider health state
-- consecutive failure count
-- cooldown until timestamp
-- auth-disabled state for current router instance
+Revision note (design interview, 2026-07-15): this section was rewritten
+from the original four-line behavior sketch after a full design review;
+every decision below is pinned. Two corrections to the old text are
+folded in: the auth-disabled scope item already shipped in PR 3
+(health.py, FilterReason.AUTH_DISABLED_THIS_RUN, covered by
+test_fallback.py), so this PR extends it rather than introducing it; and
+the old test list asserted on RouterResponse.excluded, which the PR 3R
+redesign deleted -- exclusions are now observable via
+NoEligibleProvidersError.exclusions, the bench logging below, and the new
+health_report().
 
-Suggested behavior:
-- RATE_LIMIT: apply cooldown
-- TIMEOUT: increment failure count
-- SERVER_ERROR: increment failure count
-- AUTH: disable provider for current router instance
-- SUCCESS: reset provider failure count
+Scope -- state (health.py):
+- ProviderHealthState gains cooldown_until (monotonic float | None),
+  consecutive_failures (int), and last_error (str | None -- the
+  stringified real error from the most recent counted or benching
+  failure), alongside the shipped auth_disabled flag.
+- Transition logic lives on the dataclass, not in the router loop:
+  record_failure(category, error_text, config, now) and
+  record_success(); the fallback loop only calls these. This also fixes
+  a latent bug: router.py currently *replaces* the state object on an
+  auth failure (self._health[name] =
+  ProviderHealthState(auth_disabled=True)), which would silently zero an
+  existing failure count once that field exists -- PR 5 switches to
+  get-or-create + mutate.
+
+Behavior per ErrorCategory:
+- RATE_LIMIT: enter cooldown for rate_limit_cooldown_seconds
+  immediately. Neither increments nor resets consecutive_failures (a 429
+  is flow control, not "provider is off").
+- TIMEOUT, SERVER_ERROR, CONNECTION (new), UNKNOWN: increment
+  consecutive_failures; reaching failure_threshold (default 3) enters
+  cooldown for failure_cooldown_seconds. UNKNOWN counts on purpose: its
+  two real families -- provider-specific HTTP statuses (404 from a wrong
+  base_url or a model this provider doesn't host, 413 payload limits)
+  and the defensive catch-all -- are both per-provider problems.
+  Genuine caller-side typos never reach here: bad operation strings /
+  arguments are INVALID_OPERATION and malformed requests are
+  BAD_REQUEST, both STOP categories that abort the run loudly before
+  health is involved.
+- AUTH: full-run bench exactly as shipped in PR 3, now also recording
+  last_error. Does not increment the counter.
+- BAD_REQUEST, INVALID_OPERATION (STOP): never touch health state -- the
+  fault is the call, not the provider.
+- SUCCESS: resets consecutive_failures to 0, clears cooldown_until and
+  last_error.
+- New ErrorCategory.CONNECTION: categorize_error() gains an isinstance
+  branch so ProviderConnectionError maps to "connection" instead of
+  falling through to UNKNOWN -- "provider unreachable" is the strongest
+  something-is-off signal there is, and metrics/scoring (PR 7-8) should
+  see it by name. It behaves like the other counted categories.
+
+Configuration (HealthConfig, in health.py, exported from the package
+root):
+- Pydantic model, extra="forbid": rate_limit_cooldown_seconds: float =
+  60.0, failure_cooldown_seconds: float = 60.0 (same default on purpose;
+  two knobs so they can diverge later), failure_threshold: int = 3.
+  Durations validated > 0, threshold >= 1.
+- ProviderRouter gains health: HealthConfig | Mapping[str, object] |
+  None = None. None means HealthConfig() -- zero configuration required
+  by default. A mapping is validated into HealthConfig at the boundary
+  (typos raise immediately via extra="forbid"), so overrides need no
+  import; the README documents the typed form first and the dict form as
+  the quick path -- the same accept-and-validate pattern
+  ProviderConfig.capabilities already has.
+
+Clock:
+- Cooldowns run on time.monotonic (immune to wall-clock jumps), injected
+  as a constructor seam: clock: Callable[[], float] = time.monotonic on
+  ProviderRouter -- the same seam pattern as adapter_factory/policy, per
+  the testing philosophy (no monkeypatching, no sleeps; tests inject a
+  fake clock and advance it). Reports expose remaining seconds, never
+  absolute deadlines. Documented caveat: monotonic excludes suspend time
+  on most platforms, so a laptop suspend stretches a cooldown's wall
+  duration -- benign for the long-running active workflows this router
+  targets.
+
+Filtering (filters.py, types.py):
+- Cooldown/auth-benched exclusions are hard filters, not a separate
+  mechanism: filter_eligible_providers() consults health state directly,
+  replacing disabled_this_run: Collection[str] with health: Mapping[str,
+  ProviderHealthState] and now: float (a deliberate signature change to
+  an internal function; its tests update in place, per the
+  testing-philosophy update rule).
+- New FilterReason.IN_COOLDOWN, one member for both triggers; the detail
+  string distinguishes them and carries the evidence: "in cooldown
+  (12.3s remaining) after 3 consecutive failures; last error:
+  <verbatim>" vs "... after rate limiting; ...". The
+  AUTH_DISABLED_THIS_RUN detail gains the stored last_error the same
+  way. When everything is benched, NoEligibleProvidersError therefore
+  enumerates root causes, not just cooldown states.
+- Same-call semantics unchanged from PR 3's auth behavior: a bench taken
+  mid-invoke() applies from the next call; the current fallback loop
+  already holds its ordered list.
+
+Transparency (one slice pulled forward from PR 19, same precedent as
+PR 4's missing-duckdb warning -- silent benching is not acceptable):
+- Every bench is logged with provider name, trigger, duration, and the
+  verbatim last error. Dedup per provider, PR 4's pattern: first bench =
+  WARNING, repeat benches = DEBUG, first success after a bench = one
+  INFO recovery line. A user with a typo'd base_url sees the provider's
+  own 404 text in the first warning.
+- reset_health(provider_name: str | None = None) on ProviderRouter:
+  clears cooldown, failure count, auth bench, and last_error -- "treat
+  this provider as brand new" -- for one provider or (None) all. An
+  unknown name raises ConfigError: a typo'd reset that silently no-ops
+  is the exact silent failure this PR exists to prevent. Use case: quota
+  upgraded or API key fixed mid-run, retry now instead of waiting out
+  the bench. Never touches stored metrics -- MetricsStore has no delete
+  path; every recorded attempt survives forever. Stated consequence:
+  once PR 8-9 land, a just-reset provider may still rank low from its
+  recorded history within the lookback window; reset means "may be tried
+  again now" (hard filter), not "forget what happened" (scoring) --
+  design principle 8's filter/score split.
+- health_report() -> dict[str, ProviderHealthReport] (frozen dataclass:
+  auth_disabled, consecutive_failures, cooldown_remaining_seconds: float
+  | None, last_error: str | None), one entry for every configured
+  provider, healthy ones showing zeros/None; defensive copies only --
+  no live mutable state escapes. You cannot decide whether to reset
+  without being able to look. Exported from the package root alongside
+  HealthConfig.
+
+Invariants (pinned; the second emerges from "the count resets only on
+success"):
+- One invoke() never loops: the fallback loop iterates a finite ordered
+  list in which each eligible provider appears at most once; the ceiling
+  is one attempt per eligible provider, then RouterExhaustedError. PR 23
+  mirrors the same guarantee for mid-stream restarts.
+- Probe-per-window: cooldown expiry does not reset
+  consecutive_failures. A still-broken provider whose bench lapses is
+  re-benched by its next counted failure immediately (the count is still
+  >= threshold), so after the first bench a persistently failing
+  provider costs one failed probe per cooldown window, not three. With
+  every provider misconfigured, steady state is at most N probes per
+  window plus instant, zero-network NoEligibleProvidersError fast-fails
+  enumerating each root cause. A global "total failures, then give up
+  forever" counter was considered and rejected: for overnight
+  long-running workflows it would turn a transient multi-hour outage
+  into a permanently dead router; a caller who wants give-up-after-N can
+  count the enumerated exceptions themselves.
+
+Metrics: no schema change and no recording change. Every attempt is
+still recorded exactly as PR 4 ships it, before any health decision;
+exclusions (including cooldown skips) stay unrecorded per PR 4's pinned
+decision. The only visible metrics effect is ProviderConnectionError now
+recording error_type "connection" instead of "unknown".
 
 Relationship to PR3:
-This extends the same ProviderHealthState/self._health tracker introduced in
-PR3 (auth-disabled) in place -- adding cooldown_until and
-consecutive_failures fields -- rather than moving health state to a new
-owner. It remains owned by ProviderRouter, shared by every policy.
+Extends the same ProviderHealthState / self._health tracker in place --
+never relocating it. It remains owned by ProviderRouter, in memory,
+shared by every policy, living and dying with the router instance: two
+router objects have independent health, a process restart starts clean,
+and an application that constructs a new ProviderRouter per request
+accumulates no health signal at all (stated in the README; the
+protection targets long-lived routers, the project's primary use case).
 
-Cooldown/auth-disabled exclusions are hard filters, not a separate
-mechanism: filter_eligible_providers (PR2) consults this health state
-alongside its static config checks, using the same FilterReason/
-EligibilityResult machinery. A provider skipped for being in cooldown or
-auth-disabled therefore also shows up in RouterResponse.excluded with its
-specific reason, exactly like a PR2 static exclusion.
+Deferred (backlog, not this PR):
+- Honor Retry-After on 429s instead of the fixed knob (parse both
+  delta-seconds and HTTP-date forms, cap absurd values) -- cleanly
+  additive later; ProviderHTTPError already carries the raw response.
+- max_attempts_per_call: bounds worst-case single-call latency
+  (len(eligible) x timeout_seconds) -- a latency cap, not loop
+  protection; typical 2-5 provider setups don't need it.
+- Escalating/exponential cooldowns for repeat benches.
+
+Suggested files:
+src/nygen_router/health.py (HealthConfig, ProviderHealthReport, extended
+  ProviderHealthState with record_failure/record_success)
+src/nygen_router/errors.py (ErrorCategory.CONNECTION)
+src/nygen_router/types.py (FilterReason.IN_COOLDOWN)
+src/nygen_router/filters.py (health-consulting signature)
+src/nygen_router/router.py (clock + health constructor params,
+  reset_health, health_report, bench logging, get-or-create health
+  writes)
+src/nygen_router/__init__.py (export HealthConfig, ProviderHealthReport)
+tests/test_health.py (new: state transitions, config validation, clock)
+tests/test_fallback.py, tests/test_filters.py,
+  tests/test_router_metrics.py (updated in place)
 
 Tests:
-- rate-limited provider enters cooldown
-- provider in cooldown is filtered out, and appears in RouterResponse.excluded
-  with a cooldown-specific FilterReason
-- success resets failure count
-- auth error disables provider for current run, and appears in
-  RouterResponse.excluded with an auth-disabled FilterReason
+- a 429 benches the provider for rate_limit_cooldown_seconds and leaves
+  consecutive_failures untouched
+- three counted failures (mixes of timeout / server error / connection /
+  unknown) bench for failure_cooldown_seconds
+- ProviderConnectionError categorizes as CONNECTION and records
+  error_type "connection"
+- RATE_LIMIT, AUTH, BAD_REQUEST, INVALID_OPERATION do not increment the
+  counter
+- success resets the counter and clears cooldown_until / last_error
+- a benched provider is excluded with FilterReason.IN_COOLDOWN and a
+  detail carrying trigger, remaining seconds, and the verbatim last
+  error
+- the auth-bench exclusion detail carries the verbatim last error
+- advancing an injected fake clock past the cooldown makes the provider
+  eligible again; its next counted failure re-benches it immediately
+  (probe-per-window: expiry did not reset the count)
+- with every provider benched, invoke() raises NoEligibleProvidersError
+  with zero adapter invocations, enumerating each provider's last error
+- bench logging: first bench per provider is one WARNING with the
+  verbatim error, repeat benches log DEBUG, first success after a bench
+  logs one INFO recovery (asserted via caplog)
+- health_report() returns an entry per configured provider (healthy ones
+  zeros/None), reports remaining seconds, and returns defensive copies
+  (mutating the report does not change router state)
+- reset_health() clears one provider / all providers, makes a benched
+  provider immediately eligible, raises ConfigError on an unknown name,
+  and leaves stored metrics rows untouched
+- an auth failure on a provider with an existing failure count preserves
+  that count (regression for the replace-write fix)
+- HealthConfig: defaults apply with nothing passed; an equivalent dict
+  is accepted and validated; an unknown key, non-positive duration, or
+  zero threshold is rejected
+- a bench taken mid-call does not affect the current call's already-
+  ordered fallback loop; it applies from the next invoke()
 
 PR 6: Token cost calculation (deferred, optional)
 --------------------------------------------------
