@@ -70,6 +70,45 @@ def test_sdk_available_false_logs_exactly_one_warning(caplog: pytest.LogCaptureF
     assert "[duckdb]" in warnings[0].message
 
 
+def test_sdk_available_false_warns_only_once_when_router_writes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from nygen_router import CallVariant, ProviderConfig, ProviderRouter
+
+    class _Adapter:
+        def invoke(self, operation: str, arguments: dict[str, object]) -> str:
+            return "response"
+
+    config = ProviderConfig(
+        name="provider_a",
+        protocol=ApiProtocol.OPENAI_CHAT,
+        model="model-a",
+        base_url="https://provider-a.example.com/v1",
+        api_key="secret",
+    )
+    calls = [
+        CallVariant(
+            protocol=ApiProtocol.OPENAI_CHAT,
+            operation="chat.completions.create",
+            arguments={"messages": []},
+        )
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        store = DuckDBMetricsStore(sdk_available=False)
+        router = ProviderRouter(
+            providers=[config],
+            adapter_factory=lambda _: _Adapter(),
+            metrics_store=store,
+        )
+        assert router.invoke(calls) == "response"
+        assert router.invoke(calls) == "response"
+
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "[duckdb]" in warnings[0].message
+
+
 @requires_duckdb
 def test_query_recent_reads_back_recorded_events(tmp_path: Path) -> None:
     store = DuckDBMetricsStore(tmp_path / "metrics.duckdb")

@@ -737,7 +737,14 @@ What gets recorded, and by whom:
   on failures too (a timeout's duration is itself signal).
 - Every record_attempt call is wrapped in its own try/except so a storage
   error can never disturb the LLM call, and is skipped entirely when
-  metrics_store=None.
+  metrics_store=None. Storage remains observable without flooding or
+  contaminating provider output: the router logs one short warning on the
+  first write failure, keeps retrying later writes without repeating that
+  warning, writes the full exception and traceback only at DEBUG level, and
+  logs one INFO recovery message with the number of unrecorded attempts if a
+  later write succeeds. A missing DuckDB dependency is already warned about
+  during DuckDBMetricsStore construction, so its failed writes do not produce
+  a second warning. Explicit metrics_store=None is intentional and silent.
 
 Suggested files:
 src/nygen_router/metrics.py

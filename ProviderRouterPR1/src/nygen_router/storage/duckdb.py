@@ -46,7 +46,13 @@ class DuckDBMetricsStore:
                 'pip install "nygen-router[duckdb]", or pass a different metrics_store '
                 "to ProviderRouter."
             )
+        self._sdk_available = available
         self._connection: duckdb.DuckDBPyConnection | None = None
+
+    @property
+    def available(self) -> bool:
+        """Whether the optional DuckDB dependency was present at construction."""
+        return self._sdk_available
 
     def record_attempt(self, event: MetricsEvent) -> None:
         connection = self._connect()
@@ -72,6 +78,10 @@ class DuckDBMetricsStore:
             self._connection = None
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
+        if not self._sdk_available:
+            raise ImportError(
+                'duckdb is not installed; install it with pip install "nygen-router[duckdb]"'
+            )
         if self._connection is None:
             import duckdb
 

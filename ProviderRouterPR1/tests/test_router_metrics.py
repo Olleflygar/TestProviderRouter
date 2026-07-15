@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,20 @@ class _RaisingStore:
         model: str | None = None,
     ) -> list[MetricsEvent]:
         return []
+
+
+class _RecoveringStore(_FakeStore):
+    """Fail a fixed number of writes, then recover without changing stores."""
+
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self._failures_remaining = failures
+
+    def record_attempt(self, event: MetricsEvent) -> None:
+        if self._failures_remaining > 0:
+            self._failures_remaining -= 1
+            raise RuntimeError("temporary storage failure")
+        super().record_attempt(event)
 
 
 class _ScriptedAdapter:
@@ -174,6 +189,45 @@ def test_store_raising_does_not_break_the_call(exc: Exception) -> None:
     response = router.invoke(_calls())
 
     assert response == "provider_a"
+
+
+def test_repeated_storage_failures_warn_once_and_include_debug_details(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _RaisingStore(RuntimeError("sensitive diagnostic detail"))
+    router = _router([_config("provider_a")], {}, metrics_store=store)
+
+    with caplog.at_level(logging.DEBUG, logger="nygen_router.router"):
+        router.invoke(_calls())
+        router.invoke(_calls())
+
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    debug_records = [record for record in caplog.records if record.levelno == logging.DEBUG]
+    assert len(warnings) == 1
+    assert "sensitive diagnostic detail" not in warnings[0].message
+    assert len(debug_records) == 2
+    assert all(record.exc_info is not None for record in debug_records)
+
+
+def test_storage_retries_and_logs_one_recovery_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _RecoveringStore(failures=2)
+    router = _router([_config("provider_a")], {}, metrics_store=store)
+
+    with caplog.at_level(logging.INFO, logger="nygen_router.router"):
+        router.invoke(_calls())
+        router.invoke(_calls())
+        router.invoke(_calls())
+        router.invoke(_calls())
+
+    recovery_messages = [
+        record.message
+        for record in caplog.records
+        if record.levelno == logging.INFO and "recovered" in record.message
+    ]
+    assert recovery_messages == ["Metrics storage recovered after 2 unrecorded attempt(s)."]
+    assert len(store.events) == 2
 
 
 def test_metrics_store_none_records_nothing_and_creates_no_file(tmp_path: Path) -> None:

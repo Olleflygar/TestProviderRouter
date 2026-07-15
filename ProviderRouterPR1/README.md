@@ -238,6 +238,13 @@ extra install) and handles cross-process file locking natively. For shared,
 multi-machine routing history, a Postgres/Supabase-backed store is a planned
 future backend.
 
+Storage writes are best-effort and never replace or modify a provider response.
+The router logs one short warning when a configured store first fails, continues
+retrying later writes without repeating the warning, and logs one recovery message
+if persistence starts working again. Full storage exceptions and tracebacks are
+available at DEBUG logging level. Passing `metrics_store=None` intentionally disables
+persistence and produces no warning.
+
 ### Bring your own backend
 
 `MetricsStore` is a two-method `typing.Protocol`:

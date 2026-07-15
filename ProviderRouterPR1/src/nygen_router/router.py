@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable, Collection
 from typing import Any
@@ -26,6 +27,8 @@ from nygen_router.storage.duckdb import DuckDBMetricsStore
 from nygen_router.types import CallVariant, ProviderAttempt
 
 AdapterFactory = Callable[[ProviderConfig], ProviderAdapter]
+
+logger = logging.getLogger(__name__)
 
 # Protocols the built-in adapter factory can serve. Adding a new adapter
 # (e.g. OPENAI_RESPONSES in PR12) means registering its protocol here so the
@@ -78,6 +81,14 @@ class ProviderRouter:
         self._metrics_store: MetricsStore | None = (
             DuckDBMetricsStore() if isinstance(metrics_store, _UnsetType) else metrics_store
         )
+        # A missing DuckDB dependency was already reported by the store at
+        # construction, so the first failed write must not repeat the warning.
+        self._metrics_warning_emitted = (
+            isinstance(self._metrics_store, DuckDBMetricsStore)
+            and not self._metrics_store.available
+        )
+        self._metrics_recovery_emitted = False
+        self._dropped_metrics_events = 0
 
     def invoke(self, calls: list[CallVariant]) -> Any:
         """Filter, order eligible providers, then try them in turn with fallback.
@@ -155,7 +166,23 @@ class ProviderRouter:
         try:
             self._metrics_store.record_attempt(event)
         except Exception:
-            pass
+            self._dropped_metrics_events += 1
+            logger.debug("Metrics storage write failed.", exc_info=True)
+            if not self._metrics_warning_emitted:
+                logger.warning(
+                    "Metrics storage is unavailable (%s); routing will continue, but "
+                    "attempts are not being recorded. Enable debug logging for details.",
+                    type(self._metrics_store).__name__,
+                )
+                self._metrics_warning_emitted = True
+            return
+
+        if self._dropped_metrics_events > 0 and not self._metrics_recovery_emitted:
+            logger.info(
+                "Metrics storage recovered after %d unrecorded attempt(s).",
+                self._dropped_metrics_events,
+            )
+            self._metrics_recovery_emitted = True
 
     @staticmethod
     def _prepare_variants(calls: list[CallVariant]) -> dict[ApiProtocol, CallVariant]:
