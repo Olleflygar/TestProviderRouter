@@ -816,6 +816,28 @@ redesign deleted -- exclusions are now observable via
 NoEligibleProvidersError.exclusions, the bench logging below, and the new
 health_report().
 
+Revision note (implementation, 2026-07-15): PR 5 shipped as pinned with
+one deliberate exception -- the scope of the bench-logging dedup, now
+corrected in the Transparency section below. The pinned text read "dedup
+per provider ... every subsequent bench of that same provider logs at
+DEBUG", leaving reset_health() as the only way to re-arm the WARNING.
+Read literally that is a transparency hole: a provider that benches,
+recovers, and benches again hours later reports the second, genuinely
+separate outage at DEBUG only -- invisible at the default log level.
+That contradicts this PR's own goal that nothing is ever benched
+silently, and it does so precisely for the long-lived routers this plan
+names as the primary use case. The dedup is therefore scoped to a bench
+EPISODE rather than to the provider's lifetime: record_success() also
+clears the warning flag -- a fourth thing it clears, beyond the
+consecutive_failures / cooldown_until / last_error listed in the state
+scope below -- so each distinct outage warns exactly once, while repeat
+benches within one outage still collapse to DEBUG. The anti-spam
+property the dedup existed for is unchanged, since a persistently broken
+provider never succeeds in between. reset_health() still re-arms the
+warning by dropping the entry. Nothing else about the decision changed:
+the WARNING still carries provider name, trigger, duration, and the
+verbatim last error.
+
 Scope -- state (health.py):
 - ProviderHealthState gains cooldown_until (monotonic float | None),
   consecutive_failures (int), and last_error (str | None -- the
@@ -906,9 +928,8 @@ PR 4's missing-duckdb warning -- silent benching is not acceptable):
   the first bench of an episode = WARNING, repeat benches within that
   same episode = DEBUG, first success after a bench = one INFO recovery
   line, which also re-arms the warning so the next distinct outage warns
-  again (revised 2026-07-16; see the implementation revision note
-  above). A user with a typo'd base_url sees the provider's own 404 text
-  in the first warning.
+  again (see the implementation revision note above). A user with a
+  typo'd base_url sees the provider's own 404 text in the first warning.
 - reset_health(provider_name: str | None = None) on ProviderRouter:
   clears cooldown, failure count, auth bench, and last_error -- "treat
   this provider as brand new" -- for one provider or (None) all. An
