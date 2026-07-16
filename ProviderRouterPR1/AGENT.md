@@ -27,9 +27,11 @@ Implementation rules for this package:
   `CallVariant.operation` (e.g. `"chat.completions.create"`) is resolved via
   `getattr` against an `openai.OpenAI` client, not a hardcoded per-operation
   method map -- adding a new operation needs no adapter changes.
-- Hard filters (eligibility) run before routing and are static only: enabled,
-  resolvable API key, protocol has a registered adapter, and protocol has a
-  matching `CallVariant` in this specific call. There is currently no
+- Hard filters (eligibility) run before routing: enabled, not auth-benched, not
+  in cooldown, resolvable API key, protocol has a registered adapter, and
+  protocol has a matching `CallVariant` in this specific call. Apart from the
+  two health checks (see "Provider health" below), they are static. There is
+  currently no
   capability-based filtering (no `requires_tools`-style check) -- a provider
   that can't actually handle a call's `arguments` fails at call time like any
   other provider error, rather than being excluded pre-flight. Restoring
@@ -45,15 +47,16 @@ Implementation rules for this package:
 - Round robin rotates among eligible providers, and a failed provider falls
   back to the next eligible one, re-picking whichever `CallVariant` matches
   the new provider's protocol. An auth failure (401/403) benches a provider
-  for the rest of the run (`FilterReason.AUTH_DISABLED_THIS_RUN`); a bad
-  request (400/422), an unresolvable `operation`, or `arguments` that don't
-  match the resolved operation's signature all stop the run immediately
-  instead of trying more providers -- these are call-shape problems every
-  provider sharing that protocol would hit identically, so continuing would
-  only bury the real cause. Health state lives on `ProviderRouter` so the
-  filter and any policy can see it. When every tried provider fails,
-  `RouterExhaustedError` enumerates each real failure rather than blending
-  them.
+  for the rest of the run (`FilterReason.AUTH_DISABLED_THIS_RUN`), and a 429
+  or repeated failures bench it temporarily (`FilterReason.IN_COOLDOWN`) --
+  see "Provider health" below; a bad request (400/422), an unresolvable
+  `operation`, or `arguments` that don't match the resolved operation's
+  signature all stop the run immediately instead of trying more providers --
+  these are call-shape problems every provider sharing that protocol would hit
+  identically, so continuing would only bury the real cause. Health state
+  lives on `ProviderRouter` so the filter and any policy can see it. When every
+  tried provider fails, `RouterExhaustedError` enumerates each real failure
+  rather than blending them.
 - Every provider attempt (success or failure) is persisted as one
   `MetricsEvent` behind the swappable `MetricsStore` protocol -- see
   "Metrics persistence" below. Excluded providers are not recorded.
@@ -123,3 +126,52 @@ score-based routing (PR7-10) has real history to work from:
 - Do not build cross-process coordination for DuckDB, async/batched writes,
   schema versioning, or any query beyond `query_recent` -- all explicitly out
   of scope for PR4; see `Projectplan/ProjectPlan.md`'s PR4/PR7/PR13 sections.
+
+## Provider health (PR5)
+
+`ProviderRouter` benches temporarily-bad providers so they stop being called,
+extending the auth bench PR3 shipped. Never bench silently -- that is the whole
+point of the feature:
+
+- Transitions live on `ProviderHealthState` (`health.py`) as `record_failure`
+  / `record_success`, not in the fallback loop; the loop only reports what
+  happened and reads back whether a bench began. Router-side writes are
+  get-or-create + mutate -- never replace the state object, which would
+  silently zero an existing failure count.
+- A 429 benches immediately without counting (flow control, not a broken
+  provider). Timeout, connection, server error, and unknown are counted;
+  crossing `failure_threshold` benches. The STOP categories (bad request,
+  invalid operation) must never touch health -- the call is at fault, not the
+  provider. Only a success resets the count, which is what makes a
+  persistently broken provider cost one probe per cooldown window rather than
+  three; do not "helpfully" reset the count on cooldown expiry.
+- `HealthConfig` (`health.py`, exported from the package root) is validated at
+  the constructor boundary via `HealthConfig.model_validate`, so a dict typo
+  raises immediately and no raw dict flows past `__init__`.
+- All cooldown arithmetic runs on `ProviderRouter`'s injected `clock`
+  (defaulting to `time.monotonic`) -- never `time.time()`, `datetime.now()`, or
+  a sleep. It is a constructor seam like `adapter_factory`/`policy`; tests
+  inject a fake clock and advance it. `MetricsEvent` timestamps are unrelated.
+- `filter_eligible_providers()` is strictly read-only over health state: an
+  expired cooldown simply reads as eligible and is never cleared there.
+  Benching and clearing are the router's business.
+- `FilterReason.IN_COOLDOWN` is one member for both triggers; the detail string
+  tells them apart and carries remaining seconds plus the provider's verbatim
+  last error, so a fully-benched router still enumerates root causes. The
+  trigger is stored on the state when the bench is taken -- do not infer it
+  from the failure count, which a 429 neither increments nor resets.
+- Bench logging (one slice pulled forward from PR19) dedups per bench episode:
+  the first bench warns, repeat benches within that episode are DEBUG, and the
+  first success logs one INFO recovery and re-arms the warning so a later,
+  separate outage is not buried. `reset_health` drops the entry entirely, so a
+  reset provider warns again.
+- `reset_health()` must never touch the metrics store -- `MetricsStore` has no
+  delete path and recorded history survives every reset. Reset means "may be
+  tried again now" (hard filter), not "forget what happened" (scoring).
+  An unknown provider name raises `ConfigError`; a typo'd reset that silently
+  no-ops is the exact failure this feature exists to prevent.
+- Health is in-memory and lives and dies with the router instance. Do not
+  persist it, do not add per-provider `HealthConfig` overrides, escalating
+  cooldowns, `Retry-After` handling, or any global give-up counter -- each was
+  considered and deferred or rejected; see `Projectplan/ProjectPlan.md`'s PR5
+  section.

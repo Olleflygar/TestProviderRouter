@@ -28,6 +28,7 @@ class FilterReason(StrEnum):
 
     DISABLED = "disabled"
     AUTH_DISABLED_THIS_RUN = "auth_disabled_this_run"
+    IN_COOLDOWN = "in_cooldown"
     MISSING_API_KEY = "missing_api_key"
     UNSUPPORTED_PROTOCOL = "unsupported_protocol"
     NO_MATCHING_CALL_VARIANT = "no_matching_call_variant"

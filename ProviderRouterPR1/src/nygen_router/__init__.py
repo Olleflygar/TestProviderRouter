@@ -20,6 +20,7 @@ from nygen_router.errors import (
     UnsupportedProtocolError,
 )
 from nygen_router.filters import filter_eligible_providers
+from nygen_router.health import HealthConfig, ProviderHealthReport
 from nygen_router.metrics import MetricsEvent
 from nygen_router.policies import RoundRobinPolicy
 from nygen_router.router import ProviderRouter
@@ -39,6 +40,7 @@ __all__ = [
     "DuplicateCallVariantProtocolError",
     "EligibilityResult",
     "FilterReason",
+    "HealthConfig",
     "InvalidOperationArgumentsError",
     "MetricsEvent",
     "MetricsStore",
@@ -53,6 +55,7 @@ __all__ = [
     "ProviderConnectionError",
     "ProviderError",
     "ProviderHTTPError",
+    "ProviderHealthReport",
     "ProviderRouter",
     "ProviderSDKNotInstalledError",
     "ProviderTimeoutError",

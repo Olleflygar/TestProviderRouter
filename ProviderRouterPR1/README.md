@@ -110,6 +110,10 @@ can satisfy this call. Filters are hard, not scores: a provider that fails an
 essential check is excluded, not ranked lower:
 
 - **disabled** -- `ProviderConfig(enabled=False)`
+- **auth-benched** -- an auth failure benched it for the rest of this run (see
+  [Provider health and cooldowns](#provider-health-and-cooldowns))
+- **in cooldown** -- it was temporarily benched after rate limiting or repeated
+  failures (same section)
 - **no API key available** -- neither `api_key` nor a populated `api_key_env`
 - **unsupported protocol** -- no adapter registered for this protocol at all
 - **no matching `CallVariant`** -- the provider's protocol has an adapter, but
@@ -150,8 +154,10 @@ provider (picking whichever `CallVariant` matches that provider's protocol)
 instead of failing the whole call. Failures are classified to decide what
 happens next:
 
-- **Timeout, rate limit (HTTP 429), server error (5xx), or unknown** -- try the
-  next eligible provider.
+- **Timeout, rate limit (HTTP 429), connection failure, server error (5xx), or
+  unknown** -- try the next eligible provider. These also feed provider health,
+  which may bench the failing provider from *later* calls (see
+  [Provider health and cooldowns](#provider-health-and-cooldowns)).
 - **Auth (HTTP 401/403)** -- record the failure, try the next provider, and bench
   the failing provider for the rest of this process. It is then excluded from
   later calls on the same router with `FilterReason.AUTH_DISABLED_THIS_RUN`.
@@ -177,6 +183,135 @@ from nygen_router import ProviderRouter, RoundRobinPolicy
 
 router = ProviderRouter(providers=[...], policy=RoundRobinPolicy())
 ```
+
+## Provider health and cooldowns
+
+Falling back on every call is wasteful if a provider is simply having a bad
+hour: each call would pay its timeout again before moving on. So the router
+tracks per-provider health and temporarily benches providers that are misbehaving.
+A benched provider is excluded by the hard filter, so it costs nothing until its
+bench expires.
+
+This works with **zero configuration**. By default:
+
+- A **rate limit (429)** benches that provider for **60 seconds**, immediately.
+  A 429 is flow control rather than a broken provider, so it does not count
+  toward the failure threshold below.
+- **Three consecutive counted failures** (timeout, connection failure, server
+  error, or unknown) bench that provider for **60 seconds**. Only a success
+  resets the count.
+- An **auth failure (401/403)** benches that provider for the rest of the run,
+  as it already did before.
+
+Benches are always temporary and never silent -- every one is logged with the
+provider's own verbatim error (see [Seeing benches](#seeing-benches)), readable
+via `health_report()`, and clearable via `reset_health()`.
+
+Because only a success resets the failure count, a provider that stays broken
+costs **one failed probe per cooldown window** rather than three: when its bench
+lapses it becomes eligible, and its next failure re-benches it at once. If every
+provider is benched, `invoke()` raises `NoEligibleProvidersError` before making
+any network call, and the message enumerates each provider's real root cause:
+
+```
+No eligible providers for this request: provider_a: in cooldown (47.9s remaining)
+after 3 consecutive failures; last error: Provider 'provider_a' returned HTTP 404
+Not Found for model 'gpt-4o-mini': The model does not exist; provider_b: in
+cooldown (12.4s remaining) after rate limiting; last error: ...
+```
+
+### Tuning
+
+Pass a `HealthConfig` to override any of the three knobs. The two cooldowns are
+separate settings that happen to share a default, so they can diverge:
+
+```python
+from nygen_router import HealthConfig, ProviderRouter
+
+router = ProviderRouter(
+    providers=[...],
+    health=HealthConfig(
+        rate_limit_cooldown_seconds=120.0,  # back off longer when rate limited
+        failure_cooldown_seconds=30.0,
+        failure_threshold=5,                # more tolerant of flaky providers
+    ),
+)
+```
+
+A plain dict works too, if you'd rather not import anything. It is validated
+immediately, so a typo raises at construction instead of silently doing nothing:
+
+```python
+router = ProviderRouter(providers=[...], health={"failure_threshold": 5})
+```
+
+### Inspecting health
+
+`health_report()` returns one entry per configured provider, so you can see who
+is benched and why before deciding to intervene. Healthy providers report clean
+rather than going missing:
+
+```python
+for name, health in router.health_report().items():
+    print(name, health.cooldown_remaining_seconds, health.last_error)
+```
+
+Each entry is a frozen `ProviderHealthReport` with `auth_disabled`,
+`consecutive_failures`, `cooldown_remaining_seconds` (`None` when not benched),
+and `last_error`. Cooldowns are reported as remaining seconds, never as absolute
+deadlines. The report is a copy: mutating it does not affect the router.
+
+### Clearing a bench
+
+When you have fixed the real cause -- upgraded a quota, corrected an API key --
+waiting out the cooldown serves no purpose. `reset_health()` treats a provider as
+brand new, clearing its cooldown, failure count, auth bench, and last error:
+
+```python
+router.reset_health("provider_a")  # one provider, eligible again on the next call
+router.reset_health()              # all providers
+```
+
+An unknown provider name raises `ConfigError` rather than quietly doing nothing,
+since a reset that silently no-ops is exactly the kind of failure this is meant
+to prevent.
+
+`reset_health()` never erases recorded metrics. The metrics store has no delete
+path: every attempt that actually happened stays in the history forever. Reset
+means "this provider may be tried again now", not "forget what happened".
+
+### Seeing benches
+
+Benches are reported on the standard library logger `nygen_router.router`:
+
+- The first bench of an outage logs one **WARNING** naming the provider, the
+  trigger, the bench duration, and the provider's verbatim error text -- so a
+  typo'd `base_url` shows up as that provider's own 404 message.
+- Repeat benches during that same outage drop to **DEBUG**, so one broken
+  provider cannot flood your logs.
+- The first success afterwards logs one **INFO** recovery line, and re-arms the
+  warning: a later, separate outage warns again rather than being buried.
+
+```python
+import logging
+
+logging.basicConfig(level=logging.INFO)  # WARNING benches + INFO recoveries
+logging.getLogger("nygen_router.router").setLevel(logging.DEBUG)  # every bench
+```
+
+### Two caveats worth knowing
+
+**Health lives on the router instance.** It is held in memory and dies with the
+object: two routers have independent health, a process restart starts clean, and
+an application that constructs a new `ProviderRouter` per request accumulates no
+health signal at all. This protection is built for long-lived routers -- if that
+is your setup, keep one router around rather than creating one per call.
+
+**Cooldowns run on a monotonic clock**, so they are immune to wall-clock jumps
+(NTP corrections, timezone changes). On most platforms that clock excludes time
+the machine spends suspended, so suspending a laptop mid-cooldown stretches the
+bench's wall-clock duration. That is harmless for the long-running workflows this
+router targets.
 
 ## Multiple protocols in one call
 

@@ -11,6 +11,7 @@ from nygen_router import (
     ProviderRouter,
 )
 from nygen_router.filters import filter_eligible_providers
+from nygen_router.health import CooldownTrigger, ProviderHealthState
 
 SUPPORTED = frozenset({ApiProtocol.OPENAI_CHAT})
 REQUESTED = frozenset({ApiProtocol.OPENAI_CHAT})
@@ -115,6 +116,68 @@ def test_fully_eligible_provider_passes() -> None:
 
     assert [p.name for p in eligible] == ["provider_a"]
     assert excluded == []
+
+
+def test_auth_benched_provider_without_a_stored_error_keeps_the_plain_detail() -> None:
+    """The verbatim error enriches the detail when present; its absence must not break it."""
+    health = {"provider_a": ProviderHealthState(auth_disabled=True)}
+
+    eligible, excluded = filter_eligible_providers(
+        [_config()], supported_protocols=SUPPORTED, requested_protocols=REQUESTED, health=health
+    )
+
+    assert eligible == []
+    assert excluded[0].reason is FilterReason.AUTH_DISABLED_THIS_RUN
+    assert excluded[0].detail == "disabled after an auth failure earlier this run"
+
+
+def test_cooldown_without_a_stored_error_keeps_the_plain_detail() -> None:
+    health = {
+        "provider_a": ProviderHealthState(
+            cooldown_until=50.0,
+            consecutive_failures=3,
+            cooldown_trigger=CooldownTrigger.CONSECUTIVE_FAILURES,
+        )
+    }
+
+    eligible, excluded = filter_eligible_providers(
+        [_config()],
+        supported_protocols=SUPPORTED,
+        requested_protocols=REQUESTED,
+        health=health,
+        now=20.0,
+    )
+
+    assert eligible == []
+    assert excluded[0].reason is FilterReason.IN_COOLDOWN
+    assert excluded[0].detail == "in cooldown (30.0s remaining) after 3 consecutive failures"
+
+
+def test_filter_reads_health_without_mutating_it() -> None:
+    """An elapsed cooldown reads as eligible, but clearing it is the router's business."""
+    state = ProviderHealthState(
+        cooldown_until=50.0,
+        consecutive_failures=3,
+        last_error="upstream read timeout",
+        cooldown_trigger=CooldownTrigger.CONSECUTIVE_FAILURES,
+    )
+
+    eligible, excluded = filter_eligible_providers(
+        [_config()],
+        supported_protocols=SUPPORTED,
+        requested_protocols=REQUESTED,
+        health={"provider_a": state},
+        now=100.0,  # the cooldown has long lapsed
+    )
+
+    assert [p.name for p in eligible] == ["provider_a"]
+    assert excluded == []
+    assert state == ProviderHealthState(
+        cooldown_until=50.0,
+        consecutive_failures=3,
+        last_error="upstream read timeout",
+        cooldown_trigger=CooldownTrigger.CONSECUTIVE_FAILURES,
+    )
 
 
 def test_all_providers_filtered_out_raises_with_each_specific_reason(

@@ -146,7 +146,12 @@ def test_fallback_tries_second_provider_on_server_error() -> None:
     assert invoked == ["provider_a", "provider_b"]
 
 
-def test_fallback_tries_second_provider_on_unknown_error() -> None:
+def test_fallback_tries_second_provider_on_connection_error() -> None:
+    """A connection failure is provider-specific -- fall back rather than stop.
+
+    Categorized as CONNECTION since PR5; a 404 still covers the UNKNOWN
+    fallback path above.
+    """
     connect_error = ProviderConnectionError(
         "could not connect", provider_name="provider_a", model="model-a"
     )

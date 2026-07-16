@@ -220,6 +220,7 @@ class ErrorCategory(StrEnum):
     RATE_LIMIT = "rate_limit"
     AUTH = "auth"
     SERVER_ERROR = "server_error"
+    CONNECTION = "connection"
     BAD_REQUEST = "bad_request"
     INVALID_OPERATION = "invalid_operation"
     UNKNOWN = "unknown"
@@ -246,6 +247,8 @@ def categorize_error(exc: Exception) -> ErrorCategory:
         return ErrorCategory.INVALID_OPERATION
     if isinstance(exc, ProviderTimeoutError):
         return ErrorCategory.TIMEOUT
+    if isinstance(exc, ProviderConnectionError):
+        return ErrorCategory.CONNECTION
     if isinstance(exc, ProviderHTTPError):
         status = exc.status_code
         if status == 429:
