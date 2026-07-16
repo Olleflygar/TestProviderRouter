@@ -902,10 +902,13 @@ Filtering (filters.py, types.py):
 Transparency (one slice pulled forward from PR 19, same precedent as
 PR 4's missing-duckdb warning -- silent benching is not acceptable):
 - Every bench is logged with provider name, trigger, duration, and the
-  verbatim last error. Dedup per provider, PR 4's pattern: first bench =
-  WARNING, repeat benches = DEBUG, first success after a bench = one
-  INFO recovery line. A user with a typo'd base_url sees the provider's
-  own 404 text in the first warning.
+  verbatim last error. Dedup per bench EPISODE, adapting PR 4's pattern:
+  the first bench of an episode = WARNING, repeat benches within that
+  same episode = DEBUG, first success after a bench = one INFO recovery
+  line, which also re-arms the warning so the next distinct outage warns
+  again (revised 2026-07-16; see the implementation revision note
+  above). A user with a typo'd base_url sees the provider's own 404 text
+  in the first warning.
 - reset_health(provider_name: str | None = None) on ProviderRouter:
   clears cooldown, failure count, auth bench, and last_error -- "treat
   this provider as brand new" -- for one provider or (None) all. An
@@ -1002,9 +1005,10 @@ Tests:
   (probe-per-window: expiry did not reset the count)
 - with every provider benched, invoke() raises NoEligibleProvidersError
   with zero adapter invocations, enumerating each provider's last error
-- bench logging: first bench per provider is one WARNING with the
-  verbatim error, repeat benches log DEBUG, first success after a bench
-  logs one INFO recovery (asserted via caplog)
+- bench logging: the first bench of an episode is one WARNING with the
+  verbatim error, a repeat bench with no intervening success logs DEBUG,
+  first success after a bench logs one INFO recovery, and a bench after
+  that recovery warns again (asserted via caplog)
 - health_report() returns an entry per configured provider (healthy ones
   zeros/None), reports remaining seconds, and returns defensive copies
   (mutating the report does not change router state)
