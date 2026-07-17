@@ -1112,6 +1112,15 @@ revision). This keeps the MetricsStore contract at record + query so
 custom backends stay trivial to implement; revisit only if event volume
 ever makes Python-side aggregation a real bottleneck.
 
+Pinned (PR 23 design interview, 2026-07-17): average latency is
+computed over successful attempts only. Failed attempts also carry
+latency values, and including them would let a provider that fails
+quickly look fast and win traffic it does not deserve. Additionally,
+streaming rows' latency_ms means time-to-first-token (PR 23) while
+non-streaming rows' means full-response time -- the two must not be
+blended into one average; aggregate them separately (the stream flag
+distinguishes rows) or scope the stat, decided when this PR starts.
+
 Note: no cost stat here -- cost is deferred/optional (see PR 6) and is not
 part of the core aggregation this PR needs to produce.
 
@@ -1251,6 +1260,14 @@ Scope:
 
 Rule:
 The router core should not change much. Only the adapter should know the protocol-specific payload format.
+
+Note (PR 23 design interview, 2026-07-17): this adapter's
+NormalizedStream wrapper -- reading the Responses API's typed terminal
+events (e.g. response.completed) -- is what closes PR 23's documented
+truncation-detection blind spot for responses streams. Until this PR
+lands, a responses stream dispatched through an OPENAI_CHAT provider
+runs with exception-based fallback but no truncation verdict, flagged
+at runtime by PR 23's unrecognized-shape WARNING.
 
 Tests:
 - responses adapter builds correct payload
@@ -1494,6 +1511,99 @@ convention those later PRs reuse; and PR 24 now lands second of the
 PR 23 / PR 24 pair, so PR 24 is the one that wires both usage sources
 into the token columns (per the usage-capture bullet below).
 
+Revision note (design interview, 2026-07-17): the design was walked
+end-to-end before implementation and every open decision is pinned
+below; the usage-capture bullet and the streaming test bullet are
+amended in place where they contradicted the sequencing note.
+- Seam: the SDK-specific streaming knowledge (stream detection,
+  mid-iteration exception mapping, chunk interpretation) lives behind
+  the adapter boundary as a wrapped stream. adapters/base.py gains
+  NormalizedStream, an ABC (not a Protocol -- the router needs a
+  reliable isinstance): __next__ yields the SDK's raw chunks unchanged
+  and re-raises any SDK/transport exception mapped onto the router
+  error hierarchy (chained via raise ... from); completed reports
+  whether a completion marker was seen; usage holds the
+  provider-reported usage object, if any; close() propagates. The
+  openai adapter's invoke() wraps an openai.Stream in OpenAIChatStream
+  (same file) before returning; router.py detects streams via
+  isinstance(response, NormalizedStream) and stays entirely SDK-free.
+  The adapter's existing except-chain is extracted into one shared
+  _map_sdk_exception helper used by both invoke() and the wrapper --
+  one copy of the mapping -- gaining httpx transport-error branches
+  (raw transport errors can escape unwrapped during SSE iteration; the
+  dispatch-specific TypeError/AttributeError clauses stay in invoke()
+  only). The ProviderAdapter protocol itself is unchanged: a custom
+  adapter that returns a raw stream passes through untouched exactly
+  as today (no mid-stream fallback); returning a NormalizedStream is
+  the documented opt-in.
+- Truncation verdict only with evidence: the silent-truncation
+  contract applies only when the wrapper recognized the chunk shape
+  (saw choices-bearing chunks). A stream whose chunks were never
+  recognized keeps exception-based fallback, metrics, and close
+  propagation, but its clean end counts as completed -- the router
+  never invents a failure it cannot evidence (PR 24's
+  unfamiliar-shapes posture). The first such stream per operation
+  string per router logs one WARNING stating that truncation detection
+  is not available for that operation's stream shape; repeats log
+  DEBUG (the PR 4/PR 5 dedup pattern). Documented residual risk,
+  accepted: an OpenAI-compatible provider that streams recognized
+  chunks but never sends finish_reason is indistinguishable from a
+  graceful truncation; if a real provider ever bites, the remedy is a
+  per-provider opt-out knob added on evidence (the Retry-After
+  precedent). See the note added to PR 12: its own wrapper closes this
+  blind spot for responses streams.
+- ProviderStreamInterruptedError categorizes as a new
+  ErrorCategory.STREAM_INTERRUPTED member -- visible by name to
+  metrics and scoring (the CONNECTION precedent) -- counted toward
+  failure_threshold (a chronically truncating provider benches), and
+  never a STOP category.
+- Health mirrors metrics in time: record_success() fires only at
+  completed stream end; a mid-stream failure records at failure time;
+  stream open touches neither. Success-at-open would let a provider
+  whose streams open fine and die mid-generation oscillate 0->1 and
+  never reach the threshold.
+- Consumer close: close() always stops the underlying stream, never
+  triggers a restart, is idempotent, and is terminal -- later
+  iteration raises StopIteration (Python's closed-generator
+  semantics). At close, the observed outcome is recorded: success iff
+  the completion marker was already seen (the break-on-finish_reason
+  pattern still feeds scoring history); otherwise nothing is recorded
+  -- the one documented exception to one-event-per-attempt, because an
+  attempt whose outcome the caller declined to observe has no outcome
+  to record. A bare break without close() runs no router code and
+  records nothing; the README recommends the context manager for
+  observed early stops.
+- on_restart is a ProviderRouter constructor argument (no per-call
+  form, matching stream_failure_policy), receiving one frozen
+  dataclass: failed provider name, the real error, next provider name,
+  chunks already delivered, restart count -- an object so fields can
+  be added later without breaking existing callbacks. A callback's own
+  exception propagates, never swallowed.
+- Structure: the rule-carrying steps (metrics recording, health
+  transitions, per-provider argument building, failure classification)
+  each exist exactly once as shared helpers; invoke() and RouterStream
+  keep two thin, separate loops -- no attempt-engine rewrite of the
+  just-shipped invoke().
+- Timing on failures: latency_ms on stream rows always means TTFT and
+  is NULL when no chunk ever arrived -- never repurposed for another
+  quantity; total_duration_ms is recorded for failed streams too (open
+  to death -- a fixed-time proxy cutoff is invisible without it) and
+  the duration also appears in the failure log line. A streaming call
+  that fails before the stream opens is necessarily recorded stream=0
+  (detection is by response type and no response exists), so the
+  stream flag means "a stream actually opened", not "the caller wanted
+  streaming".
+- Restart anomaly, pinned defensively: if a restart's invoke() returns
+  something that is not a NormalizedStream, that response is closed if
+  possible and the attempt is recorded as a failure with a synthesized
+  ProviderError naming the cause; fallback continues. Chunks of two
+  generations must never interleave, and a non-stream response cannot
+  be yielded to a consumer iterating chunks.
+- Scoring guard (recorded here, applied in PR 7 -- see the note added
+  there): average latency must be computed over successful attempts
+  only, and streaming TTFT must not be blended with non-streaming
+  full-response latency.
+
 Why the logic lives in a wrapper: for a streaming call the failure happens
 after invoke() has already returned -- the exception surfaces inside the
 consumer's own iteration loop, when no router code is on the call stack.
@@ -1558,9 +1668,14 @@ Scope:
   RouterStream, not at invoke() return, replacing PR 4's documented
   "success means stream started" approximation.
 - Usage capture: when the caller's arguments include stream_options
-  {"include_usage": true}, the final chunk carries usage; RouterStream
-  captures it into the token columns (added by PR 24 -- whichever of
-  PR 23 / PR 24 lands second wires both sources into those columns).
+  {"include_usage": true}, the final chunk carries usage; the adapter's
+  stream wrapper pockets that object and exposes it as
+  NormalizedStream.usage -- a property present on the ABC from birth,
+  so PR 24 never has to make a breaking change to an already-shipped
+  base class. Nothing about usage is persisted in this PR: the token
+  columns and their recording are PR 24's, which lands second and
+  wires both usage sources into them (per the 2026-07-17 revision
+  note above).
 
 Tests:
 - a non-streaming call returns the identical raw response object, exactly
@@ -1579,9 +1694,23 @@ Tests:
 - exhausting every provider raises RouterExhaustedError enumerating each
   attempt's own real reason
 - close()/breaking the loop closes the underlying SDK stream
-- for streams: latency_ms records TTFT and stream=1; total_duration_ms
-  recorded on completion; the event is written at stream end; usage
-  captured when include_usage was requested
+- for streams: latency_ms records TTFT (NULL if no chunk ever arrived)
+  and stream=1; total_duration_ms recorded on completion and on
+  mid-stream failure (open to death); the event is written at stream
+  end; the wrapper's usage property holds the provider-reported usage
+  object after an include_usage stream completes (recording it into
+  token columns is PR 24's test)
+- an unrecognized-shape stream: a clean end counts as completed, a
+  mid-stream exception still falls back, and the first such stream per
+  operation logs one WARNING (repeats DEBUG)
+- close() before the completion marker records nothing; close() after
+  the marker records the observed success; a closed stream raises
+  StopIteration on further iteration; close() is idempotent
+- a provider one failure below the threshold whose stream opens fine
+  and dies mid-generation reaches the threshold and benches (health
+  records at stream end, not open)
+- STREAM_INTERRUPTED increments consecutive_failures and is never a
+  STOP category
 
 PR 24: Non-streaming response usage extraction
 -------------------------------------------------
