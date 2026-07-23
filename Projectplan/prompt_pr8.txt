@@ -1,0 +1,282 @@
+You are implementing PR 8 ("Basic score calculator") of the nygen-router
+package.
+
+Your task, stated narrowly: using the specification below, implement PR 8
+in the existing repository, in place. This is an implementation task, not
+a design task -- every design decision has already been made and is
+listed under "Design decisions already made for you". Do not redesign,
+re-derive, second-guess, or expand them. If the specification and the
+codebase genuinely conflict, stop and report the conflict in the
+completion report instead of inventing a resolution.
+
+You are working inside the existing repository, modifying it in place. Do
+not create a new sibling folder.
+
+Before writing any code, read these in full:
+
+1. Projectplan/ProjectPlan.md -- especially: Project goal, Core design
+   principles, Testing philosophy, and the PR 8 section INCLUDING its
+   revision note (design interview, 2026-07-23). The Testing philosophy
+   is binding for this PR.
+2. The current source under src/nygen_router/, especially the new
+   src/nygen_router/stats.py from PR 7 (ProviderStats' exact field names
+   and semantics), and the tests under tests/. This PR is a pure
+   function operating on ProviderStats -- confirm PR 7 has shipped
+   before starting.
+
+⸻
+
+Goal
+
+Turn one provider's ProviderStats into a single comparable score, with
+zero I/O -- no provider calls, no storage access, no adapter imports.
+
+⸻
+
+Git workflow
+
+Work directly on the current branch (main) in this folder.
+
+Before changing anything:
+- Confirm the working tree is clean; if not, stop and report what is
+  pending.
+- Ensure a tag named pr8-start exists. If it does not, create it on the
+  current commit: git tag pr8-start
+
+Commit at logical milestones with clear messages. When every quality gate
+below passes, create the tag pr8-complete on the final commit.
+
+⸻
+
+Design decisions already made for you
+
+These were settled in the 2026-07-23 design interview and folded into the
+plan's PR 8 section. Implement them exactly:
+
+1. What was deliberately dropped, and why (do not re-add any of these):
+   - recent_error_count is not read anywhere in this PR. Within one
+     lookback window it is mathematically attempt_count * (1 -
+     success_rate) -- fully derivable from success rate, which the score
+     already uses -- and it is volume-sensitive in a way success rate is
+     not (a provider tried more often would look worse at an identical
+     rate). It remains available on ProviderStats purely as a diagnostic
+     stat.
+   - There is no separate "exploration bonus" toggle or code path. The
+     optimistic-start blend in decision 3 below IS the mechanism that
+     lets new/thin-history providers get tried -- it is always on, for
+     every provider, unconditionally.
+   - Rate-limit hits are not a scoring input. They are already excluded
+     by hard filtering while active, and their effect on success rate is
+     already captured once eligible again; do not add any rate-limit-
+     specific penalty.
+
+2. ScoreWeights (new file src/nygen_router/scoring.py) -- a Pydantic
+   model, matching the codebase's existing config-model style (see
+   HealthConfig in health.py for the pattern: model_config =
+   ConfigDict(extra="forbid"), field_validator for range checks):
+
+   class ScoreWeights(BaseModel):
+       model_config = ConfigDict(extra="forbid")
+       success_weight: float = 1.0
+       speed_weight: float = 1.0
+       regular_latency_reference_ms: float = 2000.0
+       streaming_ttft_reference_ms: float = 500.0
+       optimistic_start: float = 0.75
+       optimistic_start_pretend_attempts: float = 5.0
+
+   Validation: success_weight and speed_weight must each be >= 0.
+   regular_latency_reference_ms and streaming_ttft_reference_ms must each
+   be > 0. optimistic_start must satisfy 0 <= value <= 1.
+   optimistic_start_pretend_attempts must be > 0. Additionally, a
+   model_validator(mode="after") rejects the combination
+   success_weight == 0 and speed_weight == 0 (both zero simultaneously)
+   -- the weighted average in decision 4 would be undefined with a
+   zero denominator. Exactly one of the two weights being 0 is valid and
+   must be accepted (it simply drops that component's influence).
+
+3. ProviderScore (src/nygen_router/scoring.py) -- a frozen dataclass, not
+   Pydantic (internal record, per Core design principle 7):
+
+   @dataclass(frozen=True)
+   class ProviderScore:
+       provider_name: str
+       total: float
+       success_quality: float
+       speed_quality: float
+
+   Keep success_quality and speed_quality on the result, not just total
+   -- a low score must be explainable from its own components, not a
+   black box.
+
+4. calculate_provider_score (src/nygen_router/scoring.py):
+
+   def calculate_provider_score(
+       stats: ProviderStats,
+       weights: ScoreWeights,
+       *,
+       use_streaming: bool = False,
+   ) -> ProviderScore:
+
+   Step 1 -- pick fields: if use_streaming is True, use
+   stats.streaming_attempt_count, stats.streaming_success_count,
+   stats.streaming_success_rate, stats.streaming_avg_ttft_ms, and
+   weights.streaming_ttft_reference_ms. If False, use the regular_*
+   equivalents and weights.regular_latency_reference_ms.
+
+   Step 2 -- success_quality via the blend formula:
+       blended = (pretend * optimistic_start + real_count * observed)
+                 / (pretend + real_count)
+   where pretend = weights.optimistic_start_pretend_attempts, real_count
+   = the picked attempt_count, observed = the picked success_rate (treat
+   None as 0.0 -- with real_count == 0 in that case the formula's own
+   weighting makes the observed value irrelevant, producing exactly
+   optimistic_start). Do not write a separate branch for "no data" --
+   this formula must handle it by construction.
+
+   Step 3 -- speed_quality: first convert the picked avg_latency_ms to a
+   raw quality value (treat None as producing raw quality 0.0, again
+   irrelevant once blended with real_count == 0):
+       raw_quality = reference_ms / (reference_ms + latency_ms)
+   using the picked reference_ms from step 1. Then blend this raw_quality
+   toward optimistic_start using the SAME formula as step 2, but with
+   real_count = the picked success_count (not attempt_count -- latency
+   only exists for successful/completed attempts, so success_count is
+   the right evidence size here).
+
+   Step 4 -- total via weighted average, never a plain sum:
+       total = (weights.success_weight * success_quality
+                + weights.speed_weight * speed_quality)
+               / (weights.success_weight + weights.speed_weight)
+   ScoreWeights' own validation (decision 2) guarantees this denominator
+   is never 0.
+
+   Return ProviderScore(provider_name=stats.provider_name, total=total,
+   success_quality=success_quality, speed_quality=speed_quality).
+
+5. Purity rules (enforced by review, not by a runtime check): this
+   module must not import anything from nygen_router.adapters or
+   nygen_router.storage, and calculate_provider_score must not perform
+   any I/O, network call, or storage access of any kind. It is a pure
+   function of its three arguments.
+
+6. Exports (src/nygen_router/__init__.py): add ScoreWeights,
+   ProviderScore, calculate_provider_score. `from nygen_router import
+   ProviderRouter` must keep working with no optional dependencies
+   installed.
+
+⸻
+
+Out of scope -- do not implement
+
+- Anything from PR 7 (ProviderStats, aggregate_stats already exist --
+  use them, do not modify their fields or signature)
+- Anything from PR 9 (RoutingContext, the Policy interface change,
+  ScoreBasedPolicy, tie-breaking, the metrics-store query, the
+  lookback-window logic) -- this PR never touches a MetricsStore
+- Anything from PR 10 (decay/half-life weighting) -- ScoreWeights and
+  calculate_provider_score as specified here are the complete surface;
+  do not add a half_life parameter anywhere in this PR
+- Cost as a scoring factor (see PR 6, deferred)
+- Any per-provider persistence, caching, or memoization of scores
+
+⸻
+
+Testing rules (binding, from the plan's Testing philosophy)
+
+- No monkeypatching of internal collaborators. calculate_provider_score
+  is a pure function -- construct ProviderStats and ScoreWeights values
+  directly in each test, no fakes or seams needed.
+- Do not delete existing tests. All new test files are additive.
+
+New test file tests/test_scoring.py. Minimum coverage -- implement all of
+these:
+
+- holding every other field fixed, a higher regular_success_rate
+  produces a higher total score than a lower one
+- holding every other field fixed, a lower regular_avg_latency_ms
+  produces a higher total score than a higher one
+- a ProviderStats with regular_attempt_count == 0 and
+  regular_success_count == 0 (and the corresponding rate/average both
+  None) scores success_quality == speed_quality == optimistic_start
+  exactly, for use_streaming=False; the streaming mirror for
+  use_streaming=True
+- a provider with a real attempt count well below
+  optimistic_start_pretend_attempts scores noticeably closer to
+  optimistic_start than its raw observed success_rate would suggest; a
+  provider with an attempt count well above
+  optimistic_start_pretend_attempts scores close to its raw observed
+  success_rate (assert with an explicit tolerance, not exact equality)
+- setting speed_weight=0 makes the total score depend only on
+  success_quality (vary speed inputs and see no change); the symmetric
+  case for success_weight=0; constructing ScoreWeights with both weights
+  at 0 raises a validation error
+- calling with use_streaming=True reads only the streaming_* fields
+  (construct a ProviderStats with very different regular_* and
+  streaming_* values and assert the two use_streaming settings produce
+  different, field-appropriate scores)
+- total is within [0, 1] across a spread of valid weights and stats
+  combinations, including edge cases (zero attempts, very high latency,
+  a 100% success rate at low latency)
+- ScoreWeights: default construction succeeds with no arguments; each of
+  the six fields' invalid values (negative success_weight, negative
+  speed_weight, zero regular_latency_reference_ms, zero
+  streaming_ttft_reference_ms, optimistic_start outside [0, 1], zero or
+  negative optimistic_start_pretend_attempts) is individually rejected
+
+⸻
+
+Docs
+
+- README.md: add a "Score calculation" section explaining ScoreWeights'
+  six fields in plain terms (what each controls, its default, and its
+  valid range), the optimistic-start blend in one paragraph (why a new
+  provider does not start at zero), and that cost is deliberately not a
+  factor (cross-reference PR 6).
+- AGENT.md: update wherever it describes the feature set to include pure
+  score calculation.
+
+⸻
+
+Quality gates
+
+All of these must pass before you declare PR 8 done. Use the project's
+own virtual environment (.venv in the repo), not the system Python:
+
+ruff format .
+ruff check .
+mypy src
+pytest
+coverage run -m pytest
+coverage report
+
+Also verify the non-negotiable import rule:
+`from nygen_router import ProviderRouter` succeeds with no optional
+dependencies installed.
+
+⸻
+
+Completion report -- required format
+
+End your final message with exactly these five markdown sections, in
+this order, so the report can be processed downstream:
+
+## Files changed
+One bullet per file: path -- one-line summary of what changed in it.
+
+## Design decisions checklist
+One line per numbered decision above, `1.` through `6.`, each ending in
+exactly one of: IMPLEMENTED AS SPECIFIED -- or DEVIATED: <one-line
+reason>.
+
+## Behavior changes
+Short prose: what a user of the library observes differently after this
+PR, nothing else.
+
+## Quality gates
+The six commands with their verbatim output (trim pytest to the summary
+lines), plus the import-rule check result.
+
+## Deviations and concerns
+Anything you had to interpret, any conflict between this prompt and the
+codebase, any test you could not write as specified -- or the single
+word "None".

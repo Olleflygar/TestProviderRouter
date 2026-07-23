@@ -1090,128 +1090,396 @@ Tests:
 PR 7: Metrics aggregation
 -------------------------
 Goal:
-Turn raw events into provider stats.
+Turn raw provider_attempts events into a per-provider stats bundle that
+PR 8's score calculator can consume, correctly once PR 23's streaming
+support (the `stream` column) has shipped.
+
+Revision note (design interview, 2026-07-23): this section, together with
+PR 8-10, was walked through in a full design interview and every decision
+below is pinned. Two changes from the original one-line scope: aggregation
+is now query-only (no window logic inside it -- callers pass an
+already-filtered event list, matching the pinned "aggregation happens in
+Python over query_recent's output" rule below) and the per-provider stats
+are split by call type (regular vs. streaming) rather than blended,
+because PR 23's own design already measures and records the two
+differently (time-to-complete vs. time-to-first-chunk, success decided at
+different moments) -- blending them into one number would hide
+operation-specific weaknesses a streaming-heavy workflow needs visible.
+This PR does not depend on PR 6, PR 11, PR 21, or PR 24's still-unshipped
+columns, but it does depend on PR 23 having shipped, since it reads the
+`stream` column PR 23 adds to provider_attempts -- confirm PR 23 is merged
+before starting this PR.
+
+Provider identity fix (bundled here as a prerequisite, not a separate PR):
+ProviderRouter.__init__ now rejects two configured providers sharing the
+same `name` with a ConfigError naming every duplicate, raised at
+construction, before any call is made. Per-provider metrics identity is
+keyed by name (matching how health tracking already works, and preserving
+the case where two entries share one base_url/model but use separate API
+keys for separate rate-limit quotas -- those must keep separate
+histories). Renaming a provider in configuration therefore starts its
+recorded history over; this is accepted as a self-healing cost bounded by
+the lookback window, and is documented in the README.
 
 Scope:
-- ProviderStats
-- ProviderStatsQuery
-- aggregation by provider/model/lookback window
-
-Stats to compute:
-- attempt count
-- success count
-- success rate
-- average latency
-- rate limit count
-- timeout count
-- recent error count
-
-Aggregation happens in Python over the MetricsEvents that query_recent
-returns -- not in per-backend SQL (pinned 2026-07-14, with PR 4's
-revision). This keeps the MetricsStore contract at record + query so
-custom backends stay trivial to implement; revisit only if event volume
-ever makes Python-side aggregation a real bottleneck.
-
-Pinned (PR 23 design interview, 2026-07-17): average latency is
-computed over successful attempts only. Failed attempts also carry
-latency values, and including them would let a provider that fails
-quickly look fast and win traffic it does not deserve. Additionally,
-streaming rows' latency_ms means time-to-first-token (PR 23) while
-non-streaming rows' means full-response time -- the two must not be
-blended into one average; aggregate them separately (the stream flag
-distinguishes rows) or scope the stat, decided when this PR starts.
-
-Note: no cost stat here -- cost is deferred/optional (see PR 6) and is not
-part of the core aggregation this PR needs to produce.
+- src/nygen_router/stats.py (new file):
+  - ProviderStats, a frozen dataclass, one entry per provider:
+      provider_name: str
+      regular_attempt_count: float
+      regular_success_count: float
+      regular_success_rate: float | None       (None iff regular_attempt_count == 0)
+      regular_avg_latency_ms: float | None      (None iff regular_success_count == 0; successful attempts only)
+      streaming_attempt_count: float
+      streaming_success_count: float
+      streaming_success_rate: float | None
+      streaming_avg_ttft_ms: float | None        (time-to-first-chunk, PR 23's latency_ms meaning for stream rows; completed attempts only)
+      recent_error_count: int
+      rate_limit_count: int
+      timeout_count: int
+    The four count fields are typed float, not int, even though PR 7
+    always produces whole numbers -- reserved purely so PR 10 can populate
+    them with fractional decayed weights later without a breaking type
+    change to this dataclass. recent_error_count / rate_limit_count /
+    timeout_count stay plain, always-exact integer tallies -- diagnostic
+    only, never fed into scoring (see PR 8's note on why recent-error-count
+    was dropped as a scoring input) -- and PR 10's decay never touches
+    them.
+  - aggregate_stats(events, provider_names, *, weight_fn=None) ->
+    dict[str, ProviderStats]: one entry for every name in provider_names,
+    including providers with zero matching events (all counts 0, all
+    rates/averages None) -- mirrors health_report()'s "every configured
+    provider gets an entry" precedent, since PR 8's optimistic-blend needs
+    a real entry to fall back on. A provider whose regular figures are
+    populated and streaming figures are all-zero (or vice versa) is normal
+    and expected. weight_fn: Callable[[MetricsEvent], float] | None is
+    accepted but unused by this PR -- every event counts as weight 1.0
+    when it is None -- reserved purely so PR 10 can supply a decay-based
+    weight function without changing this signature. Events for names not
+    in provider_names are ignored. Split into regular/streaming buckets via
+    event.stream (PR 23's column: False/0 = regular, True/1 = streaming).
+- Average latency is computed over successful (or, for streaming,
+  completed) attempts only, per the standing PR 23 pin -- a provider that
+  fails fast must never look fast. Streaming rows' latency_ms
+  (time-to-first-chunk) and non-streaming rows' latency_ms (full-response
+  time) are never blended into the same average -- fully resolved by the
+  regular/streaming split above, superseding the old "decided when this PR
+  starts" placeholder.
+- No cost stat (see PR 6 -- deferred, optional, out of core scope). No
+  per-model grouping: a ProviderConfig fixes one model per provider entry,
+  so provider identity already implies model identity; MetricsStore's
+  existing query_recent model filter remains available to anyone who wants
+  to slice manually.
 
 Tests:
-- aggregates by provider
-- aggregates by model
-- uses lookback window
-- handles no data
-- handles partial data
+- a provider with only regular-call events gets populated regular_* fields
+  and all-zero/None streaming_* fields, and vice versa
+- success rate and average latency are computed correctly from a mix of
+  successes and failures
+- average latency excludes failed/incomplete attempts (a fast failure does
+  not pull the average down)
+- a provider with zero events gets a fully-zero/None entry rather than
+  being omitted
+- events for a provider not in provider_names are ignored
+- recent_error_count / rate_limit_count / timeout_count tally correctly
+  from a mix of ErrorCategory values
+- regular and streaming attempts for the same provider are never blended
+  into one figure
+- weight_fn, when supplied, is applied per-event instead of a flat 1.0 (a
+  minimal test using a trivial weight function, e.g. always 2.0, proving
+  the seam works -- real decay logic is PR 10's)
+- constructing ProviderRouter with two providers sharing a name raises
+  ConfigError naming both
 
 PR 8: Basic score calculator
 ----------------------------
 Goal:
-Add pure score calculation.
+Turn one provider's ProviderStats into a single comparable score, with
+zero I/O.
+
+Revision note (design interview, 2026-07-23): pinned in full, superseding
+the "recent errors" and "exploration bonus" scoring factors named in the
+original one-line scope -- both are removed, not merely renamed.
+- Recent-error-count is dropped as a scoring input. Within one lookback
+  window, recent_error_count is mathematically attempt_count x (1 -
+  success_rate) -- entirely derivable from a success rate the score
+  already uses -- and it is also volume-sensitive in a way success rate is
+  not: a provider tried more often (simply because it keeps winning the
+  ranking) would accumulate a larger raw count at an identical success
+  rate, unfairly dragging its score down for having been used more. It
+  remains a plain, unweighted stat on ProviderStats (PR 7) for
+  diagnostics; it is not read anywhere in this PR.
+- The "exploration bonus" as a separate, togglable feature is dropped and
+  replaced by the optimistic-start blend described below, which serves the
+  same purpose (new/thin-history providers still get tried) as an
+  always-on property of how every score is computed, not an opt-in extra.
+- Rate-limit hits are not a separate scoring input either: a provider
+  actively rate-limited is already excluded entirely by the hard filter
+  before scoring runs, and once eligible again its rate-limited attempts
+  already lowered its success rate -- a dedicated penalty on top would
+  double-count the same event and would contradict the health design's own
+  treatment of a 429 as flow control, not a reliability signal.
 
 Scope:
-- ScoreWeights
-- ProviderScore
-- calculate_provider_score
+- src/nygen_router/scoring.py (new file):
+  - ScoreWeights, a Pydantic model (extra="forbid"), the single settings
+    object for every tunable number this PR introduces:
+      success_weight: float = 1.0                     (validated >= 0)
+      speed_weight: float = 1.0                        (validated >= 0)
+      regular_latency_reference_ms: float = 2000.0     (validated > 0)
+      streaming_ttft_reference_ms: float = 500.0       (validated > 0)
+      optimistic_start: float = 0.75                   (validated 0 <= x <= 1)
+      optimistic_start_pretend_attempts: float = 5.0   (validated > 0)
+    A model_validator rejects success_weight == 0 and speed_weight == 0
+    simultaneously (the weighted average below would be undefined);
+    setting exactly one of the two to 0 is valid and simply drops that
+    factor.
+  - ProviderScore, a frozen dataclass: provider_name: str, total: float,
+    success_quality: float, speed_quality: float. The two quality
+    components are kept on the result (not just the total) so a low score
+    is explainable, not a black box.
+  - calculate_provider_score(stats: ProviderStats, weights: ScoreWeights,
+    *, use_streaming: bool = False) -> ProviderScore:
+    - Picks the regular_* or streaming_* fields from stats depending on
+      use_streaming.
+    - success_quality: the picked success_rate blended toward
+      optimistic_start -- blended = (pretend * optimistic_start +
+      real_count * observed) / (pretend + real_count), using the picked
+      attempt_count as real_count and the picked success_rate as observed
+      (0.0 when real_count is 0, which the formula's own weighting makes
+      irrelevant). This single formula needs no special case for "no data
+      at all": with real_count == 0 it reduces exactly to
+      optimistic_start.
+    - speed_quality: the picked avg_latency_ms (None when there were zero
+      successes of that type) is converted via quality = reference_ms /
+      (reference_ms + latency_ms) -- 0.5 at the reference point,
+      approaching 1 as latency approaches 0, never reaching a hard 0 --
+      then blended toward optimistic_start the same way, using the picked
+      success_count as real_count (latency only exists for successes, so
+      success_count, not attempt_count, is the right evidence size here).
+      When avg_latency_ms is None, the blend still reduces to
+      optimistic_start since real_count is 0.
+    - total: the weighted average of success_quality and speed_quality
+      using weights.success_weight / weights.speed_weight --
+      (success_weight * success_quality + speed_weight * speed_quality) /
+      (success_weight + speed_weight), never a plain sum. A weighted
+      average, not a sum, is required specifically so the result always
+      stays between 0 and 1 regardless of the absolute weight values, and
+      so weights can be entered as plain relative importance without
+      needing to sum to any particular total.
 
-Rules:
-- The score calculator must not call providers.
-- The score calculator must not write to storage.
-- The score calculator must not import adapters.
-- The score calculator only turns stats into scores.
-
-First scoring factors:
-- success rate
-- latency
-- recent errors
-- exploration bonus
+Rules (unchanged from the original plan, now with a concrete mechanism to
+enforce them):
+- calculate_provider_score must not call providers, must not write to
+  storage, must not import anything from adapters/ or storage/ -- it is a
+  pure function of (ProviderStats, ScoreWeights, bool) -> ProviderScore.
 
 Note: cost is deliberately not a default scoring factor (see Project goal
-and PR 6). If manual cost tracking is ever built, it could be wired in as an
-additional optional weight in ScoreWeights later, but it is not part of the
-core scoring model.
+and PR 6). If manual cost tracking is ever built, it could be wired in as
+an additional optional weight in ScoreWeights later, but it is not part of
+the core scoring model.
 
 Tests:
-- higher success rate improves score
-- lower latency improves score
-- recent errors reduce score
-- unknown provider gets exploration bonus
+- higher success rate improves the score, holding everything else fixed
+- lower latency improves the score, holding everything else fixed
+- a provider with zero relevant attempts scores exactly optimistic_start
+  on both components
+- a provider with few attempts (fewer than
+  optimistic_start_pretend_attempts) scores closer to optimistic_start
+  than its raw observed numbers would suggest; a provider with many
+  attempts scores close to its raw observed numbers
+- setting a weight to 0 removes that component's influence entirely;
+  setting both to 0 raises at ScoreWeights construction time
+- use_streaming=True reads the streaming_* fields and use_streaming=False
+  reads the regular_* fields, from the same ProviderStats
+- the total score is always between 0 and 1 for any valid weights and any
+  valid stats
+- ScoreWeights: defaults apply with nothing passed; each numeric field's
+  invalid range (negative weight, non-positive reference, out-of-[0,1]
+  optimistic_start, non-positive pretend-attempts) is rejected
 
 PR 9: Score-based routing policy
 --------------------------------
 Goal:
-Use the persisted metrics history (DuckDB by default, or whichever
-MetricsStore backend is configured -- see PR4) to rank providers.
+Use PR 7's aggregation and PR 8's scoring to rank eligible providers,
+falling back through the ranked order exactly as round robin already
+falls back through its rotated order.
 
-Scope:
-- ScoreBasedPolicy
-- RoutingProfile
-- score-based candidate ranking
-- fallback in ranked order
+Revision note (design interview, 2026-07-23): pinned in full; supersedes
+RoutingProfile (folded into PR 15's routing profiles, not built here) and
+the "unknown provider is occasionally explored" test (superseded by PR 8's
+always-on optimistic-start blend, which needs no separate exploration
+mechanism or test).
 
-Important behavior:
-Score policy should rank providers, not select only one.
-
-Correct behavior:
-rank A, B, C
-try A
-if A fails, try B
-if B fails, try C
+- Policy interface change (src/nygen_router/policies/base.py): a
+  deliberate, one-time breaking change, taken now while no policy code
+  outside this package exists.
+    RoutingContext, a frozen dataclass: metrics_store: MetricsStore |
+    None -- always the router's own store, built fresh by the router on
+    every invoke() call, so a policy can never read from a store other
+    than the one the router itself writes to (the mismatch that motivated
+    this design is structurally impossible under this shape). Deliberately
+    grown additively in future PRs (e.g. a request-size bucket in PR 11)
+    -- never repurposed for anything except per-call runtime data.
+    Policy.order gains a second parameter: def order(self, eligible:
+    list[ProviderConfig], context: RoutingContext) ->
+    list[ProviderConfig]. RoundRobinPolicy.order is updated to accept and
+    ignore context; its existing tests are updated in place for the new
+    signature (no behavior change).
+  - router.py's invoke() builds context =
+    RoutingContext(metrics_store=self._metrics_store) fresh each call and
+    passes it to self._policy.order(eligible, context).
+- src/nygen_router/policies/score_based.py (new file):
+    ScoreBasedPolicy(
+        *,
+        weights: ScoreWeights | None = None,          # None -> ScoreWeights()
+        lookback_hours: float = 336.0,                 # 14 days; validated > 0
+        use_streaming: bool = False,                   # which call type this policy scores for; see below
+        tie_break_policy: Policy | None = None,        # None -> RoundRobinPolicy()
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),   # clock seam, same pattern as ProviderRouter's clock=
+    )
+  - order(self, eligible, context) -> list[ProviderConfig]:
+    1. rotated = self._tie_break_policy.order(list(eligible), context) --
+       establishes both the tie-break order and the graceful-degradation
+       order in one call.
+    2. If context.metrics_store is None or not rotated, return rotated
+       unchanged (no history to learn from -> behaves exactly like the
+       tie-break policy, by construction, with no special-case code).
+    3. since = self._now() - timedelta(hours=self._lookback_hours); query
+       context.metrics_store.query_recent(since=since) inside a
+       try/except. On any exception, log once (dedup: first failure this
+       policy instance logs WARNING, later ones DEBUG, reusing the PR
+       4/PR 5 dedup pattern) and return rotated unchanged -- a broken
+       store degrades routing to round robin, it never breaks a call.
+    4. stats = aggregate_stats(events, [p.name for p in rotated]) (PR 7);
+       score each provider via calculate_provider_score(stats[p.name],
+       self._weights, use_streaming=self._use_streaming).total (PR 8).
+    5. return sorted(rotated, key=score, reverse=True) using Python's
+       stable sort -- providers with equal scores keep their relative
+       order from step 1's rotation, which is exactly how ties are
+       broken. This one stable sort is the entire tie-break mechanism; no
+       separate grouping logic is needed or should be written.
+  - use_streaming is deliberately a one-time constructor setting, not
+    inferred per call. The router cannot know before selecting a provider
+    whether the call about to be made is a streaming call without
+    inspecting the call's own arguments, and PR 23 deliberately avoids
+    exactly that (its own text: "Detection by response type, not argument
+    inspection... needs no new exception here") -- it only learns a call
+    was a stream after a provider has already responded, too late for
+    ranking. Rather than carve out a new, narrow argument-inspection
+    exception to solve this, the router instead assumes a given policy
+    instance is used for predominantly one call type or the other over its
+    lifetime -- a real limitation, explicit and configured by the user,
+    not inferred or silently guessed. A ProviderRouter whose workload
+    genuinely mixes both types on one instance would need two
+    ScoreBasedPolicy instances (one per call type) selected by the caller,
+    or accept that whichever type is not configured is scored against the
+    wrong history -- documented plainly in the README, not hidden.
+  - Correct behavior, unchanged from the original plan: this policy ranks
+    all eligible providers and returns the full ranked list;
+    ProviderRouter's existing fallback loop (unchanged by this PR) tries
+    them in that order, falling back on failure exactly as it already
+    does under round robin.
+- src/nygen_router/__init__.py: export Policy, RoutingContext,
+  ScoreBasedPolicy, ScoreWeights, ProviderScore, ProviderStats,
+  aggregate_stats, calculate_provider_score (Policy and RoutingContext
+  were not previously exported; this PR is the first to need them from
+  outside policies/base.py).
 
 Tests:
-- best-scoring provider is tried first
-- fallback still works under score policy
-- unknown provider is occasionally explored
-- score policy respects hard filters
+- the best-scoring eligible provider is ordered first; fallback proceeds
+  through the full ranked list on failure exactly as round robin does
+- providers with equal scores are ordered by the tie-break policy's own
+  order (default: round robin's rotation) -- verified by asserting the
+  relative order of two providers whose stats are engineered to produce
+  identical scores
+- with an empty or unavailable metrics store (None, and a fake store whose
+  query_recent raises), ordering falls back to exactly the tie-break
+  policy's order, and the failure is logged (caplog) with dedup: first
+  failure WARNING, repeats DEBUG
+- score-based routing only ever ranks the list it is given -- providers
+  already excluded by hard filtering never appear in its output
+  (regression-style test using the same eligible/excluded split
+  filter_eligible_providers already produces)
+- use_streaming=True scores using each provider's streaming history;
+  use_streaming=False (the default) uses regular-call history; a policy
+  configured for one never lets the other's history influence its ranking
+- lookback_hours bounds what history is queried (an old event outside the
+  window does not affect the ranking) -- using the injected now= seam to
+  make this deterministic, no monkeypatching of datetime
+- RoundRobinPolicy.order accepts a RoutingContext argument and its
+  existing rotation behavior is unchanged
+- a custom Policy implementation (satisfying the new two-argument order
+  signature) can still be injected via ProviderRouter(policy=...) exactly
+  as before
 
 PR 10: Recency weighting
 ------------------------
 Goal:
-Recent performance should matter more than old performance.
+Let recent performance count for more than old performance smoothly,
+rather than a hard in/out cutoff, without breaking anyone using PR 9's
+flat-window default.
+
+Revision note (design interview, 2026-07-23): pinned as a strict extension
+of PR 9, not a redesign -- PR 9's flat lookback_hours window remains the
+default behavior; this PR adds an optional, off-by-default alternative.
+The original plan's "start simple... add exponential decay if needed" is
+resolved: build it now, opt-in, so users who want smoother behavior do not
+need to wait for a future PR, while everyone else's behavior is untouched.
 
 Scope:
-- lookback_hours
-- optional half-life setting later
-- recent error weighting
-
-Start simple:
-RoutingProfile(
-    lookback_hours=72,
-)
-
-Later, add exponential decay if needed.
+- src/nygen_router/stats.py: no signature change (aggregate_stats's
+  weight_fn parameter already exists, unused, since PR 7). This PR is the
+  first caller to supply a real weight_fn.
+- src/nygen_router/policies/score_based.py: ScoreBasedPolicy gains one new
+  constructor parameter, half_life_hours: float | None = None (validated
+  > 0 when not None).
+  - When None (default): behavior is byte-identical to PR 9 --
+    lookback_hours bounds the query, every event within it counts
+    equally. This must be verified by a regression test, not just
+    asserted in prose.
+  - When set: half_life_hours takes over entirely from lookback_hours for
+    this policy instance (the two are not combined -- mixing a hard outer
+    bound the user tunes with a smooth inner one adds a confusing
+    interaction for no real benefit). The query's since bound is derived
+    automatically as self._now() - timedelta(hours=6 * half_life_hours)
+    -- six half-lives, a fixed internal constant (not user-configurable),
+    chosen because weight at that age is 0.5**6 ~= 1.6%, small enough that
+    any missed contribution beyond it is immaterial. A weight function
+    weight(age_hours) = 0.5 ** (age_hours / half_life_hours) is built from
+    self._now() and passed as aggregate_stats's weight_fn -- age_hours is
+    computed per-event as (self._now() - event.timestamp) in hours.
+  - Every place PR 7/PR 9 treated a count as "how much real evidence
+    exists" (PR 8's blend, via ProviderStats' float-typed count fields)
+    automatically becomes the decayed effective count once weight_fn is
+    supplied -- older evidence contributes a fraction of an attempt
+    rather than a whole one, so a run of successes from three weeks ago
+    no longer overrides a bad run from this morning the way an
+    equally-weighted count would. This requires no change to PR 8's
+    calculate_provider_score, which was already written against
+    float-typed, possibly-fractional counts from PR 7 onward for exactly
+    this reason.
+- recent_error_count / rate_limit_count / timeout_count on ProviderStats
+  stay plain, unweighted, exact tallies of what happened within the
+  queried window regardless of half_life_hours -- decay only affects the
+  scoring-relevant fields, never these diagnostic counts.
 
 Tests:
-- old events outside lookback do not affect score
-- recent failures reduce score
-- recent success improves score
+- with half_life_hours=None, results are identical to an equivalent PR 9
+  run with the same lookback_hours (regression test, not just an
+  assertion of intent)
+- an event from many half-lives ago contributes a negligible, not zero,
+  amount to the score (assert the effect is small, not that it is absent)
+- a recent failure lowers the score more than an equally-old failure from
+  several half-lives back
+- a recent success raises the score more than an equally-old success from
+  several half-lives back
+- the query bound sent to the metrics store's query_recent reflects the
+  six-half-life derivation, not lookback_hours, when half_life_hours is
+  set
+- an invalid half_life_hours (zero or negative) is rejected at
+  ScoreBasedPolicy construction
+- recent_error_count / rate_limit_count / timeout_count are unaffected by
+  half_life_hours (still exact, unweighted tallies)
 
 PR 11: Request-size buckets
 ---------------------------

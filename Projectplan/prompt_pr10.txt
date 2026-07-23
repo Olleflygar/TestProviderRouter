@@ -1,0 +1,231 @@
+You are implementing PR 10 ("Recency weighting") of the nygen-router
+package.
+
+Your task, stated narrowly: using the specification below, implement PR
+10 in the existing repository, in place. This is an implementation task,
+not a design task -- every design decision has already been made and is
+listed under "Design decisions already made for you". Do not redesign,
+re-derive, second-guess, or expand them. If the specification and the
+codebase genuinely conflict, stop and report the conflict in the
+completion report instead of inventing a resolution.
+
+You are working inside the existing repository, modifying it in place. Do
+not create a new sibling folder.
+
+Before writing any code, read these in full:
+
+1. Projectplan/ProjectPlan.md -- especially: Project goal, Core design
+   principles, Testing philosophy, and the PR 10 section INCLUDING its
+   revision note (design interview, 2026-07-23). The Testing philosophy
+   is binding for this PR.
+2. The current source under src/nygen_router/, especially
+   policies/score_based.py and stats.py from PR 9 and PR 7. Confirm PR 9
+   has shipped before starting -- this PR is a strict, opt-in extension
+   of ScoreBasedPolicy and aggregate_stats, not a new module.
+
+⸻
+
+Goal
+
+Let recent performance count for more than old performance smoothly --
+an event's influence fades gradually with age instead of dropping to zero
+the instant it crosses a fixed window boundary -- as an opt-in
+alternative to PR 9's flat lookback_hours window. Everyone not using the
+new option must observe byte-identical behavior to PR 9.
+
+⸻
+
+Git workflow
+
+Work directly on the current branch (main) in this folder.
+
+Before changing anything:
+- Confirm the working tree is clean; if not, stop and report what is
+  pending.
+- Ensure a tag named pr10-start exists. If it does not, create it on the
+  current commit: git tag pr10-start
+
+Commit at logical milestones with clear messages. When every quality gate
+below passes, create the tag pr10-complete on the final commit.
+
+⸻
+
+Design decisions already made for you
+
+These were settled in the 2026-07-23 design interview and folded into the
+plan's PR 10 section. Implement them exactly:
+
+1. No signature change to aggregate_stats. PR 7 already shipped its
+   weight_fn: Callable[[MetricsEvent], float] | None = None parameter,
+   unused until now. This PR is the first real caller of it -- do not
+   touch stats.py itself; this PR's only production-code change is to
+   src/nygen_router/policies/score_based.py.
+
+2. ScoreBasedPolicy gains one new constructor parameter:
+
+       half_life_hours: float | None = None
+
+   Validate: when not None, must be > 0 (same validation style as
+   lookback_hours already has from PR 9).
+
+3. When half_life_hours is None (the default): behavior must be
+   byte-identical to the PR 9 policy -- same query bound (derived from
+   lookback_hours as before), same flat/uniform weighting (weight_fn left
+   as None when calling aggregate_stats). This is a hard requirement,
+   not a loose approximation -- write a regression test that runs the
+   same scenario through an equivalent PR-9-shaped policy and a
+   half_life_hours=None policy and asserts identical results, not just
+   "looks similar".
+
+4. When half_life_hours is set (not None): it takes over entirely from
+   lookback_hours for this policy instance -- the two are not combined,
+   and lookback_hours is not read or used in this mode at all. Do not
+   attempt to make them interact or validate them against each other.
+   Specifically:
+   a. Query bound: since = self._now() - timedelta(hours=6 *
+      half_life_hours). The multiplier 6 is a fixed internal constant --
+      six half-lives, chosen because weight at that age is 0.5**6 ~=
+      1.6%, small enough to be immaterial. It must not be exposed as a
+      constructor parameter or otherwise made user-configurable.
+   b. Weight function: build weight(event) = 0.5 ** (age_hours /
+      half_life_hours), where age_hours = (self._now() -
+      event.timestamp) in hours (as a float, e.g.
+      (self._now() - event.timestamp).total_seconds() / 3600.0). Pass
+      this as aggregate_stats's weight_fn argument in place of leaving
+      it None.
+   c. Everything downstream of aggregate_stats (calculate_provider_score
+      in PR 8's scoring.py) needs no change: ProviderStats' count fields
+      are already typed float (from PR 7, specifically reserved for
+      this), so a fractional decayed effective count flows through PR
+      8's existing blend formula unmodified. Do not touch scoring.py in
+      this PR.
+
+5. Diagnostic counts stay exact and unweighted. recent_error_count,
+   rate_limit_count, and timeout_count on ProviderStats are computed the
+   same way regardless of half_life_hours -- plain, exact tallies of
+   what happened within the queried window. Decay must never be applied
+   to these three fields even when half_life_hours is set (they already
+   are not read by any weighted computation, since aggregate_stats's
+   existing implementation -- unchanged by this PR -- computes them as
+   plain counts; this decision exists to make explicit that this PR must
+   not change that).
+
+⸻
+
+Out of scope -- do not implement
+
+- Any change to stats.py, scoring.py, or the Policy/RoutingContext
+  interface -- this PR touches only ScoreBasedPolicy's constructor and
+  the body of its order() method
+- Making the six-half-life query-bound multiplier configurable
+- Combining half_life_hours and lookback_hours in any way -- they are
+  mutually exclusive modes on the same policy instance, selected purely
+  by whether half_life_hours is None
+- Per-provider or per-metric half-lives -- one half_life_hours value
+  applies uniformly to every event this policy instance considers
+- Any change to RoutingProfile, PR 15's presets, or any other PR's scope
+
+⸻
+
+Testing rules (binding, from the plan's Testing philosophy)
+
+- No monkeypatching of internal collaborators: no monkeypatch.setattr /
+  unittest.mock.patch reaching into modules. Use a fake MetricsStore and
+  the existing now=... clock seam on ScoreBasedPolicy (already present
+  from PR 9) to make event ages deterministic. monkeypatch.setenv /
+  monkeypatch.delenv remain allowed for environment variables (not
+  expected to be needed here).
+- Do not delete existing tests. tests/test_score_based_policy.py from PR
+  9 must continue to pass unmodified (half_life_hours=None is the
+  default, so no existing test should need updating) -- if any existing
+  test does need a change, that is a signal something in this PR
+  deviated from decision 3's byte-identical requirement; stop and report
+  it rather than editing the old test to match.
+
+Add coverage to tests/test_score_based_policy.py (or a new
+tests/test_recency_weighting.py, matching whichever fits the existing
+file's size and organization better). Minimum coverage -- implement all
+of these:
+
+- with half_life_hours=None, a scenario run through ScoreBasedPolicy
+  produces identical output to the same scenario with half_life_hours
+  simply never passed (regression test proving decision 3, using
+  identical fake-store events and identical now= values for both runs)
+- an event placed many half-lives in the past (e.g. 10 half-lives back)
+  still measurably moves the score versus an otherwise-identical
+  provider with no history at all, but by a small amount -- assert the
+  effect is present but small, not that it is exactly zero
+- given two providers with an identical single failure each, but one
+  failure timestamped recently and the other timestamped several
+  half-lives ago, the provider with the recent failure scores lower
+  (the old failure's decayed weight barely dents its score)
+- the symmetric case for a single recent success vs. an old success
+- construct a fake MetricsStore that records the `since` argument it was
+  called with, and assert it equals self._now() minus exactly six times
+  half_life_hours when half_life_hours is set (not lookback_hours's
+  value)
+- constructing ScoreBasedPolicy with half_life_hours=0 or a negative
+  value raises a validation error
+- recent_error_count / rate_limit_count / timeout_count in the resulting
+  ProviderStats are identical whether half_life_hours is None or set, for
+  the same underlying events (decay does not touch these fields)
+
+⸻
+
+Docs
+
+- README.md: extend the "Score-based routing" section (added in PR 9)
+  with a "Recency weighting" subsection explaining half_life_hours in
+  plain terms -- what a half-life means, the default (off,
+  lookback_hours governs), and that setting it replaces lookback_hours
+  entirely rather than combining with it. Include one concrete worked
+  example (e.g. "with half_life_hours=72, an event from three days ago
+  counts half as much as one from right now").
+- AGENT.md: update wherever it describes ScoreBasedPolicy's parameters
+  to include half_life_hours.
+
+⸻
+
+Quality gates
+
+All of these must pass before you declare PR 10 done. Use the project's
+own virtual environment (.venv in the repo), not the system Python:
+
+ruff format .
+ruff check .
+mypy src
+pytest
+coverage run -m pytest
+coverage report
+
+Also verify the non-negotiable import rule:
+`from nygen_router import ProviderRouter` succeeds with no optional
+dependencies installed.
+
+⸻
+
+Completion report -- required format
+
+End your final message with exactly these five markdown sections, in
+this order, so the report can be processed downstream:
+
+## Files changed
+One bullet per file: path -- one-line summary of what changed in it.
+
+## Design decisions checklist
+One line per numbered decision above, `1.` through `5.`, each ending in
+exactly one of: IMPLEMENTED AS SPECIFIED -- or DEVIATED: <one-line
+reason>.
+
+## Behavior changes
+Short prose: what a user of the library observes differently after this
+PR, nothing else.
+
+## Quality gates
+The six commands with their verbatim output (trim pytest to the summary
+lines), plus the import-rule check result.
+
+## Deviations and concerns
+Anything you had to interpret, any conflict between this prompt and the
+codebase, any test you could not write as specified -- or the single
+word "None".

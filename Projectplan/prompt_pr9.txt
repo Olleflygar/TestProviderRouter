@@ -1,0 +1,309 @@
+You are implementing PR 9 ("Score-based routing policy") of the
+nygen-router package.
+
+Your task, stated narrowly: using the specification below, implement PR 9
+in the existing repository, in place. This is an implementation task, not
+a design task -- every design decision has already been made and is
+listed under "Design decisions already made for you". Do not redesign,
+re-derive, second-guess, or expand them. If the specification and the
+codebase genuinely conflict, stop and report the conflict in the
+completion report instead of inventing a resolution.
+
+You are working inside the existing repository, modifying it in place. Do
+not create a new sibling folder.
+
+Before writing any code, read these in full:
+
+1. Projectplan/ProjectPlan.md -- especially: Project goal, Core design
+   principles, Testing philosophy, and the PR 9 section INCLUDING its
+   revision note (design interview, 2026-07-23). The Testing philosophy
+   is binding for this PR.
+2. The current source under src/nygen_router/, especially
+   policies/base.py, policies/round_robin.py, router.py's invoke()
+   fallback loop, and PR 7/PR 8's stats.py and scoring.py. Confirm PR 7
+   and PR 8 have both shipped before starting -- this PR wires them
+   together and adds nothing of its own to either.
+3. tests/test_round_robin.py and tests/test_fallback.py, since this PR
+   changes the Policy interface those tests exercise.
+
+⸻
+
+Goal
+
+Use PR 7's aggregation and PR 8's scoring to rank eligible providers, so
+ProviderRouter's existing fallback loop tries the best-scoring provider
+first, then the next, and so on -- exactly the same fallback mechanics
+that already exist for round robin, just fed a different order.
+
+⸻
+
+Git workflow
+
+Work directly on the current branch (main) in this folder.
+
+Before changing anything:
+- Confirm the working tree is clean; if not, stop and report what is
+  pending.
+- Ensure a tag named pr9-start exists. If it does not, create it on the
+  current commit: git tag pr9-start
+
+Commit at logical milestones with clear messages. When every quality gate
+below passes, create the tag pr9-complete on the final commit.
+
+⸻
+
+Design decisions already made for you
+
+These were settled in the 2026-07-23 design interview and folded into the
+plan's PR 9 section. Implement them exactly:
+
+1. Policy interface change (src/nygen_router/policies/base.py). This is a
+   deliberate, one-time breaking change to the shipped Policy protocol,
+   taken now while no policy code outside this package exists:
+
+   @dataclass(frozen=True)
+   class RoutingContext:
+       metrics_store: MetricsStore | None
+
+   class Policy(Protocol):
+       def order(
+           self, eligible: list[ProviderConfig], context: RoutingContext
+       ) -> list[ProviderConfig]: ...
+
+   RoutingContext.metrics_store must always be the router's own store --
+   the router builds one RoutingContext per invoke() call from its own
+   self._metrics_store, never from any other source. This is deliberately
+   grown additively: future PRs (e.g. PR 11's request-size bucket) add
+   fields to RoutingContext, never repurpose it for something else.
+
+2. RoundRobinPolicy update (src/nygen_router/policies/round_robin.py):
+   change order()'s signature to def order(self, eligible:
+   list[ProviderConfig], context: RoutingContext) ->
+   list[ProviderConfig], accepting and ignoring context. No other
+   change to its rotation logic. Update tests/test_round_robin.py in
+   place for the new signature -- this is a signature-only change with
+   no behavior change, per the testing-philosophy rule that a test
+   updates in place when a PR deliberately changes what it asserts.
+
+3. Router wiring (src/nygen_router/router.py): in invoke(), build
+   `context = RoutingContext(metrics_store=self._metrics_store)` once,
+   fresh, per call, and pass it as the second argument everywhere
+   self._policy.order(eligible) is currently called -- update the call
+   site to self._policy.order(eligible, context). No other change to
+   invoke()'s control flow, fallback loop, or recording.
+
+4. ScoreBasedPolicy (new file src/nygen_router/policies/score_based.py):
+
+   class ScoreBasedPolicy:
+       def __init__(
+           self,
+           *,
+           weights: ScoreWeights | None = None,
+           lookback_hours: float = 336.0,
+           use_streaming: bool = False,
+           tie_break_policy: Policy | None = None,
+           now: Callable[[], datetime] = lambda: datetime.now(UTC),
+       ) -> None: ...
+
+   weights defaults to ScoreWeights() when None. lookback_hours must be
+   validated > 0 (raise ValueError or ConfigError -- match whichever the
+   codebase's existing lightweight constructor validation uses
+   elsewhere, e.g. HealthConfig's field validators, adapted to a plain
+   constructor argument here). tie_break_policy defaults to
+   RoundRobinPolicy() when None. now is a clock seam, injected the same
+   way ProviderRouter's own clock=time.monotonic is injected -- tests
+   must be able to supply a fixed or advancing fake, never real
+   datetime.now() in a test.
+
+   order(self, eligible, context) -> list[ProviderConfig]:
+   a. rotated = self._tie_break_policy.order(list(eligible), context) --
+      this single call establishes both the tie-break order for step (e)
+      and the graceful-degradation order for step (b).
+   b. If context.metrics_store is None or not rotated: return rotated
+      unchanged. No history to learn from means this policy behaves
+      exactly like the tie-break policy, by construction -- do not write
+      any special-case logic here beyond this early return.
+   c. Compute since = self._now() - timedelta(hours=self._lookback_hours).
+      Call context.metrics_store.query_recent(since=since) inside a
+      try/except Exception. On any exception: log once via the module's
+      logger, following the same first-failure-WARNING /
+      repeat-failure-DEBUG dedup pattern already used elsewhere in this
+      codebase (see router.py's _record_metrics for the precedent --
+      track the "have we already warned" flag as private instance state
+      on this ScoreBasedPolicy), then return rotated unchanged. A broken
+      store must degrade routing to the tie-break order, never raise out
+      of order().
+   d. stats = aggregate_stats(events, [p.name for p in rotated]) (from
+      PR 7's stats.py). For each provider in rotated, compute
+      calculate_provider_score(stats[p.name], self._weights,
+      use_streaming=self._use_streaming).total (from PR 8's scoring.py).
+   e. Return sorted(rotated, key=<the score computed in (d)>,
+      reverse=True). Python's sort is stable -- providers with equal
+      scores keep their relative order from step (a)'s rotation, which
+      is the entire tie-break mechanism. Do not write any separate
+      grouping/tie-detection logic; the stable sort alone must produce
+      the correct tie-break behavior.
+
+5. use_streaming semantics (no code beyond the constructor parameter
+   already specified in decision 4, but the following behavioral
+   constraint is binding and must be tested): use_streaming is a
+   one-time setting chosen by whoever constructs the policy, never
+   inferred from any individual call's arguments or operation. Do not
+   add any logic anywhere in this PR that inspects a CallVariant's
+   arguments to guess whether a call is a streaming call -- this was
+   explicitly considered and rejected in the design interview specifically
+   because PR 23 only learns whether a call was a stream after a provider
+   has already responded, too late for a routing decision. A single
+   ScoreBasedPolicy instance scores every call it orders using whichever
+   history use_streaming selects, regardless of what that particular call
+   turns out to be.
+
+6. Exports (src/nygen_router/__init__.py): add Policy, RoutingContext,
+   ScoreBasedPolicy (Policy and RoutingContext were not previously
+   exported at all -- add them now, since a custom policy author needs
+   both to implement the new two-argument order signature). `from
+   nygen_router import ProviderRouter` must keep working with no
+   optional dependencies installed.
+
+⸻
+
+Out of scope -- do not implement
+
+- Any change to PR 7's stats.py or PR 8's scoring.py beyond calling
+  their existing public functions -- do not modify ProviderStats,
+  aggregate_stats, ScoreWeights, ProviderScore, or
+  calculate_provider_score
+- PR 10's decay/half-life weighting -- do not add a half_life_hours
+  parameter or any weight_fn usage in this PR; lookback_hours with flat,
+  uniform weighting is the complete scope here
+- Any argument inspection to infer streaming vs. regular per call (see
+  decision 5) -- there is no seam, flag, or hook for this anywhere in
+  this PR
+- RoutingProfile or any named preset (balanced/fastest/etc.) -- that is
+  PR 15's scope
+- Caching or memoizing scores across calls -- every order() call
+  recomputes from scratch, per the plan's pinned "recompute fresh every
+  call, no caching" decision
+- Any change to ProviderRouter's fallback loop itself beyond decision 3's
+  context-building and call-site update
+
+⸻
+
+Testing rules (binding, from the plan's Testing philosophy)
+
+- No monkeypatching of internal collaborators: no monkeypatch.setattr /
+  unittest.mock.patch reaching into modules. Use constructor seams: a
+  fake MetricsStore (a plain class implementing the MetricsStore
+  protocol, including one whose query_recent raises, for the
+  degradation tests) passed via ProviderRouter's existing
+  metrics_store=... or directly into RoutingContext(metrics_store=...)
+  for policy-level unit tests; the new now=... clock seam on
+  ScoreBasedPolicy for deterministic lookback-window tests; caplog for
+  the dedup-logging test. monkeypatch.setenv / monkeypatch.delenv remain
+  allowed for environment variables (not expected to be needed here).
+- Do not delete existing tests. tests/test_round_robin.py is updated in
+  place for the new order() signature (decision 2) -- a signature-only
+  change, not a behavior change. All other new coverage is additive.
+
+New test file tests/test_score_based_policy.py, plus the in-place
+test_round_robin.py update. Minimum coverage -- implement all of these:
+
+- given a fake store whose query_recent returns events that make one
+  provider clearly outscore the others, order() returns that provider
+  first; a subsequent fallback through ProviderRouter (with a fake
+  adapter_factory that fails the top-scored provider) proceeds to the
+  next-ranked provider, exactly as round robin's existing fallback does
+- two providers engineered to score identically are ordered by the
+  tie-break policy's own order (default RoundRobinPolicy) -- verify by
+  checking their relative order matches what RoundRobinPolicy.order
+  alone would produce on the same input
+- context.metrics_store=None returns exactly the tie-break policy's
+  order, unchanged
+- a fake store whose query_recent raises also falls back to exactly the
+  tie-break policy's order, and logs a WARNING (caplog) on first
+  failure; a second failing call from the same ScoreBasedPolicy instance
+  logs DEBUG, not WARNING (dedup)
+- providers already excluded by filter_eligible_providers before order()
+  is ever called never appear in ScoreBasedPolicy's output (construct
+  the eligible list the same way router.py's invoke() would, i.e. only
+  the eligible half of filter_eligible_providers' return value)
+- use_streaming=True and use_streaming=False on otherwise-identical
+  ScoreBasedPolicy instances, given a ProviderStats with deliberately
+  different regular_* and streaming_* figures (via a fake store's
+  events), produce different orderings that each reflect only their own
+  call type's history
+- an event older than lookback_hours does not affect the ordering
+  (construct the fake store's events with timestamps relative to a fixed
+  now= value, advance nothing, and assert the old event has zero effect)
+  -- use the injected now= seam, never real wall-clock time
+- RoundRobinPolicy.order(eligible, context) accepts a RoutingContext
+  argument (any value, including one built with metrics_store=None) and
+  its rotation behavior is byte-identical to before this PR
+- a hand-written custom policy class implementing the new two-argument
+  order(self, eligible, context) signature can still be passed as
+  ProviderRouter(policy=...) and is honored, exactly as a custom policy
+  was before this PR
+
+⸻
+
+Docs
+
+- README.md: add a "Score-based routing" section covering
+  ScoreBasedPolicy's constructor parameters and their defaults
+  (including the 14-day lookback_hours default and what it means in
+  hours), the tie-break-via-round-robin behavior and its automatic
+  graceful-degradation-to-round-robin property when there is no usable
+  history, and a clearly worded explanation of the use_streaming
+  limitation from decision 5 -- state plainly that a policy instance
+  scores for one call type, chosen once at setup, and that a workload
+  mixing both types needs two policy instances or must accept the
+  documented mismatch for whichever type is not configured.
+- AGENT.md: update wherever it describes the feature set and the Policy
+  protocol to reflect the new order() signature and ScoreBasedPolicy's
+  existence.
+
+⸻
+
+Quality gates
+
+All of these must pass before you declare PR 9 done. Use the project's
+own virtual environment (.venv in the repo), not the system Python:
+
+ruff format .
+ruff check .
+mypy src
+pytest
+coverage run -m pytest
+coverage report
+
+Also verify the non-negotiable import rule:
+`from nygen_router import ProviderRouter` succeeds with no optional
+dependencies installed.
+
+⸻
+
+Completion report -- required format
+
+End your final message with exactly these five markdown sections, in
+this order, so the report can be processed downstream:
+
+## Files changed
+One bullet per file: path -- one-line summary of what changed in it.
+
+## Design decisions checklist
+One line per numbered decision above, `1.` through `6.`, each ending in
+exactly one of: IMPLEMENTED AS SPECIFIED -- or DEVIATED: <one-line
+reason>.
+
+## Behavior changes
+Short prose: what a user of the library observes differently after this
+PR, nothing else.
+
+## Quality gates
+The six commands with their verbatim output (trim pytest to the summary
+lines), plus the import-rule check result.
+
+## Deviations and concerns
+Anything you had to interpret, any conflict between this prompt and the
+codebase, any test you could not write as specified -- or the single
+word "None".

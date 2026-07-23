@@ -1,0 +1,272 @@
+You are implementing PR 7 ("Metrics aggregation") of the nygen-router
+package.
+
+Your task, stated narrowly: using the specification below, implement PR 7
+in the existing repository, in place. This is an implementation task, not
+a design task -- every design decision has already been made and is
+listed under "Design decisions already made for you". Do not redesign,
+re-derive, second-guess, or expand them. If the specification and the
+codebase genuinely conflict, stop and report the conflict in the
+completion report instead of inventing a resolution.
+
+You are working inside the existing repository, modifying it in place. Do
+not create a new sibling folder.
+
+Before writing any code, read these in full:
+
+1. Projectplan/ProjectPlan.md -- especially: Project goal, Core design
+   principles, Testing philosophy, the transparency principle (in PR 1's
+   "Key implementation decisions"), and the PR 7 section INCLUDING its
+   revision note (design interview, 2026-07-23). The Testing philosophy
+   and the transparency principle are binding for this PR.
+2. The current source under src/nygen_router/ and the tests under
+   tests/. Important prerequisite: this PR reads the `stream` column PR
+   23 adds to provider_attempts. Confirm PR 23 has already shipped
+   (check for a `stream` field on MetricsEvent in metrics.py and a
+   `stream` column in storage/base.py's schema SQL) before starting. If
+   PR 23 has not shipped, stop and report this instead of inventing a
+   substitute.
+
+⸻
+
+Goal
+
+Turn raw provider_attempts events into a per-provider stats bundle that
+PR 8's score calculator can consume, split cleanly between regular
+(non-streaming) and streaming call history so the two are never blended.
+
+⸻
+
+Git workflow
+
+Work directly on the current branch (main) in this folder.
+
+Before changing anything:
+- Confirm the working tree is clean; if not, stop and report what is
+  pending.
+- Ensure a tag named pr7-start exists. If it does not, create it on the
+  current commit: git tag pr7-start
+
+Commit at logical milestones with clear messages. When every quality gate
+below passes, create the tag pr7-complete on the final commit.
+
+⸻
+
+Design decisions already made for you
+
+These were settled in the 2026-07-23 design interview and folded into the
+plan's PR 7 section. Implement them exactly:
+
+1. Provider-name uniqueness (src/nygen_router/router.py). In
+   ProviderRouter.__init__, after self.providers = list(providers),
+   validate that no two providers share a `name`. If any do, raise
+   ConfigError naming every duplicated name (not just the first one
+   found), before anything else in __init__ runs. Metrics/health identity
+   is keyed by provider name throughout the codebase; a silent duplicate
+   would merge two providers' history together, which this check exists
+   to prevent. This is a small, self-contained addition -- do not touch
+   any other constructor logic.
+
+2. ProviderStats (new file src/nygen_router/stats.py) -- a frozen
+   dataclass, not Pydantic (internal record, per Core design principle
+   7):
+
+   @dataclass(frozen=True)
+   class ProviderStats:
+       provider_name: str
+       regular_attempt_count: float
+       regular_success_count: float
+       regular_success_rate: float | None
+       regular_avg_latency_ms: float | None
+       streaming_attempt_count: float
+       streaming_success_count: float
+       streaming_success_rate: float | None
+       streaming_avg_ttft_ms: float | None
+       recent_error_count: int
+       rate_limit_count: int
+       timeout_count: int
+
+   The four count fields (regular_attempt_count, regular_success_count,
+   streaming_attempt_count, streaming_success_count) are typed float, not
+   int, even though this PR only ever produces whole numbers. This is
+   deliberate forward-compatibility for PR 10, which will populate them
+   with fractional decayed weights -- do not "simplify" them to int.
+   recent_error_count / rate_limit_count / timeout_count stay plain int:
+   exact, unweighted tallies, diagnostic only, never read by PR 8's
+   scoring and never touched by PR 10's decay.
+
+   *_success_rate is None iff the matching *_attempt_count is 0 (a
+   provider with zero regular attempts has regular_success_rate=None, not
+   0.0). *_avg_latency_ms is None iff the matching *_success_count is 0
+   -- computed over successful (regular) or completed (streaming)
+   attempts only, per the standing rule that a fast failure must never
+   look fast. For streaming rows, *_avg_latency_ms is the average of
+   MetricsEvent.latency_ms, which PR 23 defines as time-to-first-chunk for
+   stream rows -- do not attempt to compute anything from
+   total_duration_ms here; it is not part of this PR's scope.
+
+3. aggregate_stats (src/nygen_router/stats.py):
+
+   def aggregate_stats(
+       events: Sequence[MetricsEvent],
+       provider_names: Collection[str],
+       *,
+       weight_fn: Callable[[MetricsEvent], float] | None = None,
+   ) -> dict[str, ProviderStats]:
+
+   Returns exactly one ProviderStats entry per name in provider_names --
+   including names with zero matching events, which get a fully
+   zero/None entry (all counts 0.0/0, all rates and averages None). This
+   mirrors health_report()'s existing "every configured provider gets an
+   entry" precedent: PR 8's optimistic-start blend needs a real entry to
+   fall back on for a brand-new provider, not a missing key.
+
+   Bucket each event into regular or streaming via event.stream (False/0
+   = regular, True/1 = streaming). Events whose provider_name is not in
+   provider_names are ignored entirely (do not raise, do not include
+   them under some other key).
+
+   weight_fn is accepted as a parameter but UNUSED by this PR: when it is
+   None, treat every event as weight 1.0 (i.e. plain counting, exactly as
+   if the parameter did not exist). This parameter exists purely so PR 10
+   can later supply a real decay-based weight function without changing
+   this signature -- do not implement any decay logic in this PR, and do
+   not skip building the parameter just because it does nothing yet. When
+   weight_fn is supplied, every count/rate/average must be computed using
+   weight_fn(event) in place of a flat 1.0 for that event's contribution
+   (i.e. write the aggregation as if weighting always mattered, with 1.0
+   as the trivial default weight -- do not write two separate code paths
+   for "weighted" and "unweighted").
+
+4. No per-model grouping, no cost stat. A ProviderConfig fixes one model
+   per provider entry, so provider identity already implies model
+   identity -- do not add any model-based branching to aggregate_stats.
+   MetricsStore.query_recent's existing model parameter remains available
+   to any caller who wants to pre-filter before calling aggregate_stats.
+   Cost is out of scope entirely (see PR 6, deferred).
+
+5. Exports (src/nygen_router/__init__.py): add ProviderStats and
+   aggregate_stats. `from nygen_router import ProviderRouter` must keep
+   working with no optional dependencies installed -- this PR imports
+   nothing new that isn't already a core dependency.
+
+⸻
+
+Out of scope -- do not implement
+
+- Any part of PR 8's scoring (quality curves, weighted averages,
+  ScoreWeights, ProviderScore, calculate_provider_score)
+- Any part of PR 9's policy wiring (RoutingContext, ScoreBasedPolicy, the
+  Policy interface change)
+- Any real decay/weighting logic behind weight_fn (PR 10) -- the
+  parameter must exist and default to flat weight-1.0 behavior, nothing
+  more
+- Cost tracking (PR 6), request-size buckets (PR 11), capability
+  inference (PR 21), token usage (PR 24)
+- Any change to MetricsStore, MetricsEvent, or the provider_attempts
+  schema -- this PR only reads events that already exist, via the
+  existing query_recent
+- Any change to router.py's invoke() control flow or recording
+  (decision 1's duplicate-name check is the only router.py change)
+
+⸻
+
+Testing rules (binding, from the plan's Testing philosophy)
+
+- No monkeypatching of internal collaborators: no monkeypatch.setattr /
+  unittest.mock.patch reaching into modules. aggregate_stats is a pure
+  function over a list of MetricsEvent objects you construct directly in
+  tests -- no store, no router, no adapter needed to test it.
+  monkeypatch.setenv / monkeypatch.delenv remain allowed for environment
+  variables (not needed for this PR).
+- Do not delete existing tests. All new test files are additive.
+
+New test file tests/test_stats.py, plus a small addition to wherever
+router construction is tested (test_router_pr1.py or a new location if
+more appropriate -- match the existing test-file convention). Minimum
+coverage -- implement all of these:
+
+- a provider with only regular-call events (stream=False on every event)
+  gets populated regular_* fields and all-zero/None streaming_* fields
+- a provider with only streaming-call events gets the mirror image
+- success rate and average latency are computed correctly from a mix of
+  successful and failed events of the same call type
+- average latency excludes failed (or, for streaming, uncompleted)
+  attempts -- construct a fast failure and a slow success and assert the
+  average reflects only the success
+- a provider name present in provider_names with zero matching events
+  gets an entry with every count at 0.0/0 and every rate/average at None
+- an event whose provider_name is not in provider_names is excluded from
+  the result entirely
+- recent_error_count, rate_limit_count, and timeout_count tally correctly
+  from a mix of error_type values (use ErrorCategory.RATE_LIMIT.value,
+  ErrorCategory.TIMEOUT.value, and other failure categories)
+- regular and streaming events for the same provider never influence each
+  other's fields (a streaming failure does not change
+  regular_success_rate, etc.)
+- weight_fn, when supplied (e.g. a trivial lambda event: 2.0), changes
+  every affected count/rate/average from what the default (None) would
+  produce -- proves the seam is wired through every computation, not
+  just attempt counts
+- constructing ProviderRouter with two ProviderConfig entries sharing the
+  same name raises ConfigError, and the message names both/all duplicated
+  names
+
+⸻
+
+Docs
+
+- README.md: add a short "Metrics aggregation" section (or extend the
+  existing metrics-persistence section) documenting aggregate_stats,
+  ProviderStats' regular/streaming split and why it exists, and the
+  provider-name-uniqueness requirement (with the renaming-resets-history
+  consequence stated plainly).
+- AGENT.md: update wherever it describes the feature set to include
+  per-provider stats aggregation and the duplicate-name construction
+  check.
+
+⸻
+
+Quality gates
+
+All of these must pass before you declare PR 7 done. Use the project's
+own virtual environment (.venv in the repo), not the system Python:
+
+ruff format .
+ruff check .
+mypy src
+pytest
+coverage run -m pytest
+coverage report
+
+Also verify the non-negotiable import rule:
+`from nygen_router import ProviderRouter` succeeds with no optional
+dependencies installed.
+
+⸻
+
+Completion report -- required format
+
+End your final message with exactly these five markdown sections, in
+this order, so the report can be processed downstream:
+
+## Files changed
+One bullet per file: path -- one-line summary of what changed in it.
+
+## Design decisions checklist
+One line per numbered decision above, `1.` through `5.`, each ending in
+exactly one of: IMPLEMENTED AS SPECIFIED -- or DEVIATED: <one-line
+reason>.
+
+## Behavior changes
+Short prose: what a user of the library observes differently after this
+PR, nothing else.
+
+## Quality gates
+The six commands with their verbatim output (trim pytest to the summary
+lines), plus the import-rule check result.
+
+## Deviations and concerns
+Anything you had to interpret, any conflict between this prompt and the
+codebase, any test you could not write as specified -- or the single
+word "None".
