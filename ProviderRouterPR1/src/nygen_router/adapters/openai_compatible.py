@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from nygen_router.adapters.base import NormalizedStream
 from nygen_router.config import ProviderConfig
 from nygen_router.errors import (
     InvalidOperationArgumentsError,
@@ -63,8 +64,11 @@ class OpenAICompatibleAdapter:
             ) from exc
 
         try:
-            return target(**arguments)
+            response = target(**arguments)
         except TypeError as exc:
+            # Dispatch-specific, so it stays here rather than in the shared
+            # mapping: mid-stream a TypeError means the provider sent something
+            # unusable, never that the caller's arguments were wrong.
             raise InvalidOperationArgumentsError(
                 f"Provider {name!r} operation {operation!r} rejected the given arguments for "
                 f"model {model!r} ({type(exc).__name__}): {exc}",
@@ -72,44 +76,169 @@ class OpenAICompatibleAdapter:
                 model=model,
                 original=exc,
             ) from exc
-        except openai.APITimeoutError as exc:
-            raise ProviderTimeoutError(
-                f"Provider {name!r} timed out after {self.config.timeout_seconds}s for model "
-                f"{model!r} ({type(exc).__name__}): {exc}",
+        except Exception as exc:
+            mapped = _map_sdk_exception(
+                exc, provider_name=name, model=model, timeout_seconds=self.config.timeout_seconds
+            )
+            if mapped is None:
+                raise
+            raise mapped from exc
+
+        if isinstance(response, openai.Stream):
+            return OpenAIChatStream(
+                response,
                 provider_name=name,
                 model=model,
-                original=exc,
-            ) from exc
-        except openai.APIConnectionError as exc:
-            raise ProviderConnectionError(
-                f"Provider {name!r} could not connect for model {model!r} "
-                f"({type(exc).__name__}): {exc}",
-                provider_name=name,
-                model=model,
-                original=exc,
-            ) from exc
-        except openai.APIStatusError as exc:
-            raise ProviderHTTPError(
-                provider_name=name,
-                model=model,
-                status_code=exc.status_code,
-                message=_verbatim_message(exc.body, fallback=exc.message),
-                error_type=exc.type,
-                error_code=exc.code,
-                body=exc.body,
-                response=exc.response,
-                original=exc,
-            ) from exc
-        except openai.OpenAIError as exc:  # pragma: no cover
-            # Defensive: every realistic SDK failure through .create() is already caught
-            # by a more specific branch above; kept for a future SDK version's new type.
-            raise ProviderError(
-                f"Provider {name!r} request failed for model {model!r} "
-                f"({type(exc).__name__}): {exc}",
-                provider_name=name,
-                model=model,
-                original=exc,
-            ) from exc
+                timeout_seconds=self.config.timeout_seconds,
+            )
+        return response
+
+
+class OpenAIChatStream(NormalizedStream):
+    """Wraps an ``openai.Stream`` so the router can observe it, chunk for chunk.
+
+    Chunks are handed on exactly as the SDK produced them -- nothing buffered,
+    accumulated, reordered, or invented -- so a consumer's loop is
+    indistinguishable from iterating the SDK stream directly. The only
+    per-chunk work is reading ``finish_reason`` and pocketing the usage object
+    the ``include_usage`` final chunk carries.
+    """
+
+    def __init__(
+        self,
+        stream: Any,
+        *,
+        provider_name: str,
+        model: str,
+        timeout_seconds: float,
+    ) -> None:
+        self._stream = stream
+        self._provider_name = provider_name
+        self._model = model
+        self._timeout_seconds = timeout_seconds
+        self._completed = False
+        self._recognized = False
+        self._usage: Any = None
+
+    def __next__(self) -> Any:
+        try:
+            chunk = next(self._stream)
+        except StopIteration:
+            raise
+        except Exception as exc:
+            raise self._as_router_error(exc) from exc
+        self._observe(chunk)
+        return chunk
+
+    @property
+    def completed(self) -> bool:
+        return self._completed
+
+    @property
+    def recognized(self) -> bool:
+        return self._recognized
+
+    @property
+    def usage(self) -> Any:
+        return self._usage
+
+    def close(self) -> None:
+        self._stream.close()
+
+    def _observe(self, chunk: Any) -> None:
+        """Read a chunk's completion marker and usage without altering it."""
+        usage = getattr(chunk, "usage", None)
+        if usage is not None:
+            self._usage = usage
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            # Two different chunks land here and neither says anything about
+            # completion: the include_usage final chunk, whose choices list is
+            # empty and which arrives after the finish_reason chunk, and a
+            # shape this wrapper does not recognize at all.
+            return
+        self._recognized = True
+        if any(getattr(choice, "finish_reason", None) is not None for choice in choices):
+            self._completed = True
+
+    def _as_router_error(self, exc: Exception) -> ProviderError:
+        """Map anything escaping mid-iteration onto the router's error hierarchy.
+
+        The ABC's contract is that only router errors leave ``__next__``, and
+        iteration raises a wider set than ``.create()`` does -- raw httpx
+        transport errors, and a JSONDecodeError from a malformed SSE payload --
+        so an unrecognized type becomes a plain ProviderError rather than
+        reaching the consumer as an SDK-shaped surprise.
+        """
+        mapped = _map_sdk_exception(
+            exc,
+            provider_name=self._provider_name,
+            model=self._model,
+            timeout_seconds=self._timeout_seconds,
+        )
+        if mapped is not None:
+            return mapped
+        return ProviderError(
+            f"Provider {self._provider_name!r} stream failed for model {self._model!r} "
+            f"({type(exc).__name__}): {exc}",
+            provider_name=self._provider_name,
+            model=self._model,
+            original=exc,
+        )
+
+
+def _map_sdk_exception(
+    exc: Exception, *, provider_name: str, model: str, timeout_seconds: float
+) -> ProviderError | None:
+    """Map one SDK or transport exception onto the router's error hierarchy.
+
+    The single copy of this mapping, shared by ``invoke()`` and the stream
+    wrapper. The httpx branches exist because the SDK only folds transport
+    failures into its own exception types around ``.create()``: during SSE
+    iteration a read timeout or a dropped connection escapes as the raw httpx
+    exception. Returns None for anything unrecognized, so a caller can decide
+    whether to re-raise it untouched or supply its own fallback.
+    """
+    import httpx
+    import openai
+
+    if isinstance(exc, openai.APITimeoutError | httpx.TimeoutException):
+        return ProviderTimeoutError(
+            f"Provider {provider_name!r} timed out after {timeout_seconds}s for model "
+            f"{model!r} ({type(exc).__name__}): {exc}",
+            provider_name=provider_name,
+            model=model,
+            original=exc,
+        )
+    if isinstance(exc, openai.APIConnectionError | httpx.TransportError):
+        return ProviderConnectionError(
+            f"Provider {provider_name!r} could not connect for model {model!r} "
+            f"({type(exc).__name__}): {exc}",
+            provider_name=provider_name,
+            model=model,
+            original=exc,
+        )
+    if isinstance(exc, openai.APIStatusError):
+        return ProviderHTTPError(
+            provider_name=provider_name,
+            model=model,
+            status_code=exc.status_code,
+            message=_verbatim_message(exc.body, fallback=exc.message),
+            error_type=exc.type,
+            error_code=exc.code,
+            body=exc.body,
+            response=exc.response,
+            original=exc,
+        )
+    if isinstance(exc, openai.OpenAIError):
+        return ProviderError(
+            f"Provider {provider_name!r} request failed for model {model!r} "
+            f"({type(exc).__name__}): {exc}",
+            provider_name=provider_name,
+            model=model,
+            original=exc,
+        )
+    return None
 
 
 def _verbatim_message(body: object, *, fallback: str) -> str:

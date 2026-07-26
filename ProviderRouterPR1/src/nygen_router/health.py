@@ -56,12 +56,15 @@ class CooldownTrigger(StrEnum):
 # wrong base_url or a model this provider doesn't host, 413 payload limits)
 # and the defensive catch-all -- are both per-provider problems. Caller-side
 # mistakes never reach here; they are STOP categories the router acts on
-# before health is involved.
+# before health is involved. STREAM_INTERRUPTED counts for the same reason:
+# a provider that chronically truncates its streams is a broken provider,
+# even though every one of its calls starts out looking healthy.
 _COUNTED_CATEGORIES = frozenset(
     {
         ErrorCategory.TIMEOUT,
         ErrorCategory.SERVER_ERROR,
         ErrorCategory.CONNECTION,
+        ErrorCategory.STREAM_INTERRUPTED,
         ErrorCategory.UNKNOWN,
     }
 )

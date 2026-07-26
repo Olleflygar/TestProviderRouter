@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from nygen_router.adapters.base import NormalizedStream
 from nygen_router.config import ApiProtocol, ProviderCapabilities, ProviderConfig
 from nygen_router.errors import (
     ConfigError,
@@ -14,6 +15,7 @@ from nygen_router.errors import (
     ProviderError,
     ProviderHTTPError,
     ProviderSDKNotInstalledError,
+    ProviderStreamInterruptedError,
     ProviderTimeoutError,
     RouterExhaustedError,
     UnsupportedOperationError,
@@ -23,7 +25,7 @@ from nygen_router.filters import filter_eligible_providers
 from nygen_router.health import HealthConfig, ProviderHealthReport
 from nygen_router.metrics import MetricsEvent
 from nygen_router.policies import RoundRobinPolicy
-from nygen_router.router import ProviderRouter
+from nygen_router.router import ProviderRouter, StreamFailurePolicy, StreamRestart
 from nygen_router.storage import DuckDBMetricsStore, MetricsStore, SQLiteMetricsStore
 from nygen_router.types import (
     CallVariant,
@@ -48,6 +50,7 @@ __all__ = [
     "ModelArgumentConflictError",
     "NoEligibleProvidersError",
     "NoProvidersConfiguredError",
+    "NormalizedStream",
     "NygenRouterError",
     "ProviderAttempt",
     "ProviderCapabilities",
@@ -58,10 +61,13 @@ __all__ = [
     "ProviderHealthReport",
     "ProviderRouter",
     "ProviderSDKNotInstalledError",
+    "ProviderStreamInterruptedError",
     "ProviderTimeoutError",
     "RoundRobinPolicy",
     "RouterExhaustedError",
     "SQLiteMetricsStore",
+    "StreamFailurePolicy",
+    "StreamRestart",
     "UnsupportedOperationError",
     "UnsupportedProtocolError",
     "filter_eligible_providers",

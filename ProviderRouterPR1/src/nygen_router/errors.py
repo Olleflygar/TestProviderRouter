@@ -157,6 +157,15 @@ class InvalidOperationArgumentsError(ProviderError):
     """A CallVariant's ``arguments`` do not match its resolved operation's signature."""
 
 
+class ProviderStreamInterruptedError(ProviderError):
+    """A stream ended without the provider ever marking it complete.
+
+    Synthesized by the router, not raised by any SDK: a silently truncated
+    stream has no HTTP status and no transport failure of its own, so there is
+    no original exception to chain here.
+    """
+
+
 class ProviderHTTPError(ProviderError):
     """A provider returned a non-2xx HTTP status.
 
@@ -221,6 +230,7 @@ class ErrorCategory(StrEnum):
     AUTH = "auth"
     SERVER_ERROR = "server_error"
     CONNECTION = "connection"
+    STREAM_INTERRUPTED = "stream_interrupted"
     BAD_REQUEST = "bad_request"
     INVALID_OPERATION = "invalid_operation"
     UNKNOWN = "unknown"
@@ -249,6 +259,8 @@ def categorize_error(exc: Exception) -> ErrorCategory:
         return ErrorCategory.TIMEOUT
     if isinstance(exc, ProviderConnectionError):
         return ErrorCategory.CONNECTION
+    if isinstance(exc, ProviderStreamInterruptedError):
+        return ErrorCategory.STREAM_INTERRUPTED
     if isinstance(exc, ProviderHTTPError):
         status = exc.status_code
         if status == 429:

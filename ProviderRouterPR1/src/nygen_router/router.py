@@ -3,9 +3,11 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Collection, Mapping
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
-from nygen_router.adapters.base import ProviderAdapter
+from nygen_router.adapters.base import NormalizedStream, ProviderAdapter
 from nygen_router.adapters.openai_compatible import OpenAICompatibleAdapter
 from nygen_router.config import ApiProtocol, ProviderConfig
 from nygen_router.errors import (
@@ -15,6 +17,8 @@ from nygen_router.errors import (
     ModelArgumentConflictError,
     NoEligibleProvidersError,
     NoProvidersConfiguredError,
+    ProviderError,
+    ProviderStreamInterruptedError,
     RouterExhaustedError,
     UnsupportedProtocolError,
     categorize_error,
@@ -47,6 +51,39 @@ SUPPORTED_PROTOCOLS = frozenset({ApiProtocol.OPENAI_CHAT})
 _STOP_CATEGORIES = frozenset({ErrorCategory.BAD_REQUEST, ErrorCategory.INVALID_OPERATION})
 
 
+class StreamFailurePolicy(StrEnum):
+    """What a stream that dies mid-generation should do.
+
+    An enum rather than a bool so a third mode can arrive without a breaking
+    change. RESTART is the default because dying mid-generation with no
+    fallback is the worst failure mode for a long-running workflow, and that
+    default must cost no configuration.
+    """
+
+    RESTART = "restart"
+    RAISE = "raise"
+
+
+@dataclass(frozen=True)
+class StreamRestart:
+    """One mid-stream switch of provider, reported to ``on_restart``.
+
+    An object rather than positional arguments so later PRs can add fields
+    without breaking callbacks already in the wild. ``error`` is the failed
+    provider's own exception, never a router summary of it.
+
+    ``chunks_yielded`` is what the consumer has accumulated from the provider
+    that just died: the next provider regenerates from scratch, so that partial
+    output must be discarded rather than concatenated.
+    """
+
+    failed_provider: str
+    error: Exception
+    next_provider: str
+    chunks_yielded: int
+    restart_count: int
+
+
 class _UnsetType:
     """Sentinel distinguishing "metrics_store not passed" from "metrics_store=None".
 
@@ -69,6 +106,8 @@ class ProviderRouter:
         metrics_store: MetricsStore | None | _UnsetType = _UNSET,
         health: HealthConfig | Mapping[str, object] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        stream_failure_policy: StreamFailurePolicy = StreamFailurePolicy.RESTART,
+        on_restart: Callable[[StreamRestart], None] | None = None,
     ):
         self.providers = list(providers)
         self._adapter_factory = adapter_factory or self._default_adapter_for
@@ -105,6 +144,13 @@ class ProviderRouter:
         )
         self._metrics_recovery_emitted = False
         self._dropped_metrics_events = 0
+        # Stream fallback is on by default; RAISE is for callers who would
+        # rather stop than have a second provider regenerate the answer.
+        self._stream_failure_policy = stream_failure_policy
+        self._on_restart = on_restart
+        # Operations whose stream shape this router has already reported as
+        # unreadable, so one unfamiliar provider cannot flood the log.
+        self._stream_shape_warned: set[str] = set()
 
     def invoke(self, calls: list[CallVariant]) -> Any:
         """Filter, order eligible providers, then try them in turn with fallback.
@@ -113,6 +159,11 @@ class ProviderRouter:
         returned -- untouched, with nothing attached. Every attempt and
         exclusion is still tracked internally, so a total failure still
         raises an error enumerating each provider's own real reason.
+
+        A response that is a NormalizedStream is the one exception: its outcome
+        is not known yet, so it comes back wrapped in a RouterStream that
+        finishes the job -- fallback, metrics and health -- while the consumer
+        iterates. Consumers write the same ``for chunk in ...`` loop either way.
         """
         if not self.providers:
             raise NoProvidersConfiguredError("No providers configured.")
@@ -130,9 +181,10 @@ class ProviderRouter:
             raise NoEligibleProvidersError(excluded)
 
         attempts: list[ProviderAttempt] = []
-        for provider in self._policy.order(eligible):
+        ordered = list(self._policy.order(eligible))
+        for index, provider in enumerate(ordered):
             variant = variants_by_protocol[provider.protocol]
-            arguments = {**variant.arguments, "model": provider.model}
+            arguments = self._arguments_for(variant, provider)
             adapter = self._adapter_for(provider)
             start = time.perf_counter()
             try:
@@ -142,21 +194,29 @@ class ProviderRouter:
                 attempts.append(
                     ProviderAttempt(provider_name=provider.name, success=False, error=exc)
                 )
-                category = categorize_error(exc)
-                self._record_metrics(
-                    provider, success=False, latency_ms=latency_ms, error_type=category.value
-                )
+                category = self._record_attempt_failure(provider, exc, latency_ms=latency_ms)
                 if category in _STOP_CATEGORIES:
-                    # The call is at fault, not the provider: leave its health
-                    # untouched and stop before any of it is blamed.
                     break
-                self._record_failure(provider.name, category, exc)
                 continue
+
+            if isinstance(response, NormalizedStream):
+                # Nothing is known yet -- headers arriving is not a served call
+                # -- so no attempt, no metrics and no health change is recorded
+                # here. RouterStream carries the rest of the ranked order and
+                # records the real outcome when the stream reaches it.
+                return RouterStream(
+                    router=self,
+                    stream=response,
+                    provider=provider,
+                    remaining=ordered[index + 1 :],
+                    variants_by_protocol=variants_by_protocol,
+                    attempts=attempts,
+                    started_at=start,
+                )
 
             latency_ms = (time.perf_counter() - start) * 1000.0
             attempts.append(ProviderAttempt(provider_name=provider.name, success=True))
-            self._record_metrics(provider, success=True, latency_ms=latency_ms, error_type=None)
-            self._record_success(provider.name)
+            self._record_attempt_success(provider, latency_ms=latency_ms)
             return response
 
         raise RouterExhaustedError(attempts)
@@ -205,6 +265,59 @@ class ProviderRouter:
                 last_error=state.last_error,
             )
         return report
+
+    def _record_attempt_failure(
+        self,
+        provider: ProviderConfig,
+        exc: Exception,
+        *,
+        latency_ms: float | None,
+        stream: bool = False,
+        total_duration_ms: float | None = None,
+    ) -> ErrorCategory:
+        """Classify one dead attempt, record it, and bench the provider unless the call is at fault.
+
+        The single copy of the failure rules, shared by invoke()'s loop and
+        RouterStream's: a STOP category means the call itself is broken, so the
+        provider's health is left untouched -- one malformed request must not
+        bench every provider it is tried against.
+        """
+        category = categorize_error(exc)
+        self._record_metrics(
+            provider,
+            success=False,
+            latency_ms=latency_ms,
+            error_type=category.value,
+            stream=stream,
+            total_duration_ms=total_duration_ms,
+        )
+        if category not in _STOP_CATEGORIES:
+            self._record_failure(provider.name, category, exc)
+        return category
+
+    def _record_attempt_success(
+        self,
+        provider: ProviderConfig,
+        *,
+        latency_ms: float | None,
+        stream: bool = False,
+        total_duration_ms: float | None = None,
+    ) -> None:
+        """Record one attempt the provider actually served, in metrics and in health.
+
+        For a stream this runs at the end of the stream, never at its open: a
+        provider whose streams open cleanly and die mid-generation would
+        otherwise oscillate between failure and success and never bench.
+        """
+        self._record_metrics(
+            provider,
+            success=True,
+            latency_ms=latency_ms,
+            error_type=None,
+            stream=stream,
+            total_duration_ms=total_duration_ms,
+        )
+        self._record_success(provider.name)
 
     def _record_failure(self, provider_name: str, category: ErrorCategory, exc: Exception) -> None:
         """Apply one failure to a provider's health, reporting any bench it starts.
@@ -263,8 +376,10 @@ class ProviderRouter:
         provider: ProviderConfig,
         *,
         success: bool,
-        latency_ms: float,
+        latency_ms: float | None,
         error_type: str | None,
+        stream: bool = False,
+        total_duration_ms: float | None = None,
     ) -> None:
         """Persist one MetricsEvent for this attempt; never let storage disturb the call."""
         if self._metrics_store is None:
@@ -276,6 +391,8 @@ class ProviderRouter:
             success=success,
             latency_ms=latency_ms,
             error_type=error_type,
+            stream=stream,
+            total_duration_ms=total_duration_ms,
         )
         try:
             self._metrics_store.record_attempt(event)
@@ -297,6 +414,32 @@ class ProviderRouter:
                 self._dropped_metrics_events,
             )
             self._metrics_recovery_emitted = True
+
+    def _log_unrecognized_stream_shape(self, operation: str) -> None:
+        """Report once per operation that this stream shape carries no completion marker.
+
+        Repeats drop to DEBUG, following the bench-logging pattern: a provider
+        whose chunk shape the adapter cannot read is one fact about that
+        operation, not one line per call.
+        """
+        first_time = operation not in self._stream_shape_warned
+        self._stream_shape_warned.add(operation)
+        logger.log(
+            logging.WARNING if first_time else logging.DEBUG,
+            "A stream for operation %r ended without any chunk shape this adapter "
+            "recognizes; silent-truncation detection is not available for it, so the "
+            "stream counts as completed.",
+            operation,
+        )
+
+    @staticmethod
+    def _arguments_for(variant: CallVariant, provider: ProviderConfig) -> dict[str, object]:
+        """Copy the variant's arguments with this provider's model injected.
+
+        A fresh copy per attempt, never a mutation: one CallVariant is reused
+        for every provider sharing its protocol, including on a stream restart.
+        """
+        return {**variant.arguments, "model": provider.model}
 
     @staticmethod
     def _prepare_variants(calls: list[CallVariant]) -> dict[ApiProtocol, CallVariant]:
@@ -328,3 +471,295 @@ class ProviderRouter:
         # Unreachable via invoke(): unsupported protocols are excluded by the
         # eligibility filter first. Kept as a guard for direct/custom callers.
         raise UnsupportedProtocolError(provider.name, provider.protocol)  # pragma: no cover
+
+
+class RouterStream:
+    """Iterator that keeps the router on the call stack for the life of a stream.
+
+    A stream's real outcome arrives after invoke() has already returned, inside
+    the consumer's own loop, where no router code would otherwise be running.
+    This object is the only code of ours still on that stack, so it is the only
+    possible home for a stream's fallback, metrics and health recording. It
+    yields the provider's chunks exactly as they arrive -- nothing buffered,
+    nothing accumulated, nothing invented -- and holds the not-yet-tried tail of
+    the same ranked provider order invoke() was working through.
+
+    A restart means the next provider regenerates its answer from scratch:
+    chunks from two generations cannot be spliced, so whatever the consumer
+    accumulated from the dead provider has to be discarded. Never letting that
+    happen silently is what ``on_restart`` and ``restarts`` are for.
+    """
+
+    def __init__(
+        self,
+        *,
+        router: ProviderRouter,
+        stream: NormalizedStream,
+        provider: ProviderConfig,
+        remaining: list[ProviderConfig],
+        variants_by_protocol: dict[ApiProtocol, CallVariant],
+        attempts: list[ProviderAttempt],
+        started_at: float,
+    ) -> None:
+        self._router = router
+        self._stream = stream
+        self._provider = provider
+        self._remaining = list(remaining)
+        self._variants_by_protocol = variants_by_protocol
+        self._attempts = attempts
+        self._started_at = started_at
+        self._first_chunk_at: float | None = None
+        self._chunks_yielded = 0
+        self._recorded = False
+        self._closed = False
+        self.restarts = 0
+
+    def __iter__(self) -> RouterStream:
+        return self
+
+    def __next__(self) -> Any:
+        while True:
+            if self._closed:
+                # Closing is terminal, matching a closed generator: a consumer
+                # that stopped early is not handed the rest of its stream.
+                raise StopIteration
+            failure: Exception
+            try:
+                chunk = next(self._stream)
+            except StopIteration:
+                truncation = self._judge_clean_end()
+                if truncation is None:
+                    raise
+                failure = truncation
+            except Exception as exc:
+                # Already a router error -- that is NormalizedStream's contract.
+                failure = exc
+            else:
+                if self._first_chunk_at is None:
+                    self._first_chunk_at = time.perf_counter()
+                self._chunks_yielded += 1
+                return chunk
+            # Deliberately outside the handlers above, so an error raised from
+            # here is not chained onto the stream's own StopIteration.
+            self._fail(failure)
+
+    def __enter__(self) -> RouterStream:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """End the stream for good, recording only an outcome the consumer observed.
+
+        Never restarts: a consumer that closed a stream asked for it to stop,
+        not for another provider to regenerate it. Idempotent and terminal --
+        iterating afterwards raises StopIteration, like a closed generator.
+
+        A completion marker already seen means the call was served, so it is
+        recorded like any other success (the break-on-finish_reason pattern
+        still feeds scoring). Without one, nothing at all is recorded: the one
+        documented exception to one event per attempt, because an outcome the
+        caller declined to observe is not one the router can honestly report.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._close_underlying()
+        if self._stream.completed:
+            self._record_success()
+
+    def _judge_clean_end(self) -> ProviderStreamInterruptedError | None:
+        """Judge a stream that ended without error: None if it truly finished.
+
+        A stream finished iff the provider marked it finished. The exception is
+        a stream whose chunk shape the adapter never recognized: its completion
+        marker was never readable in the first place, and the router does not
+        invent a failure it cannot evidence.
+        """
+        if not self._stream.completed:
+            if self._stream.recognized:
+                return ProviderStreamInterruptedError(
+                    f"Provider {self._provider.name!r} ended its stream for model "
+                    f"{self._provider.model!r} after {self._chunks_yielded} chunk(s) without "
+                    f"ever marking it complete; the response was silently truncated.",
+                    provider_name=self._provider.name,
+                    model=self._provider.model,
+                )
+            self._router._log_unrecognized_stream_shape(self._operation())
+        self._record_success()
+        self._close_underlying()
+        self._closed = True
+        return None
+
+    def _fail(self, error: Exception) -> None:
+        """Record the attempt this error killed, then restart on the next provider or raise."""
+        duration_ms = self._duration_ms()
+        self._close_underlying()
+        self._recorded = True
+        self._attempts.append(
+            ProviderAttempt(provider_name=self._provider.name, success=False, error=error)
+        )
+        category = self._router._record_attempt_failure(
+            self._provider,
+            error,
+            latency_ms=self._ttft_ms(),
+            stream=True,
+            total_duration_ms=duration_ms,
+        )
+        logger.warning(
+            "Provider %r stream died after %d chunk(s) and %.1fms: %s",
+            self._provider.name,
+            self._chunks_yielded,
+            duration_ms,
+            error,
+        )
+        if (
+            category in _STOP_CATEGORIES
+            or self._router._stream_failure_policy is StreamFailurePolicy.RAISE
+        ):
+            # Both stop here, and both hand the consumer the provider's own
+            # error rather than the router's summary of it.
+            self._closed = True
+            raise error
+        self._restart(error)
+
+    def _restart(self, error: Exception) -> None:
+        """Open the next provider in the ranked order, or exhaust trying.
+
+        Each eligible provider is tried at most once per call -- the ranked
+        order is consumed, never refilled -- which is the restart guardrail;
+        there is no separate max-restarts knob.
+        """
+        while self._remaining:
+            provider = self._remaining.pop(0)
+            variant = self._variants_by_protocol[provider.protocol]
+            arguments = self._router._arguments_for(variant, provider)
+            start = time.perf_counter()
+            try:
+                response = self._router._adapter_for(provider).invoke(variant.operation, arguments)
+            except Exception as exc:
+                latency_ms = (time.perf_counter() - start) * 1000.0
+                self._attempts.append(
+                    ProviderAttempt(provider_name=provider.name, success=False, error=exc)
+                )
+                # No stream opened, so this is recorded as the plain failed
+                # attempt it is: the stream flag means one actually opened.
+                category = self._router._record_attempt_failure(
+                    provider, exc, latency_ms=latency_ms
+                )
+                if category in _STOP_CATEGORIES:
+                    break
+                continue
+
+            if not isinstance(response, NormalizedStream):
+                latency_ms = (time.perf_counter() - start) * 1000.0
+                self._reject_non_stream(provider, response, latency_ms=latency_ms)
+                continue
+
+            self._announce_restart(error, provider)
+            self._stream = response
+            self._provider = provider
+            self._started_at = start
+            self._first_chunk_at = None
+            self._chunks_yielded = 0
+            self._recorded = False
+            return
+
+        self._closed = True
+        raise RouterExhaustedError(self._attempts)
+
+    def _reject_non_stream(
+        self, provider: ProviderConfig, response: Any, *, latency_ms: float
+    ) -> None:
+        """Discard a restart that came back as a whole response instead of a stream.
+
+        Defensive: a consumer part-way through iterating chunks cannot be handed
+        a single response object, and splicing one into a stream in progress
+        would be worse than falling back again.
+        """
+        close = getattr(response, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.debug("Closing a non-stream restart response failed.", exc_info=True)
+        anomaly = ProviderError(
+            f"Provider {provider.name!r} returned a non-streaming "
+            f"{type(response).__name__} while restarting a stream for model "
+            f"{provider.model!r}; it cannot be spliced into a stream already in progress.",
+            provider_name=provider.name,
+            model=provider.model,
+        )
+        self._attempts.append(
+            ProviderAttempt(provider_name=provider.name, success=False, error=anomaly)
+        )
+        self._router._record_attempt_failure(provider, anomaly, latency_ms=latency_ms)
+
+    def _announce_restart(self, error: Exception, provider: ProviderConfig) -> None:
+        """Make a restart visible before the next provider starts regenerating.
+
+        ``restarts`` counts every restart. The callback and the warning fire
+        only once chunks have been yielded: a restart at zero chunks leaves the
+        consumer nothing to discard, so there is nothing to warn about. With
+        chunks already out and no callback registered, that warning is all that
+        stands between the consumer and silently corrupted accumulated output.
+        """
+        self.restarts += 1
+        if not self._chunks_yielded:
+            return
+        if self._router._on_restart is None:
+            logger.warning(
+                "Discarding %d chunk(s) already yielded by provider %r and restarting on "
+                "provider %r, which regenerates from scratch: %s. Register on_restart to "
+                "handle this in code.",
+                self._chunks_yielded,
+                self._provider.name,
+                provider.name,
+                error,
+            )
+            return
+        # A callback's own exception propagates: the router does not decide that
+        # a consumer's restart handling failing is survivable.
+        self._router._on_restart(
+            StreamRestart(
+                failed_provider=self._provider.name,
+                error=error,
+                next_provider=provider.name,
+                chunks_yielded=self._chunks_yielded,
+                restart_count=self.restarts,
+            )
+        )
+
+    def _record_success(self) -> None:
+        """Record the current attempt as served, at most once."""
+        if self._recorded:
+            return
+        self._recorded = True
+        self._attempts.append(ProviderAttempt(provider_name=self._provider.name, success=True))
+        self._router._record_attempt_success(
+            self._provider,
+            latency_ms=self._ttft_ms(),
+            stream=True,
+            total_duration_ms=self._duration_ms(),
+        )
+
+    def _close_underlying(self) -> None:
+        """Release the provider's connection; failing to must not mask the real outcome."""
+        try:
+            self._stream.close()
+        except Exception:
+            logger.debug("Closing the provider stream failed.", exc_info=True)
+
+    def _operation(self) -> str:
+        return self._variants_by_protocol[self._provider.protocol].operation
+
+    def _ttft_ms(self) -> float | None:
+        """Time to this attempt's first chunk, or None if no chunk ever arrived."""
+        if self._first_chunk_at is None:
+            return None
+        return (self._first_chunk_at - self._started_at) * 1000.0
+
+    def _duration_ms(self) -> float:
+        """This attempt's span so far -- to completion, or to the death of its stream."""
+        return (time.perf_counter() - self._started_at) * 1000.0

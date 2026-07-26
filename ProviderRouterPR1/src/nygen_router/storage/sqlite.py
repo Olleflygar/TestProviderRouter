@@ -8,8 +8,11 @@ from nygen_router.metrics import MetricsEvent
 from nygen_router.storage.base import (
     CREATE_PROVIDER_ATTEMPTS_TABLE_SQL,
     INSERT_PROVIDER_ATTEMPT_SQL,
+    TABLE_INFO_SQL,
     build_query_recent_sql,
     event_to_params,
+    existing_column_names,
+    missing_column_sql,
     row_to_event,
 )
 
@@ -54,5 +57,9 @@ class SQLiteMetricsStore:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             connection = sqlite3.connect(str(self.path))
             connection.execute(CREATE_PROVIDER_ATTEMPTS_TABLE_SQL)
+            columns = existing_column_names(connection.execute(TABLE_INFO_SQL).fetchall())
+            for statement in missing_column_sql(columns):
+                connection.execute(statement)
+            connection.commit()
             self._connection = connection
         return self._connection
