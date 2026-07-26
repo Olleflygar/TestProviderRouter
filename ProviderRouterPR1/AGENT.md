@@ -65,6 +65,10 @@ Implementation rules for this package:
 - Streaming calls are first-class: a stream that dies mid-generation falls back
   to the next provider, and its outcome is recorded when the stream ends rather
   than when it opens -- see "Streaming" below.
+- Recorded attempts are summarized into per-provider `ProviderStats` by
+  `aggregate_stats` (`stats.py`), split by call type -- see "Metrics
+  aggregation" below. Two providers may not share a `name`: `__init__` rejects
+  that with a `ConfigError` naming every duplicate.
 
 ## Design principle (native pass-through, non-negotiable)
 
@@ -140,6 +144,40 @@ score-based routing (PR7-10) has real history to work from:
   PR24 reuse it rather than inventing another mechanism. Added-column DDL must
   carry no constraints -- DuckDB rejects them in `ALTER TABLE ADD COLUMN`, even
   though it accepts them in `CREATE TABLE`.
+
+## Metrics aggregation (PR7)
+
+`aggregate_stats(events, provider_names, *, weight_fn=None)` in `stats.py`
+turns recorded events into one `ProviderStats` per provider, for PR8's scoring:
+
+- Pure and query-only: a function over a list of `MetricsEvent`, with no store,
+  router, or adapter involved and no window logic of its own. Callers filter
+  with `query_recent` first. Do not push aggregation into per-backend SQL.
+- Regular and streaming figures are separate fields and must never be blended:
+  a regular latency is time-to-complete, a streaming one is time-to-first-chunk
+  (see "Streaming" above), and they are decided successful at different
+  moments.
+- Averages cover successful attempts only -- a fast failure must never look
+  fast -- and a success carrying no latency at all contributes nothing rather
+  than a 0.0.
+- Every requested name gets an entry, including one with no events (counts `0`,
+  rates and averages `None`), matching `health_report()`'s precedent: PR8's
+  optimistic-start blend needs a real entry to fall back on.
+- The four count fields are typed `float` although this PR only produces whole
+  numbers -- reserved for PR10's fractional decayed weights. Do not "simplify"
+  them to `int`. The three tallies stay `int`: exact, unweighted, diagnostic,
+  never scored and never decayed.
+- `weight_fn` exists but does nothing yet: it defaults to a flat 1.0 per event.
+  Write every count, rate, and average through it as if weighting always
+  mattered -- never a separate weighted and unweighted code path -- so PR10 can
+  supply real decay without touching this signature. Do not implement decay
+  here.
+- No per-model grouping: a `ProviderConfig` fixes one model, so provider
+  identity already implies model identity. No cost stat (PR6, deferred).
+- Provider names are the identity key for both metrics and health, which is why
+  `__init__` rejects duplicates. Renaming a provider therefore restarts its
+  recorded history; that is accepted and documented in the README, not a bug to
+  fix with fuzzy matching.
 
 ## Provider health (PR5)
 

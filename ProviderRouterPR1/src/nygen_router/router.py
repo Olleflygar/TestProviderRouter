@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import Counter
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -110,6 +111,7 @@ class ProviderRouter:
         on_restart: Callable[[StreamRestart], None] | None = None,
     ):
         self.providers = list(providers)
+        self._reject_duplicate_names(self.providers)
         self._adapter_factory = adapter_factory or self._default_adapter_for
         self._policy = policy or RoundRobinPolicy()
         # Validated at the boundary so a typo'd key raises here rather than
@@ -431,6 +433,25 @@ class ProviderRouter:
             "stream counts as completed.",
             operation,
         )
+
+    @staticmethod
+    def _reject_duplicate_names(providers: list[ProviderConfig]) -> None:
+        """Reject two configured providers sharing a name, before anything is keyed by it.
+
+        Metrics and health identity are provider names throughout, so a
+        duplicate would silently merge two providers' histories into one and
+        route on the blend. Two entries pointing at the same base_url and model
+        through separate API keys are a supported configuration -- they just
+        need separate names to keep separate histories.
+        """
+        counts = Counter(provider.name for provider in providers)
+        duplicates = sorted(name for name, count in counts.items() if count > 1)
+        if duplicates:
+            raise ConfigError(
+                f"Duplicate provider name(s) in configuration: "
+                f"{', '.join(repr(name) for name in duplicates)}. Provider names key "
+                f"metrics and health history, so each configured provider needs its own."
+            )
 
     @staticmethod
     def _arguments_for(variant: CallVariant, provider: ProviderConfig) -> dict[str, object]:

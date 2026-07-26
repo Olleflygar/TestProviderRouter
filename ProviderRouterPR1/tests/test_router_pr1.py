@@ -5,6 +5,7 @@ import pytest
 from nygen_router import (
     ApiProtocol,
     CallVariant,
+    ConfigError,
     DuplicateCallVariantProtocolError,
     FilterReason,
     ModelArgumentConflictError,
@@ -43,6 +44,38 @@ def test_router_raises_no_providers_configured_with_no_providers() -> None:
 
     with pytest.raises(NoProvidersConfiguredError):
         router.invoke(_calls())
+
+
+def test_duplicate_provider_names_are_rejected_at_construction() -> None:
+    """Names key metrics and health history, so a duplicate would merge two providers into one."""
+    with pytest.raises(ConfigError) as exc_info:
+        ProviderRouter(
+            providers=[
+                _openai_config("provider_a"),
+                _openai_config("provider_a"),
+                _openai_config("provider_b"),
+            ]
+        )
+
+    message = str(exc_info.value)
+    assert "provider_a" in message
+    assert "provider_b" not in message  # only the name that is actually duplicated
+
+
+def test_duplicate_provider_names_error_names_every_duplicate() -> None:
+    with pytest.raises(ConfigError) as exc_info:
+        ProviderRouter(
+            providers=[
+                _openai_config("provider_a"),
+                _openai_config("provider_a"),
+                _openai_config("provider_b"),
+                _openai_config("provider_b"),
+            ]
+        )
+
+    message = str(exc_info.value)
+    assert "provider_a" in message
+    assert "provider_b" in message
 
 
 def test_router_invokes_first_enabled_openai_compatible_provider() -> None:

@@ -514,6 +514,60 @@ check your implementation against the same conformance suite the bundled
 backends run, point `tests/test_metrics_store.py`'s parametrized `store`
 fixture at a factory for your backend.
 
+## Metrics aggregation
+
+`aggregate_stats` turns recorded attempts into one `ProviderStats` per
+provider -- the input score-based routing will use, and a readable summary of
+what each provider has actually been doing:
+
+```python
+from datetime import UTC, datetime, timedelta
+
+from nygen_router import aggregate_stats
+
+store = SQLiteMetricsStore("metrics.sqlite")
+events = store.query_recent(since=datetime.now(UTC) - timedelta(hours=1))
+
+stats = aggregate_stats(events, [provider.name for provider in router.providers])
+print(stats["provider_a"].regular_success_rate)     # e.g. 0.95
+print(stats["provider_a"].streaming_avg_ttft_ms)    # e.g. 210.4
+```
+
+It is query-only: you choose the window, and any model or provider filtering,
+by what you pass to `query_recent` first. Every name you ask about gets an
+entry, including a provider with no history at all -- its counts are `0` and
+its rates and averages are `None`, so a brand-new provider is "no evidence",
+never a missing key.
+
+**Regular and streaming calls are counted separately** -- `regular_*` versus
+`streaming_*` -- and never blended. They are not the same measurement: a
+regular call's latency is the time to a complete response, a streaming call's
+is the time to its first chunk, and the two are decided successful at
+different moments. One combined number would hide precisely the weakness a
+streaming-heavy workflow needs to see. A provider with populated regular
+figures and empty streaming ones (or the reverse) is normal.
+
+Averages are computed over successful attempts only, so a provider that fails
+in 5ms never looks faster than one that answers in 500ms. `recent_error_count`,
+`rate_limit_count`, and `timeout_count` are exact tallies across both call
+types, for diagnostics.
+
+### Provider names must be unique
+
+`ProviderRouter` rejects two configured providers sharing a `name`, raising
+`ConfigError` naming every duplicate before any call is made. Names are how
+both metrics history and health state identify a provider, so a duplicate
+would silently merge two providers into one and route on the blend.
+
+Two entries pointing at the same `base_url` and model through different API
+keys -- separate rate-limit quotas -- are a supported and useful setup. They
+just need distinct names, which is also what keeps their histories separate.
+
+**Renaming a provider starts its recorded history over.** The old name's
+events are still on disk but no longer match, so the provider looks brand new
+until it accumulates history again. That is a deliberate trade: identity you
+can read straight off the config, self-healing within one lookback window.
+
 ## Errors
 
 The router is deliberately transparent about failures -- no "peel the onion"
