@@ -7,9 +7,11 @@ Implementation rules for this package:
 - No provider SDK imports at module level, anywhere -- not even inside an
   adapter module. Always lazy-import inside the method body that actually
   needs it (see `adapters/openai_compatible.py`'s `import openai` inside
-  `invoke()`). `httpx` is not a core dependency either; it only appears as an
-  injectable test seam (`http_client`) and as a transitive dependency of the
-  `openai` extra.
+  `invoke()`). `httpx` is not a core dependency either; it appears only as an
+  injectable test seam (`http_client`), as a transitive dependency of the
+  `openai` extra, and in `_map_sdk_exception`'s in-body import, which is
+  reached only after `openai` itself imported successfully. `router.py` stays
+  entirely SDK-free -- no `openai`, no `httpx`, not even lazily.
 - Do not add LangChain, Pydantic AI, Supabase, or OpenTelemetry yet. DuckDB
   shipped in PR4 as the metrics-storage default -- see below -- but it too
   follows the lazy-import rule: `storage/duckdb.py` never imports `duckdb` at
@@ -60,6 +62,9 @@ Implementation rules for this package:
 - Every provider attempt (success or failure) is persisted as one
   `MetricsEvent` behind the swappable `MetricsStore` protocol -- see
   "Metrics persistence" below. Excluded providers are not recorded.
+- Streaming calls are first-class: a stream that dies mid-generation falls back
+  to the next provider, and its outcome is recorded when the stream ends rather
+  than when it opens -- see "Streaming" below.
 
 ## Design principle (native pass-through, non-negotiable)
 
@@ -87,7 +92,10 @@ Avoid the "peel the onion" debugging that plagues comparable routers:
   (`ModelArgumentConflictError`, `DuplicateCallVariantProtocolError`) and for
   dispatch failures inside the adapter (`UnsupportedOperationError`,
   `InvalidOperationArgumentsError`) -- never let a bare `AttributeError`,
-  `TypeError`, or SDK exception escape unwrapped.
+  `TypeError`, or SDK exception escape unwrapped. The same holds inside a
+  stream: only router errors leave `NormalizedStream.__next__`, and the
+  synthesized `ProviderStreamInterruptedError` names the provider that
+  truncated.
 - Never swallow or re-message a provider/transport error. Surface the
   provider's verbatim message and structured fields (status, error type/code,
   body) -- note that `openai.APIStatusError.message` is an SDK-synthesized
@@ -126,6 +134,12 @@ score-based routing (PR7-10) has real history to work from:
 - Do not build cross-process coordination for DuckDB, async/batched writes,
   schema versioning, or any query beyond `query_recent` -- all explicitly out
   of scope for PR4; see `Projectplan/ProjectPlan.md`'s PR4/PR7/PR13 sections.
+- New columns are added to `_ADDED_COLUMNS` in `storage/base.py`, which every
+  backend replays against its table on connect (check `PRAGMA table_info`, then
+  `ALTER TABLE ADD COLUMN` whatever is missing). PR23 established this; PR6 and
+  PR24 reuse it rather than inventing another mechanism. Added-column DDL must
+  carry no constraints -- DuckDB rejects them in `ALTER TABLE ADD COLUMN`, even
+  though it accepts them in `CREATE TABLE`.
 
 ## Provider health (PR5)
 
@@ -175,3 +189,49 @@ point of the feature:
   cooldowns, `Retry-After` handling, or any global give-up counter -- each was
   considered and deferred or rejected; see `Projectplan/ProjectPlan.md`'s PR5
   section.
+- `ErrorCategory.STREAM_INTERRUPTED` counts toward `failure_threshold` and is
+  never a STOP category: a chronically truncating provider is a broken
+  provider, even though each of its calls starts out looking healthy.
+
+## Streaming (PR23)
+
+A stream's real outcome happens after `invoke()` has returned, inside the
+consumer's own loop, so the returned object is the only place the router can
+still act:
+
+- The SDK-specific knowledge stays behind the adapter boundary.
+  `NormalizedStream` (`adapters/base.py`) is an ABC, not a `Protocol` -- the
+  router needs a reliable `isinstance` -- and `OpenAICompatibleAdapter.invoke`
+  wraps an `openai.Stream` in `OpenAIChatStream` before returning. An adapter
+  returning a raw SDK stream still passes through untouched; returning a
+  `NormalizedStream` is the documented opt-in.
+- `_map_sdk_exception` is the single copy of the SDK-exception mapping, shared
+  by `invoke()` and the stream wrapper. It carries `httpx` branches because
+  during SSE iteration raw transport errors escape unwrapped -- the SDK only
+  folds them into its own types around `.create()`. The dispatch-specific
+  `TypeError`/`AttributeError` handling stays in `invoke()` alone: a mid-stream
+  `TypeError` must never be reported as the caller's arguments being wrong.
+- `RouterStream` (`router.py`) is a pass-through iterator. Never buffer,
+  reorder, or synthesize chunks, and never yield a router-invented marker
+  object. Per-chunk work stays at one completion check.
+- Recording happens at stream end, in metrics and in health alike. Recording
+  success at open would let a provider whose streams open fine and die
+  mid-generation oscillate and never reach `failure_threshold`.
+- On a stream row `latency_ms` always means time-to-first-chunk and is NULL
+  when no chunk arrived; do not repurpose it. `total_duration_ms` is recorded
+  for dead streams too. `stream` means a stream actually opened, so a streaming
+  call that fails before that is recorded `stream=False`.
+- A truncation verdict needs evidence: only a stream whose chunk shape the
+  wrapper recognized can be called silently truncated. An unrecognized shape
+  logs one WARNING per operation per router and counts as completed.
+- `close()` is idempotent, terminal, and never restarts. It records the success
+  if the completion marker was already seen and records nothing otherwise --
+  the one documented exception to one event per attempt.
+- The rule-carrying steps (metrics recording, health transitions, failure
+  classification, per-provider argument building) each exist exactly once as
+  helpers on `ProviderRouter`; `invoke()` and `RouterStream` keep two thin,
+  separate loops. Do not rewrite them into one attempt engine.
+- Do not add per-call overrides for `stream_failure_policy` or `on_restart`, a
+  max-restarts knob, or any async support -- all considered and deferred; see
+  `Projectplan/ProjectPlan.md`'s PR23 section. Usage is exposed on the wrapper
+  but persisted by nobody until PR24.

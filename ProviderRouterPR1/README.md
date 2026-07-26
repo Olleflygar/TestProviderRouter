@@ -339,12 +339,128 @@ response = router.invoke(
 Each protocol may appear at most once per call -- a second `CallVariant` for a
 protocol already supplied raises `DuplicateCallVariantProtocolError`.
 
+## Streaming
+
+Pass `stream=True` and iterate. Nothing else changes: the chunks are the
+provider SDK's own objects, in order, unbuffered.
+
+```python
+response = router.invoke(
+    [
+        CallVariant(
+            protocol=ApiProtocol.OPENAI_CHAT,
+            operation="chat.completions.create",
+            arguments={"messages": [{"role": "user", "content": "Hello"}], "stream": True},
+        )
+    ]
+)
+
+for chunk in response:
+    print(chunk.choices[0].delta.content or "", end="")
+```
+
+What you get on top of the raw SDK stream is that the router is still watching.
+A stream that dies half-way through -- a dropped connection, a read timeout, or
+a provider that simply stops sending without ever marking the response finished
+-- falls back to the next provider in the same ranked order `invoke()` was
+working through, instead of surfacing a raw SDK exception in your loop. Each
+eligible provider is tried at most once per call; when none are left you get
+`RouterExhaustedError` listing every provider's own real reason.
+
+### A restart means regenerating from scratch
+
+Two generations cannot be spliced together. When the router restarts on a new
+provider, **everything you have already accumulated from the dead provider must
+be discarded** -- the new provider starts its answer over from the beginning.
+
+That is never allowed to happen silently:
+
+```python
+from nygen_router import ProviderRouter, StreamRestart
+
+def on_restart(restart: StreamRestart) -> None:
+    print(f"discard {restart.chunks_yielded} chunk(s) from {restart.failed_provider}")
+    print(f"{restart.next_provider} is regenerating; cause: {restart.error}")
+    buffer.clear()
+
+router = ProviderRouter(providers=[...], on_restart=on_restart)
+```
+
+If no callback is registered and chunks had already been yielded, the router
+logs a warning instead. A restart that happens before any chunk was yielded
+leaves you nothing to discard, so it fires neither. The number of restarts so
+far is on the returned stream as `.restarts`.
+
+To stop on any mid-stream failure rather than regenerate, set the policy:
+
+```python
+from nygen_router import ProviderRouter, StreamFailurePolicy
+
+router = ProviderRouter(providers=[...], stream_failure_policy=StreamFailurePolicy.RAISE)
+```
+
+`RAISE` re-raises the provider's own error, unchanged, after recording the
+failed attempt. Both policies stop immediately on a malformed call (a 400, a
+bad `operation`), since no other provider would do better.
+
+### Stopping early
+
+If you break out of the loop, close the stream -- or use it as a context
+manager, which does it for you:
+
+```python
+with router.invoke([...]) as stream:
+    for chunk in stream:
+        if done_enough(chunk):
+            break
+```
+
+Closing releases the provider's connection, never triggers a restart, and is
+final: iterating a closed stream stops immediately, like a closed generator.
+Closing also decides what gets recorded. If the provider had already marked the
+response finished, the call is recorded as the success it was; if not, nothing
+is recorded at all, because an outcome you declined to observe is not one the
+router can honestly report. A bare `break` with no `close()` runs no router
+code and records nothing.
+
+### When truncation cannot be detected
+
+A stream counts as successful only if it ended after the provider marked it
+finished. For OpenAI-compatible chat streams that marker is `finish_reason`.
+
+If a provider sends chunks in a shape the adapter does not recognize, there is
+no marker to read, so the router will not claim a truncation it cannot
+evidence: the stream counts as completed, and you get one warning per operation
+saying truncation detection is unavailable for that stream shape. Fallback on
+exceptions, metrics, and `close()` all still work normally for it.
+
+### Custom adapters
+
+Mid-stream fallback is opt-in. An adapter returning a raw SDK stream passes
+straight through, exactly as before -- the router does not touch it. To opt in,
+return a `NormalizedStream`: yield the SDK's chunks unchanged from `__next__`,
+raise only router errors from it, and report `completed` and `usage`.
+
 ## Metrics persistence
 
 Every provider attempt (success or failure) is recorded as one observational
 `MetricsEvent` -- provider name, model, protocol, success, latency, and error
 type -- so score-based routing (a later PR) has real history to work from.
 Excluded providers are not recorded.
+
+Streams are recorded once, when the stream ends, never when it opens -- headers
+arriving is not a served call. A stream row is marked `stream=True`, and its
+`latency_ms` means **time to first chunk**, not the full duration (which mostly
+tracks how long the answer was). `total_duration_ms` carries that full span,
+for a completed stream and for one that died mid-generation alike. A streaming
+call that fails before a stream ever opens is recorded like any other failed
+attempt, with `stream=False`.
+
+Adding those two columns is the first schema change to reach existing metrics
+files. Both bundled backends check their table on connect and add whatever
+columns are missing, so an older file keeps its rows and its history: rows
+written before this change simply read back as the non-streaming attempts they
+were.
 
 `metrics_store` is a `ProviderRouter` constructor parameter with three forms:
 
@@ -419,7 +535,9 @@ debugging. The contract:
   call), `RouterExhaustedError` (every provider tried failed), `UnsupportedOperationError`
   / `InvalidOperationArgumentsError` (bad `operation`/`arguments`),
   `ProviderTimeoutError` / `ProviderConnectionError` / `ProviderError` (transport),
-  `ProviderHTTPError` (HTTP status). Messages always name the provider and model.
+  `ProviderHTTPError` (HTTP status), `ProviderStreamInterruptedError` (a stream
+  ended without the provider ever marking it finished). Messages always name the
+  provider and model.
 - **Originals are chained, never re-wrapped.** Transport and SDK failures keep
   the exact `openai`/`httpx` exception type in the message and attach it as both
   `__cause__` and `.original`.
