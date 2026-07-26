@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import json
 import sys
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
 import pytest
 
-from nygen_router import ApiProtocol, ProviderConfig
+from nygen_router import ApiProtocol, NormalizedStream, ProviderConfig
 from nygen_router.adapters.openai_compatible import OpenAICompatibleAdapter
 from nygen_router.errors import (
     InvalidOperationArgumentsError,
     ProviderConnectionError,
+    ProviderError,
     ProviderHTTPError,
     ProviderSDKNotInstalledError,
     ProviderTimeoutError,
@@ -273,3 +276,199 @@ def test_other_transport_error_also_raises_provider_connection_error() -> None:
 
     assert not isinstance(exc_info.value, ProviderTimeoutError)
     assert type(exc_info.value.__cause__).__name__ == "APIConnectionError"
+
+
+def _chunk_json(content: str = "hi", finish_reason: str | None = None) -> str:
+    return json.dumps(
+        {
+            "id": "x",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "model-a",
+            "choices": [
+                {"index": 0, "delta": {"content": content}, "finish_reason": finish_reason}
+            ],
+        }
+    )
+
+
+def _usage_chunk_json() -> str:
+    """The include_usage final chunk: usage, no choices, after the finish_reason chunk."""
+    return json.dumps(
+        {
+            "id": "x",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "model-a",
+            "choices": [],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
+        }
+    )
+
+
+def _sse(*payloads: str) -> Iterator[bytes]:
+    for payload in payloads:
+        yield f"data: {payload}\n\n".encode()
+
+
+def _stream_client(body: Iterator[bytes] | bytes) -> httpx.Client:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def _stream_arguments() -> dict[str, object]:
+    return {**_arguments(), "stream": True}
+
+
+def _stream(body: Iterator[bytes] | bytes) -> Any:
+    adapter = OpenAICompatibleAdapter(_config(), http_client=_stream_client(body))
+    return adapter.invoke("chat.completions.create", _stream_arguments())
+
+
+def test_streaming_response_is_wrapped_in_a_normalized_stream() -> None:
+    """Wrapping is the opt-in that lets the router observe a stream it must not interpret."""
+    stream = _stream(_sse(_chunk_json(finish_reason="stop"), "[DONE]"))
+
+    assert isinstance(stream, NormalizedStream)
+
+
+def test_wrapped_stream_yields_the_sdk_chunks_unchanged_and_marks_completion() -> None:
+    stream = _stream(_sse(_chunk_json("one"), _chunk_json("two", finish_reason="stop"), "[DONE]"))
+
+    chunks = list(stream)
+
+    assert [type(chunk).__name__ for chunk in chunks] == [
+        "ChatCompletionChunk",
+        "ChatCompletionChunk",
+    ]
+    assert [chunk.choices[0].delta.content for chunk in chunks] == ["one", "two"]
+    assert stream.completed is True
+    assert stream.recognized is True
+
+
+def test_wrapped_stream_pockets_usage_without_disturbing_completion() -> None:
+    """The usage chunk has no choices and arrives last; it must not undo the marker."""
+    stream = _stream(
+        _sse(
+            _chunk_json("one", finish_reason="stop"),
+            _usage_chunk_json(),
+            "[DONE]",
+        )
+    )
+
+    list(stream)
+
+    assert stream.usage is not None
+    assert stream.usage.total_tokens == 7
+    assert stream.completed is True
+    assert stream.recognized is True
+
+
+def test_wrapped_stream_without_finish_reason_is_not_completed() -> None:
+    stream = _stream(_sse(_chunk_json("one"), "[DONE]"))
+
+    list(stream)
+
+    assert stream.completed is False
+    assert stream.recognized is True  # the shape was readable; the marker never came
+
+
+def test_wrapped_stream_of_an_unfamiliar_shape_is_not_recognized() -> None:
+    """A chunk carrying no choices at all tells the wrapper nothing about completion."""
+    stream = _stream(_sse(json.dumps({"id": "x", "object": "other", "created": 0}), "[DONE]"))
+
+    list(stream)
+
+    assert stream.recognized is False
+    assert stream.completed is False
+
+
+def _dying_body(exc: Exception) -> Iterator[bytes]:
+    yield f"data: {_chunk_json('one')}\n\n".encode()
+    raise exc
+
+
+def test_mid_stream_timeout_raises_provider_timeout_error() -> None:
+    """During SSE iteration the SDK does not fold transport errors into its own types."""
+    stream = _stream(_dying_body(httpx.ReadTimeout("read timed out")))
+
+    assert next(stream).choices[0].delta.content == "one"
+    with pytest.raises(ProviderTimeoutError) as exc_info:
+        next(stream)
+
+    assert isinstance(exc_info.value.__cause__, httpx.ReadTimeout)
+    assert exc_info.value.original is exc_info.value.__cause__
+
+
+def test_mid_stream_transport_error_raises_provider_connection_error() -> None:
+    stream = _stream(_dying_body(httpx.RemoteProtocolError("peer closed connection")))
+
+    next(stream)
+    with pytest.raises(ProviderConnectionError) as exc_info:
+        next(stream)
+
+    assert not isinstance(exc_info.value, ProviderTimeoutError)
+    assert isinstance(exc_info.value.__cause__, httpx.RemoteProtocolError)
+
+
+def test_mid_stream_sse_error_event_raises_provider_error() -> None:
+    body = (
+        f"data: {_chunk_json('one')}\n\n".encode()
+        + b'event: error\ndata: {"error":{"message":"upstream exploded"}}\n\n'
+    )
+    stream = _stream(body)
+
+    next(stream)
+    with pytest.raises(ProviderError) as exc_info:
+        next(stream)
+
+    assert "upstream exploded" in str(exc_info.value)
+
+
+def test_mid_stream_malformed_payload_still_leaves_as_a_router_error() -> None:
+    """Only router errors leave __next__, whatever the provider sent down the wire."""
+    body = f"data: {_chunk_json('one')}\n\n".encode() + b"data: {not json\n\n"
+    stream = _stream(body)
+
+    next(stream)
+    with pytest.raises(ProviderError) as exc_info:
+        next(stream)
+
+    assert isinstance(exc_info.value.__cause__, ValueError)  # JSONDecodeError
+    assert "JSONDecodeError" in str(exc_info.value)
+
+
+class _ClosableBody(httpx.SyncByteStream):
+    """Response body that records whether httpx was asked to close it."""
+
+    def __init__(self, *payloads: str) -> None:
+        self._payloads = payloads
+        self.closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        for payload in self._payloads:
+            yield f"data: {payload}\n\n".encode()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_closing_the_wrapper_releases_the_underlying_response() -> None:
+    """close() has to reach all the way down, or an abandoned stream leaks its connection."""
+    body = _ClosableBody(_chunk_json("one"), _chunk_json("two"), "[DONE]")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=body)
+
+    adapter = OpenAICompatibleAdapter(
+        _config(), http_client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    stream = adapter.invoke("chat.completions.create", _stream_arguments())
+
+    next(stream)
+    assert body.closed is False
+    stream.close()
+
+    assert body.closed is True

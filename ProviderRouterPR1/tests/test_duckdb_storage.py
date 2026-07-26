@@ -110,6 +110,61 @@ def test_sdk_available_false_warns_only_once_when_router_writes(
 
 
 @requires_duckdb
+def test_metrics_file_written_before_the_stream_columns_is_migrated_on_connect(
+    tmp_path: Path,
+) -> None:
+    """The same check-and-ALTER as SQLite, since DuckDB is the default backend."""
+    import duckdb
+
+    path = tmp_path / "metrics.duckdb"
+    recorded_at = datetime.now(UTC) - timedelta(minutes=5)
+    connection = duckdb.connect(str(path))
+    connection.execute(
+        """
+        CREATE TABLE provider_attempts (
+            id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            provider_name TEXT NOT NULL,
+            model TEXT NOT NULL,
+            protocol TEXT NOT NULL,
+            success INTEGER NOT NULL,
+            latency_ms REAL,
+            error_type TEXT
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO provider_attempts "
+        "(id, timestamp, provider_name, model, protocol, success, latency_ms, error_type) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ["old", recorded_at.isoformat(), "provider_a", "model-a", "openai_chat", 1, 5.0, None],
+    )
+    connection.close()
+
+    store = DuckDBMetricsStore(path)
+    store.record_attempt(
+        MetricsEvent(
+            provider_name="provider_b",
+            model="model-a",
+            protocol=ApiProtocol.OPENAI_CHAT,
+            success=True,
+            latency_ms=8.0,
+            stream=True,
+            total_duration_ms=900.0,
+        )
+    )
+    events = store.query_recent(since=recorded_at - timedelta(seconds=1))
+
+    old_event, new_event = events
+    assert old_event.id == "old"
+    assert old_event.stream is False
+    assert old_event.total_duration_ms is None
+    assert new_event.stream is True
+    assert new_event.total_duration_ms == 900.0
+    store.close()
+
+
+@requires_duckdb
 def test_query_recent_reads_back_recorded_events(tmp_path: Path) -> None:
     store = DuckDBMetricsStore(tmp_path / "metrics.duckdb")
     since = datetime.now(UTC) - timedelta(minutes=1)

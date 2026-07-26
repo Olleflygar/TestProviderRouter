@@ -510,7 +510,6 @@ class RouterStream:
         self._started_at = started_at
         self._first_chunk_at: float | None = None
         self._chunks_yielded = 0
-        self._recorded = False
         self._closed = False
         self.restarts = 0
 
@@ -596,7 +595,6 @@ class RouterStream:
         """Record the attempt this error killed, then restart on the next provider or raise."""
         duration_ms = self._duration_ms()
         self._close_underlying()
-        self._recorded = True
         self._attempts.append(
             ProviderAttempt(provider_name=self._provider.name, success=False, error=error)
         )
@@ -663,7 +661,6 @@ class RouterStream:
             self._started_at = start
             self._first_chunk_at = None
             self._chunks_yielded = 0
-            self._recorded = False
             return
 
         self._closed = True
@@ -732,10 +729,11 @@ class RouterStream:
         )
 
     def _record_success(self) -> None:
-        """Record the current attempt as served, at most once."""
-        if self._recorded:
-            return
-        self._recorded = True
+        """Record the current attempt as served.
+
+        Both callers close the stream immediately afterwards, and a closed
+        stream records nothing further, so one attempt cannot be recorded twice.
+        """
         self._attempts.append(ProviderAttempt(provider_name=self._provider.name, success=True))
         self._router._record_attempt_success(
             self._provider,

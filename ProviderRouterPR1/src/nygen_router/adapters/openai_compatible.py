@@ -80,7 +80,11 @@ class OpenAICompatibleAdapter:
             mapped = _map_sdk_exception(
                 exc, provider_name=name, model=model, timeout_seconds=self.config.timeout_seconds
             )
-            if mapped is None:
+            if mapped is None:  # pragma: no cover
+                # Unreachable through .create() today -- the SDK folds even an
+                # unrelated transport exception into APIConnectionError -- but
+                # what the mapping cannot classify is passed on exactly as it
+                # arrived rather than re-wrapped into a guess.
                 raise
             raise mapped from exc
 

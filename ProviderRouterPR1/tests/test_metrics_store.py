@@ -56,6 +56,8 @@ def _event(
     success: bool = True,
     latency_ms: float | None = 12.5,
     error_type: str | None = None,
+    stream: bool = False,
+    total_duration_ms: float | None = None,
     timestamp: datetime | None = None,
 ) -> MetricsEvent:
     return MetricsEvent(
@@ -65,6 +67,8 @@ def _event(
         success=success,
         latency_ms=latency_ms,
         error_type=error_type,
+        stream=stream,
+        total_duration_ms=total_duration_ms,
         timestamp=timestamp if timestamp is not None else datetime.now(UTC),
     )
 
@@ -94,6 +98,47 @@ def test_records_and_reads_back_success_event_field_for_field(store: MetricsStor
     assert read_back.latency_ms == pytest.approx(event.latency_ms)
     assert read_back.error_type is None
     assert read_back.timestamp == event.timestamp
+
+
+def test_records_and_reads_back_a_stream_event(store: MetricsStore) -> None:
+    """On a stream row latency_ms is time-to-first-chunk and total_duration_ms is open-to-end."""
+    event = _event(stream=True, latency_ms=8.0, total_duration_ms=1200.0)
+
+    store.record_attempt(event)
+    (read_back,) = store.query_recent(since=event.timestamp - timedelta(seconds=1))
+
+    assert read_back.stream is True
+    assert read_back.latency_ms == pytest.approx(8.0)
+    assert read_back.total_duration_ms == pytest.approx(1200.0)
+
+
+def test_non_stream_event_reads_back_with_stream_false_and_no_total_duration(
+    store: MetricsStore,
+) -> None:
+    event = _event()
+
+    store.record_attempt(event)
+    (read_back,) = store.query_recent(since=event.timestamp - timedelta(seconds=1))
+
+    assert read_back.stream is False
+    assert read_back.total_duration_ms is None
+
+
+def test_stream_event_with_no_first_chunk_round_trips_a_null_latency(store: MetricsStore) -> None:
+    """A stream that died before its first chunk has no TTFT to report, and must not fake one."""
+    event = _event(
+        success=False,
+        error_type="stream_interrupted",
+        stream=True,
+        latency_ms=None,
+        total_duration_ms=45.0,
+    )
+
+    store.record_attempt(event)
+    (read_back,) = store.query_recent(since=event.timestamp - timedelta(seconds=1))
+
+    assert read_back.latency_ms is None
+    assert read_back.total_duration_ms == pytest.approx(45.0)
 
 
 def test_records_failure_event_error_type_round_trips_as_category_string(
