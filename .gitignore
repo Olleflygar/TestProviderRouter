@@ -9,3 +9,5 @@ venv/
 .coverage
 .coverage.*
 htmlcov/
+WorkflowTests/*.duckdb
+WorkflowTests/*.duckdb.wal

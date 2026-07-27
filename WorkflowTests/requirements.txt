@@ -1,0 +1,5 @@
+duckdb>=0.10,<2
+langchain-core>=0.3,<2
+openai>=1,<2
+pydantic>=2,<3
+python-dotenv>=1,<2
