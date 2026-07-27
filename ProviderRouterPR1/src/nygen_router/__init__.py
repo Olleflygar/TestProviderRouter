@@ -26,6 +26,7 @@ from nygen_router.health import HealthConfig, ProviderHealthReport
 from nygen_router.metrics import MetricsEvent
 from nygen_router.policies import RoundRobinPolicy
 from nygen_router.router import ProviderRouter, StreamFailurePolicy, StreamRestart
+from nygen_router.scoring import ProviderScore, ScoreWeights, calculate_provider_score
 from nygen_router.stats import ProviderStats, aggregate_stats
 from nygen_router.storage import DuckDBMetricsStore, MetricsStore, SQLiteMetricsStore
 from nygen_router.types import (
@@ -61,17 +62,20 @@ __all__ = [
     "ProviderHTTPError",
     "ProviderHealthReport",
     "ProviderRouter",
+    "ProviderScore",
     "ProviderSDKNotInstalledError",
     "ProviderStats",
     "ProviderStreamInterruptedError",
     "ProviderTimeoutError",
     "RoundRobinPolicy",
     "RouterExhaustedError",
+    "ScoreWeights",
     "SQLiteMetricsStore",
     "StreamFailurePolicy",
     "StreamRestart",
     "UnsupportedOperationError",
     "UnsupportedProtocolError",
     "aggregate_stats",
+    "calculate_provider_score",
     "filter_eligible_providers",
 ]

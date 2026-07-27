@@ -558,6 +558,41 @@ in 5ms never looks faster than one that answers in 500ms. `recent_error_count`,
 `rate_limit_count`, and `timeout_count` are exact tallies across both call
 types, for diagnostics.
 
+## Score calculation
+
+`calculate_provider_score(stats, weights, use_streaming=False)` turns one
+provider's aggregated observations into a comparable score between 0 and 1.
+Pass `use_streaming=True` to score streaming success and time-to-first-chunk
+instead of regular success and full-response latency. The returned
+`ProviderScore` keeps `success_quality` and `speed_quality` alongside `total`,
+so the result remains explainable.
+
+`ScoreWeights` controls the calculation:
+
+| Setting | Default | Valid range | What it controls |
+| --- | ---: | --- | --- |
+| `success_weight` | `1.0` | `>= 0` | Relative influence of observed success rate. |
+| `speed_weight` | `1.0` | `>= 0` | Relative influence of latency. |
+| `regular_latency_reference_ms` | `2000.0` | `> 0` | Regular latency that maps to a raw speed quality of `0.5`. |
+| `streaming_ttft_reference_ms` | `500.0` | `> 0` | Streaming TTFT that maps to a raw speed quality of `0.5`. |
+| `optimistic_start` | `0.75` | `0` to `1` | Initial quality assumed before real evidence accumulates. |
+| `optimistic_start_pretend_attempts` | `5.0` | `> 0` | Strength of that initial assumption, measured in pretend attempts. |
+
+At least one of `success_weight` and `speed_weight` must be greater than zero.
+The total is their weighted average, so the weights express relative
+importance and do not need to add up to any particular value.
+
+Success and speed are both blended toward `optimistic_start` as though the
+provider began with `optimistic_start_pretend_attempts` imaginary observations.
+A brand-new provider therefore starts at `0.75`, not zero; a small amount of
+history moves it gently, while enough real attempts eventually dominate the
+prior. This always-on optimistic start is how new providers remain eligible
+for exploration—there is no separate exploration-bonus switch.
+
+Cost is deliberately not a scoring factor. Automatic pricing is outside the
+router's core model, and manually configured cost remains the deferred,
+optional work described in PR 6.
+
 ### Provider names must be unique
 
 `ProviderRouter` rejects two configured providers sharing a `name`, raising

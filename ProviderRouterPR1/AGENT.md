@@ -179,6 +179,25 @@ turns recorded events into one `ProviderStats` per provider, for PR8's scoring:
   recorded history; that is accepted and documented in the README, not a bug to
   fix with fuzzy matching.
 
+## Score calculation (PR8)
+
+`calculate_provider_score(stats, weights, *, use_streaming=False)` in
+`scoring.py` is a pure function from one `ProviderStats` record to one frozen,
+explainable `ProviderScore`:
+
+- Select only the regular or streaming bucket requested by `use_streaming`;
+  never blend the two call types.
+- Blend success rate toward `ScoreWeights.optimistic_start` using attempt count
+  as evidence. Blend latency-derived speed quality toward the same prior using
+  successful-attempt count as evidence.
+- Compute `total` as the weighted average of the two components, never a sum.
+  Exactly one zero component weight is valid; both zero is rejected.
+- New providers need no branch or exploration toggle: the blend formula itself
+  returns the optimistic start when the relevant evidence count is zero.
+- `recent_error_count`, rate-limit counts, and cost are not scoring inputs.
+- Keep this module independent of adapters, storage, providers, and I/O. It
+  operates only on the values passed to it.
+
 ## Provider health (PR5)
 
 `ProviderRouter` benches temporarily-bad providers so they stop being called,
