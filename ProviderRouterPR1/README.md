@@ -636,6 +636,25 @@ both call types needs two policy instances selected by the caller, or must
 accept that whichever type is not configured will be ranked using the other
 type's history.
 
+### Recency weighting
+
+`half_life_hours` optionally makes recent observations count more than older
+ones. A half-life is the age at which an event carries half its original
+weight. For example, with `half_life_hours=72`, an event from three days ago
+counts half as much as one from right now; after six days it counts one
+quarter as much.
+
+The default is `half_life_hours=None`, which leaves recency weighting off and
+preserves the flat `lookback_hours=336` behavior above. Setting a positive
+half-life replaces `lookback_hours` entirely for that policy instance; the two
+windows are never combined. The router queries the latest six half-lives and
+applies exponential decay within them. Events older than that boundary are
+ignored after their influence has already fallen below about 1.6%.
+
+```python
+policy = ScoreBasedPolicy(half_life_hours=72.0)
+```
+
 ### Provider names must be unique
 
 `ProviderRouter` rejects two configured providers sharing a `name`, raising

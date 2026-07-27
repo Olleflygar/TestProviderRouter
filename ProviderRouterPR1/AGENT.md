@@ -221,8 +221,13 @@ ignores it.
 - `use_streaming` is fixed at policy construction and never inferred from
   `CallVariant.arguments`. A policy instance scores one call type for its
   entire lifetime.
-- PR10 owns decay. PR9's lookback window is flat and must not pass a
-  `weight_fn` to aggregation.
+- `half_life_hours=None` preserves PR9's flat `lookback_hours` behavior
+  exactly. A positive half-life replaces that window entirely: query the
+  latest six half-lives and pass exponential event weights
+  `0.5 ** (age_hours / half_life_hours)` to aggregation. The multiplier six is
+  fixed, and the same half-life applies to every provider and metric.
+- Decay affects scoring evidence only. The exact diagnostic error,
+  rate-limit, and timeout counts remain unweighted.
 
 ## Provider health (PR5)
 
