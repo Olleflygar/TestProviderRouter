@@ -367,6 +367,12 @@ working through, instead of surfacing a raw SDK exception in your loop. Each
 eligible provider is tried at most once per call; when none are left you get
 `RouterExhaustedError` listing every provider's own real reason.
 
+A stream that ends without yielding even one chunk is also a failed attempt,
+even if the provider marked it complete: it produced no usable response.
+The router records a `ProviderStreamInterruptedError` and follows the same
+configured stream-failure policy -- restart on the next provider by default,
+or raise immediately under `StreamFailurePolicy.RAISE`.
+
 ### A restart means regenerating from scratch
 
 Two generations cannot be spliced together. When the router restarts on a new

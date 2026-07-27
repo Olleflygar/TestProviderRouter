@@ -16,6 +16,7 @@ from nygen_router import (
     ProviderConfig,
     ProviderHTTPError,
     ProviderRouter,
+    ProviderStreamInterruptedError,
     ProviderTimeoutError,
     RouterExhaustedError,
     StreamFailurePolicy,
@@ -40,13 +41,14 @@ class _FakeStream(NormalizedStream):
         marker_at: int | None = None,
         error: Exception | None = None,
         recognized: bool = True,
+        completed: bool = False,
         usage: Any = None,
     ) -> None:
         self._chunks = list(chunks)
         self._index = 0
         self._marker_at = marker_at
         self._error = error
-        self._completed = False
+        self._completed = completed
         self._recognized = recognized
         self._usage = usage
         self.close_calls = 0
@@ -251,6 +253,90 @@ def test_failure_before_any_chunk_falls_back_without_firing_on_restart() -> None
 
     assert list(router.invoke(_calls())) == ["x"]
     assert restarts == []
+
+
+def test_empty_completed_stream_is_failed_and_restarted_without_a_callback() -> None:
+    """A completion claim cannot turn a zero-chunk response into a served call."""
+    empty = _FakeStream([], completed=True)
+    script = _Script({"provider_a": [empty], "provider_b": [_finishing(["x"])]})
+    restarts: list[StreamRestart] = []
+    router, store = _router(
+        [_config("provider_a"), _config("provider_b")],
+        script,
+        health=HealthConfig(failure_threshold=1),
+        on_restart=restarts.append,
+    )
+
+    stream = router.invoke(_calls())
+
+    assert list(stream) == ["x"]
+    assert stream.restarts == 1
+    assert restarts == []
+    assert script.invoked == ["provider_a", "provider_b"]
+    assert [(event.provider_name, event.success) for event in store.events] == [
+        ("provider_a", False),
+        ("provider_b", True),
+    ]
+    failed = store.events[0]
+    assert failed.error_type == "stream_interrupted"
+    assert failed.stream is True
+    assert failed.latency_ms is None
+    assert failed.total_duration_ms is not None
+    report = router.health_report()["provider_a"]
+    assert report.consecutive_failures == 1
+    assert report.cooldown_remaining_seconds is not None
+
+
+def test_empty_stream_respects_raise_policy_even_when_its_shape_is_unrecognized() -> None:
+    """RAISE still stops immediately; zero chunks override the shape blind spot."""
+    script = _Script(
+        {
+            "provider_a": [_FakeStream([], recognized=False)],
+            "provider_b": [_finishing(["x"])],
+        }
+    )
+    router, store = _router(
+        [_config("provider_a"), _config("provider_b")],
+        script,
+        stream_failure_policy=StreamFailurePolicy.RAISE,
+    )
+
+    with pytest.raises(ProviderStreamInterruptedError, match="without yielding any chunks"):
+        list(router.invoke(_calls()))
+
+    assert script.invoked == ["provider_a"]
+    assert len(store.events) == 1
+    assert store.events[0].success is False
+    assert store.events[0].error_type == "stream_interrupted"
+    assert router.health_report()["provider_a"].consecutive_failures == 1
+
+
+def test_empty_streams_exhaust_every_provider_with_each_failure_visible() -> None:
+    script = _Script(
+        {
+            "provider_a": [_FakeStream([], completed=True)],
+            "provider_b": [_FakeStream([], recognized=False)],
+        }
+    )
+    router, store = _router([_config("provider_a"), _config("provider_b")], script)
+
+    with pytest.raises(RouterExhaustedError) as exc_info:
+        list(router.invoke(_calls()))
+
+    assert script.invoked == ["provider_a", "provider_b"]
+    assert [attempt.provider_name for attempt in exc_info.value.attempts] == [
+        "provider_a",
+        "provider_b",
+    ]
+    assert all(
+        isinstance(attempt.error, ProviderStreamInterruptedError)
+        for attempt in exc_info.value.attempts
+    )
+    assert "without yielding any chunks" in str(exc_info.value)
+    assert [(event.provider_name, event.success) for event in store.events] == [
+        ("provider_a", False),
+        ("provider_b", False),
+    ]
 
 
 def test_stream_ending_without_completion_marker_is_recorded_as_interrupted() -> None:

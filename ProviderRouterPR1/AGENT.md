@@ -255,6 +255,11 @@ still act:
 - Recording happens at stream end, in metrics and in health alike. Recording
   success at open would let a provider whose streams open fine and die
   mid-generation oscillate and never reach `failure_threshold`.
+- A fully consumed stream that yields zero chunks is
+  `ProviderStreamInterruptedError`, regardless of its reported completion or
+  recognized-shape state: it produced no usable response. Record it as a
+  streaming failure with NULL TTFT, apply the normal health transition, and
+  obey `stream_failure_policy` (`RESTART` by default, `RAISE` when configured).
 - On a stream row `latency_ms` always means time-to-first-chunk and is NULL
   when no chunk arrived; do not repurpose it. `total_duration_ms` is recorded
   for dead streams too. `stream` means a stream actually opened, so a streaming

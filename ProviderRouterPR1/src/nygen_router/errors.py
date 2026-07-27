@@ -158,11 +158,11 @@ class InvalidOperationArgumentsError(ProviderError):
 
 
 class ProviderStreamInterruptedError(ProviderError):
-    """A stream ended without the provider ever marking it complete.
+    """A stream ended empty or without the provider ever marking it complete.
 
-    Synthesized by the router, not raised by any SDK: a silently truncated
-    stream has no HTTP status and no transport failure of its own, so there is
-    no original exception to chain here.
+    Synthesized by the router, not raised by any SDK: an empty or silently
+    truncated stream has no HTTP status and no transport failure of its own, so
+    there is no original exception to chain here.
     """
 
 

@@ -592,11 +592,21 @@ class RouterStream:
     def _judge_clean_end(self) -> ProviderStreamInterruptedError | None:
         """Judge a stream that ended without error: None if it truly finished.
 
-        A stream finished iff the provider marked it finished. The exception is
-        a stream whose chunk shape the adapter never recognized: its completion
-        marker was never readable in the first place, and the router does not
-        invent a failure it cannot evidence.
+        A stream that yielded nothing did not serve a usable response, whatever
+        completion state its wrapper reports. Otherwise, a stream finished iff
+        the provider marked it finished. The exception is a stream whose chunk
+        shape the adapter never recognized: its completion marker was never
+        readable in the first place, and the router does not invent a failure
+        it cannot evidence.
         """
+        if self._chunks_yielded == 0:
+            return ProviderStreamInterruptedError(
+                f"Provider {self._provider.name!r} ended its stream for model "
+                f"{self._provider.model!r} without yielding any chunks; no usable "
+                f"response was produced.",
+                provider_name=self._provider.name,
+                model=self._provider.model,
+            )
         if not self._stream.completed:
             if self._stream.recognized:
                 return ProviderStreamInterruptedError(

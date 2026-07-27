@@ -1783,6 +1783,18 @@ Revision note (design interview, 2026-07-17): the design was walked
 end-to-end before implementation and every open decision is pinned
 below; the usage-capture bullet and the streaming test bullet are
 amended in place where they contradicted the sequencing note.
+
+Revision note (empty-stream correction, 2026-07-27): a fully consumed stream
+that yields zero chunks is now a `ProviderStreamInterruptedError`, even if its
+wrapper reports completion or an unrecognized shape. The earlier rule could
+record such an attempt as successful despite producing no usable response,
+and left streaming TTFT undefined for a counted success. The empty attempt is
+recorded as a streaming failure with NULL TTFT and measured total duration,
+counts toward provider health, and follows the configured
+`stream_failure_policy`: restart by default or raise when requested. Consumer
+close remains unchanged and never invents a failure for an outcome the caller
+did not observe.
+
 - Seam: the SDK-specific streaming knowledge (stream detection,
   mid-iteration exception mapping, chunk interpretation) lives behind
   the adapter boundary as a wrapped stream. adapters/base.py gains
@@ -1804,7 +1816,7 @@ amended in place where they contradicted the sequencing note.
   adapter that returns a raw stream passes through untouched exactly
   as today (no mid-stream fallback); returning a NormalizedStream is
   the documented opt-in.
-- Truncation verdict only with evidence: the silent-truncation
+- Truncation verdict only with evidence after at least one chunk: the silent-truncation
   contract applies only when the wrapper recognized the chunk shape
   (saw choices-bearing chunks). A stream whose chunks were never
   recognized keeps exception-based fallback, metrics, and close
@@ -1819,7 +1831,8 @@ amended in place where they contradicted the sequencing note.
   graceful truncation; if a real provider ever bites, the remedy is a
   per-provider opt-out knob added on evidence (the Retry-After
   precedent). See the note added to PR 12: its own wrapper closes this
-  blind spot for responses streams.
+  blind spot for responses streams. Independently, zero chunks is direct
+  evidence that no usable response was produced and is always a failure.
 - ProviderStreamInterruptedError categorizes as a new
   ErrorCategory.STREAM_INTERRUPTED member -- visible by name to
   metrics and scoring (the CONNECTION precedent) -- counted toward
@@ -1896,10 +1909,12 @@ Scope:
   time-to-first-token is unaffected. close() and context-manager support
   propagate to the underlying SDK stream, so a consumer's break / Ctrl-C
   cleans up naturally.
-- Completion contract: a stream succeeded iff iteration ended after a
-  chunk carrying a finish_reason. A stream that ends cleanly without one
-  was silently truncated by the provider -- there is no HTTP status and no
-  SDK exception for this case, so the router synthesizes its own
+- Completion contract: a stream succeeded iff it yielded at least one chunk
+  and iteration ended after a chunk carrying a finish_reason. A zero-chunk
+  stream failed to produce a usable response. A non-empty stream that ends
+  cleanly without a completion marker was silently truncated by the provider
+  -- there is no HTTP status and no SDK exception for either case, so the router
+  synthesizes its own
   ProviderStreamInterruptedError (new ProviderError subclass, with its own
   ErrorCategory mapping). Mid-iteration transport/SDK exceptions go
   through categorize_error as usual. (Verify at implementation time
