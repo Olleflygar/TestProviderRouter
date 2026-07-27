@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from nygen_router.config import ProviderConfig
+from nygen_router.policies.base import RoutingContext
 
 
 class RoundRobinPolicy:
@@ -15,7 +16,9 @@ class RoundRobinPolicy:
     def __init__(self) -> None:
         self._index = 0
 
-    def order(self, eligible: list[ProviderConfig]) -> list[ProviderConfig]:
+    def order(
+        self, eligible: list[ProviderConfig], context: RoutingContext
+    ) -> list[ProviderConfig]:
         """Return eligible rotated so a different provider leads each call."""
         if not eligible:
             return []

@@ -31,7 +31,7 @@ from nygen_router.health import (
     ProviderHealthState,
 )
 from nygen_router.metrics import MetricsEvent
-from nygen_router.policies import Policy, RoundRobinPolicy
+from nygen_router.policies import Policy, RoundRobinPolicy, RoutingContext
 from nygen_router.storage.base import MetricsStore
 from nygen_router.storage.duckdb import DuckDBMetricsStore
 from nygen_router.types import CallVariant, ProviderAttempt
@@ -183,7 +183,8 @@ class ProviderRouter:
             raise NoEligibleProvidersError(excluded)
 
         attempts: list[ProviderAttempt] = []
-        ordered = list(self._policy.order(eligible))
+        context = RoutingContext(metrics_store=self._metrics_store)
+        ordered = list(self._policy.order(eligible, context))
         for index, provider in enumerate(ordered):
             variant = variants_by_protocol[provider.protocol]
             arguments = self._arguments_for(variant, provider)

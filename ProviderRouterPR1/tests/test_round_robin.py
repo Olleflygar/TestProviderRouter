@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from nygen_router import ApiProtocol, CallVariant, ProviderConfig, ProviderRouter, RoundRobinPolicy
+from nygen_router import (
+    ApiProtocol,
+    CallVariant,
+    ProviderConfig,
+    ProviderRouter,
+    RoundRobinPolicy,
+    RoutingContext,
+)
 
 
 def _config(name: str, *, enabled: bool = True) -> ProviderConfig:
@@ -37,7 +44,9 @@ class _EchoAdapter:
 class _ReversePolicy:
     """Attempt eligible providers in reverse order (a fake policy for injection)."""
 
-    def order(self, eligible: list[ProviderConfig]) -> list[ProviderConfig]:
+    def order(
+        self, eligible: list[ProviderConfig], context: RoutingContext
+    ) -> list[ProviderConfig]:
         return list(reversed(eligible))
 
 
@@ -79,4 +88,15 @@ def test_injected_policy_is_honored() -> None:
 
 
 def test_round_robin_order_of_empty_eligible_is_empty() -> None:
-    assert RoundRobinPolicy().order([]) == []
+    context = RoutingContext(metrics_store=None)
+
+    assert RoundRobinPolicy().order([], context) == []
+
+
+def test_round_robin_accepts_context_without_changing_rotation() -> None:
+    providers = [_config("provider_a"), _config("provider_b"), _config("provider_c")]
+    context = RoutingContext(metrics_store=None)
+    policy = RoundRobinPolicy()
+
+    assert policy.order(providers, context) == providers
+    assert policy.order(providers, context) == [providers[1], providers[2], providers[0]]

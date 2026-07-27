@@ -15,6 +15,7 @@ from nygen_router import (
     ProviderRouter,
     ProviderTimeoutError,
     RouterExhaustedError,
+    RoutingContext,
     UnsupportedOperationError,
 )
 
@@ -53,7 +54,9 @@ def _http(name: str, status: int) -> ProviderHTTPError:
 class _StaticPolicy:
     """Try eligible providers in config order (no rotation) for deterministic fallback tests."""
 
-    def order(self, eligible: list[ProviderConfig]) -> list[ProviderConfig]:
+    def order(
+        self, eligible: list[ProviderConfig], context: RoutingContext
+    ) -> list[ProviderConfig]:
         return list(eligible)
 
 

@@ -16,6 +16,7 @@ from nygen_router import (
     ProviderRouter,
     ProviderTimeoutError,
     RouterExhaustedError,
+    RoutingContext,
 )
 
 
@@ -88,7 +89,9 @@ class _ScriptedAdapter:
 class _StaticPolicy:
     """Try eligible providers in config order (no rotation) for deterministic tests."""
 
-    def order(self, eligible: list[ProviderConfig]) -> list[ProviderConfig]:
+    def order(
+        self, eligible: list[ProviderConfig], context: RoutingContext
+    ) -> list[ProviderConfig]:
         return list(eligible)
 
 

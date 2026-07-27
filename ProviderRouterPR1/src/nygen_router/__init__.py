@@ -24,7 +24,7 @@ from nygen_router.errors import (
 from nygen_router.filters import filter_eligible_providers
 from nygen_router.health import HealthConfig, ProviderHealthReport
 from nygen_router.metrics import MetricsEvent
-from nygen_router.policies import RoundRobinPolicy
+from nygen_router.policies import Policy, RoundRobinPolicy, RoutingContext, ScoreBasedPolicy
 from nygen_router.router import ProviderRouter, StreamFailurePolicy, StreamRestart
 from nygen_router.scoring import ProviderScore, ScoreWeights, calculate_provider_score
 from nygen_router.stats import ProviderStats, aggregate_stats
@@ -54,6 +54,7 @@ __all__ = [
     "NoProvidersConfiguredError",
     "NormalizedStream",
     "NygenRouterError",
+    "Policy",
     "ProviderAttempt",
     "ProviderCapabilities",
     "ProviderConfig",
@@ -68,7 +69,9 @@ __all__ = [
     "ProviderStreamInterruptedError",
     "ProviderTimeoutError",
     "RoundRobinPolicy",
+    "RoutingContext",
     "RouterExhaustedError",
+    "ScoreBasedPolicy",
     "ScoreWeights",
     "SQLiteMetricsStore",
     "StreamFailurePolicy",

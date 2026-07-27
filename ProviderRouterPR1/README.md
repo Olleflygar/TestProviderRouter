@@ -593,6 +593,49 @@ Cost is deliberately not a scoring factor. Automatic pricing is outside the
 router's core model, and manually configured cost remains the deferred,
 optional work described in PR 6.
 
+## Score-based routing
+
+`ScoreBasedPolicy` ranks every eligible provider from recent observations and
+hands the full best-first list to the router's existing fallback loop:
+
+```python
+from nygen_router import ProviderRouter, ScoreBasedPolicy, ScoreWeights
+
+policy = ScoreBasedPolicy(
+    weights=ScoreWeights(success_weight=2.0, speed_weight=1.0),
+    lookback_hours=336.0,
+    use_streaming=False,
+)
+router = ProviderRouter(providers=[...], policy=policy)
+```
+
+Its constructor settings are:
+
+- `weights=None`: use the default `ScoreWeights`.
+- `lookback_hours=336.0`: query the latest 336 hours, which is 14 days, and
+  count every event in that window equally.
+- `use_streaming=False`: score regular-call history. Set it to `True` to score
+  streaming success and TTFT instead.
+- `tie_break_policy=None`: use an internal `RoundRobinPolicy`.
+- `now=...`: wall-clock seam for deterministic testing; normal applications
+  use its UTC default.
+
+The tie-break policy is applied first, then a stable score sort preserves that
+order wherever scores are equal. With the default, equal-scoring providers
+therefore rotate through round robin instead of one permanently winning every
+tie. The same order is returned unchanged when metrics are disabled, the store
+cannot be queried, or history produces equal scores. A metrics failure logs a
+warning and routing continues through round robin; it never breaks an LLM
+call.
+
+`use_streaming` is chosen once when the policy is constructed. The router does
+not inspect a call's provider-specific arguments to guess its type before
+routing, so one policy instance always scores either regular history or
+streaming history regardless of the individual call. A workload that mixes
+both call types needs two policy instances selected by the caller, or must
+accept that whichever type is not configured will be ranked using the other
+type's history.
+
 ### Provider names must be unique
 
 `ProviderRouter` rejects two configured providers sharing a `name`, raising

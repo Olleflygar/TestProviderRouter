@@ -198,6 +198,32 @@ explainable `ProviderScore`:
 - Keep this module independent of adapters, storage, providers, and I/O. It
   operates only on the values passed to it.
 
+## Score-based routing (PR9)
+
+The `Policy` protocol is now
+`order(eligible: list[ProviderConfig], context: RoutingContext)`. The router
+builds a fresh frozen context per `invoke()` from its own metrics store; custom
+policies must accept that second argument. `RoundRobinPolicy` accepts and
+ignores it.
+
+`ScoreBasedPolicy` connects PR7 aggregation to PR8 scoring:
+
+- Call its tie-break policy exactly once on a copy of the eligible list before
+  reading history. This is both the stable tie order and the graceful fallback
+  order.
+- Query the context's metrics store from `now - lookback_hours` on every call,
+  aggregate only the rotated providers, calculate their selected call-type
+  scores, and use one stable descending sort. Do not cache scores or add
+  tie-grouping logic.
+- If metrics are disabled, the eligible list is empty, or the history query
+  fails, return the tie-break order unchanged. Query failures warn once per
+  policy instance and log repeats at DEBUG.
+- `use_streaming` is fixed at policy construction and never inferred from
+  `CallVariant.arguments`. A policy instance scores one call type for its
+  entire lifetime.
+- PR10 owns decay. PR9's lookback window is flat and must not pass a
+  `weight_fn` to aggregation.
+
 ## Provider health (PR5)
 
 `ProviderRouter` benches temporarily-bad providers so they stop being called,
