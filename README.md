@@ -94,25 +94,25 @@ router = ProviderRouter(
     metrics_store=metrics,
 )
 
-
-def ask(prompt: str) -> str:
+try:
     response = router.invoke(
         [
             CallVariant(
                 protocol=ApiProtocol.OPENAI_CHAT,
                 operation="chat.completions.create",
                 arguments={
-                    "messages": [{"role": "user", "content": prompt}],
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Write a short product description.",
+                        }
+                    ],
                     "stream": False,
                 },
             )
         ]
     )
-    return response.choices[0].message.content or ""
-
-
-try:
-    print(ask("Write a short product description."))
+    print(response.choices[0].message.content)
 finally:
     metrics.close()
 ```
@@ -121,10 +121,6 @@ finally:
 the model configured for whichever provider it selects. API keys can also be
 passed directly to `ProviderConfig`, but environment-variable names keep secrets
 out of source code.
-
-The `ask()` function is also a small integration boundary. Framework code can
-depend on that function without pretending Nygen Router ships a framework-specific
-model adapter.
 
 ## LangChain
 
@@ -142,7 +138,21 @@ prompt = PromptTemplate.from_template(
 
 
 def call_router(prompt_value) -> str:
-    return ask(prompt_value.to_string())
+    response = router.invoke(
+        [
+            CallVariant(
+                protocol=ApiProtocol.OPENAI_CHAT,
+                operation="chat.completions.create",
+                arguments={
+                    "messages": [
+                        {"role": "user", "content": prompt_value.to_string()}
+                    ],
+                    "stream": False,
+                },
+            )
+        ]
+    )
+    return response.choices[0].message.content or ""
 
 
 workflow = prompt | RunnableLambda(call_router)
@@ -170,11 +180,28 @@ class ProductDescription(BaseModel):
 
 
 schema = json.dumps(ProductDescription.model_json_schema())
-text = ask(
-    "Write a short product description for wireless headphones. "
-    f"Return only valid JSON matching this schema: {schema}"
+response = router.invoke(
+    [
+        CallVariant(
+            protocol=ApiProtocol.OPENAI_CHAT,
+            operation="chat.completions.create",
+            arguments={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Write a short product description for wireless headphones. "
+                            f"Return only valid JSON matching this schema: {schema}"
+                        ),
+                    }
+                ],
+                "stream": False,
+            },
+        )
+    ]
 )
-result = ProductDescription.model_validate_json(text)
+content = response.choices[0].message.content or ""
+result = ProductDescription.model_validate_json(content)
 
 print(result.description)
 ```
