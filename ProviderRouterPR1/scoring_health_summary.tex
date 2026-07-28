@@ -1,0 +1,177 @@
+\documentclass[10pt,a4paper]{article}
+
+\usepackage[margin=1.25cm]{geometry}
+\usepackage{amsmath,amssymb,booktabs,multicol}
+\usepackage{enumitem}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{2.5pt}
+\setlength{\columnsep}{0.55cm}
+\setlist[itemize]{leftmargin=*,nosep}
+\pagestyle{empty}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\qualitysuccess}{q_{\mathrm{success}}}
+\newcommand{\qualityspeed}{q_{\mathrm{speed}}}
+
+\begin{document}
+
+\begin{center}
+    {\Large\bfseries ProviderRouterPR1: Scoring and Health Mechanisms}\\[-1pt]
+    {\small Concise summary of the currently implemented behaviour}
+\end{center}
+
+\vspace{-2pt}
+\fbox{\parbox{0.975\linewidth}{\centering\small
+Configured providers
+$\rightarrow$ \textbf{hard eligibility and health filter}
+$\rightarrow$ tie-break order
+$\rightarrow$ recent metrics
+$\rightarrow$ \textbf{score and stable sort}
+$\rightarrow$ best-first attempts with fallback.
+\quad Observed outcomes feed persistent metrics; provider-attributable outcomes
+also update in-memory health.
+}}
+
+\vspace{3pt}
+\begin{multicols}{2}
+\small
+
+\textbf{Scoring evidence.}
+The router attempts to persist one \code{MetricsEvent} per observed provider
+outcome; excluded providers produce none. An early-closed stream with no observed
+outcome is deliberately not recorded. Aggregation is per provider and keeps
+regular and streaming calls separate:
+regular latency is time to the complete response, whereas streaming latency is
+time to first chunk (TTFT). For the selected bucket, let $w_i$ be an event weight,
+$y_i\in\{0,1\}$ its success indicator, and $\ell_i$ its latency:
+\[
+ A=\sum_i w_i,\qquad S=\sum_iw_i y_i,\qquad r=\frac{S}{A}\ (A>0),
+\quad
+\bar{\ell}=
+\frac{\sum_{i\in L}w_i\ell_i}{\sum_{i\in L}w_i},
+\]
+where $L$ contains only successful events with a recorded latency. Failed
+latencies are deliberately ignored: otherwise a provider that fails quickly
+could appear fast. A missing rate or latency is represented by \code{None},
+never by zero.
+
+By default, events in the latest 336 hours have $w_i=1$. With a positive
+half-life $h$, this window is replaced by the latest $6h$ and
+\[
+ w_i=2^{-a_i/h},
+\]
+where $a_i$ is event age in hours. Decay changes scoring evidence but not exact
+diagnostic error, rate-limit, or timeout counts.
+
+\textbf{Score calculation.}
+The raw speed quality is a bounded inverse-latency curve
+\[
+ q_{\mathrm{raw}}=\frac{R}{R+\bar{\ell}},
+\]
+with $R=2000$\,ms for regular calls and $R=500$\,ms for streaming TTFT.
+Thus latency $R$ maps to $0.5$. If no latency exists, $q_{\mathrm{raw}}=0$.
+
+Both observed qualities are shrunk toward an optimistic prior $q_0$:
+\[
+ \qualitysuccess=\frac{n_0q_0+Ar}{n_0+A},
+ \qquad
+ \qualityspeed=\frac{n_0q_0+S q_{\mathrm{raw}}}{n_0+S}.
+\]
+Defaults are $q_0=0.75$ and $n_0=5$ pretend attempts. Consequently, a new
+provider scores exactly $0.75$; sparse observations move it gradually, while
+deep history dominates the prior. This supplies exploration without a separate,
+stateful exploration bonus.
+
+The final score is the normalized weighted average
+\[
+ Q=\frac{\alpha\qualitysuccess+\beta\qualityspeed}{\alpha+\beta},
+\qquad \alpha,\beta\geq0,\quad \alpha+\beta>0,
+\]
+with $\alpha=\beta=1$ by default. Normalization keeps $Q\in[0,1]$ and makes the
+weights relative rather than scale-dependent. Error counts are not separate
+factors: failures already reduce $r$, so another penalty would double-count
+them. Cost is not currently scored.
+
+\textbf{Ordering and failure behaviour.}
+\code{ScoreBasedPolicy} receives only eligible providers. It first invokes one
+tie-break policy (round robin by default), then queries and scores history on
+every call and applies one stable descending sort. Equal scores retain the
+round-robin order. The full order is handed to fallback, so failure of the
+highest-ranked provider tries the next one. With disabled metrics, no eligible
+providers, or a failed history query, routing safely returns the tie-break order;
+scores are neither cached nor allowed to break an LLM call.
+
+\columnbreak
+
+\textbf{Health is a hard gate, not a score.}
+Health answers ``may this provider be tried now?'', while scoring answers ``which
+eligible provider should be tried first?'' A benched provider is excluded before
+the policy runs rather than assigned an arbitrary numerical penalty. This avoids
+mixing operational safety with performance preference and lets any routing
+policy reuse the same health state.
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.28\columnwidth}p{0.65\columnwidth}@{}}
+\toprule
+\textbf{Failure} & \textbf{Implemented transition}\\
+\midrule
+HTTP 401/403 &
+Disable provider until explicit reset or destruction of the router instance.\\
+HTTP 429 &
+Immediate cooldown (default 60\,s); do not change the consecutive-failure count.\\
+Timeout/408, connection, ${\geq}500$, interrupted stream, unknown &
+Increment consecutive failures; at the default threshold of 3, start a
+60\,s cooldown.\\
+HTTP 400/422 or invalid operation/arguments &
+Stop the call because another provider using the same request would not help;
+do not blame or bench the provider.\\
+Success &
+Clear failure count, cooldown, trigger, and last error; an authentication bench
+remains until explicitly reset.\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Cooldowns use a monotonic clock. Expiry restores eligibility but deliberately
+does not erase the failure count; a failed probe can therefore re-bench the
+provider immediately. \code{reset\_health()} restores eligibility but never
+deletes metrics. This separates short-lived, process-local protection from
+longer-lived performance evidence. A bench created during a fallback sequence
+affects the next invocation because the current best-first list has already
+been fixed.
+
+\textbf{Important architectural choices.}
+\begin{itemize}
+    \item Aggregation and scoring are pure Python functions, independent of
+    adapters and storage backends; the policy only composes them.
+    \item Successful latency alone represents speed; every attempt represents
+    reliability. Regular and streaming evidence is never blended.
+    \item \code{use\_streaming} is fixed when constructing the policy, not inferred
+    from opaque provider arguments. Mixed workloads therefore require separate
+    policy instances or an explicit choice of which history to use.
+    \item Provider names are metric and health identity keys. Names must be
+    unique, and renaming a provider intentionally starts a new effective history.
+    \item Metric writes and reads are best-effort. Storage failure may reduce
+    future evidence, but never replaces a successful model response.
+\end{itemize}
+
+\textbf{Short planned extensions.}
+\begin{itemize}
+    \item Optional user-configured token-cost calculation; cost is deliberately
+    outside the current core score.
+    \item Pre-flight capability filtering inferred from call arguments; currently
+    unsupported capabilities fail during the provider call.
+\end{itemize}
+
+\textbf{Implementation basis.}
+\code{scoring.py}, \code{stats.py}, \code{policies/score\_based.py},
+\code{health.py}, \code{filters.py}, \code{metrics.py}, and \code{router.py}.
+
+\end{multicols}
+\end{document}
