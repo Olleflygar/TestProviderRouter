@@ -27,6 +27,7 @@ Configure `Fireworks_API_KEY` and `Together_API_KEY` in the repository-root
 ```bash
 python WorkflowTests/langchain/workflow.py
 python WorkflowTests/pydantic/workflow.py
+python WorkflowTests/pydantic/CompactWorkflow.py
 ```
 
 Both accept a simple custom topic:
@@ -68,3 +69,9 @@ LangChain chat model.
 The Pydantic script uses ordinary Pydantic models rather than Pydantic AI. It
 validates structured JSON between model steps. A validation failure gets one
 correction call, after which the script stops with a clear error.
+
+`pydantic/CompactWorkflow.py` is the minimal integration example. Its two-step
+workflow depends only on a small `TextModel` protocol, while `RouterTextModel`
+adapts `ProviderRouter` to that interface. Replacing the model object does not
+change the workflow. It uses the shared DuckDB and score-based routing but
+omits calibration, retries, and diagnostic output.

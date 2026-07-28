@@ -23,6 +23,7 @@ from nygen_router import (  # noqa: E402
     CallVariant,
     DuckDBMetricsStore,
     MetricsEvent,
+    MissingApiKeyError,
     ProviderConfig,
     ProviderRouter,
     RoundRobinPolicy,
@@ -66,7 +67,7 @@ def parse_options(description: str) -> WorkflowOptions:
 
 def load_project_environment() -> None:
     """Load the same project-root .env file as the existing usage scripts."""
-    load_dotenv(PROJECT_ROOT / ".env")
+    load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 
 def provider_configs() -> list[ProviderConfig]:
@@ -95,7 +96,7 @@ def require_api_keys(providers: list[ProviderConfig]) -> None:
     for provider in providers:
         try:
             provider.resolve_api_key()
-        except Exception as exc:
+        except MissingApiKeyError as exc:
             errors.append(str(exc))
     if errors:
         raise RuntimeError("Provider API key configuration is incomplete:\n- " + "\n- ".join(errors))
