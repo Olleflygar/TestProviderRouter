@@ -2072,3 +2072,65 @@ This must always work without optional provider dependencies:
 from nygen_router import ProviderRouter
 
 If this import fails because Anthropic, OpenAI SDK, LangChain, Pydantic AI, DuckDB, Supabase, Logfire, or OpenTelemetry is not installed, the implementation is wrong.
+
+
+Draft/old onboarding example:
+### Before: using one LLM provider directly
+
+```python
+from some_ai_framework import LLM
+
+llm = LLM(
+    model="some-model",
+    base_url="https://provider-a.example.com/v1",
+    api_key_env="PROVIDER_A_API_KEY",
+)
+
+response = llm.invoke("Write a short product description.")
+
+print(response.text)
+```
+
+### After: using Nygen Router
+
+```python
+from nygen_router import ProviderRouter
+
+router = ProviderRouter(...)
+
+response = router.invoke("Write a short product description.")
+
+print(response.text)
+```
+
+The application still calls `.invoke(...)` in the same way. The difference is that the single hard-coded LLM provider is replaced by Nygen Router, which can choose between configured providers based on eligibility, recent performance, latency, cost, and other application-specific metrics.
+
+## Plain Python
+
+Use the router directly when you are calling model APIs yourself.
+
+```python
+from nygen_router import ProviderRouter, ProviderConfig, ApiProtocol
+
+router = ProviderRouter(
+    providers=[
+        ProviderConfig(
+            name="provider_a",
+            protocol=ApiProtocol.OPENAI_CHAT,
+            model="some-model",
+            base_url="https://provider-a.example.com/v1",
+            api_key_env="PROVIDER_A_API_KEY",
+        ),
+        ProviderConfig(
+            name="provider_b",
+            protocol=ApiProtocol.OPENAI_CHAT,
+            model="some-model",
+            base_url="https://provider-b.example.com/v1",
+            api_key_env="PROVIDER_B_API_KEY",
+        ),
+    ]
+)
+
+response = router.invoke("Write a short product description.")
+
+print(response.text)

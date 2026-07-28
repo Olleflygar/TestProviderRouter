@@ -1,171 +1,202 @@
-## Onboarding: replace the LLM object with Nygen Router
+# Nygen Router
 
-Without Nygen Router, an application usually calls one provider directly. Nygen Router is designed to replace the LLM or model object in your existing workflow.
+Nygen Router routes one native LLM call across multiple providers that can serve
+the same model. Your application keeps the provider SDK's request shape and
+response type; the router selects the provider, falls back when appropriate,
+and records runtime observations for later routing decisions.
 
-### Before: using one LLM provider directly
+## Onboarding: route the model call
+
+Without Nygen Router, an application sends every request to one configured
+provider.
+
+### Before: calling one provider directly
 
 ```python
-from some_ai_framework import LLM
+import os
 
-llm = LLM(
-    model="some-model",
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.environ["PROVIDER_A_API_KEY"],
     base_url="https://provider-a.example.com/v1",
-    api_key_env="PROVIDER_A_API_KEY",
 )
 
-response = llm.invoke("Write a short product description.")
+response = client.chat.completions.create(
+    model="provider-a/model-name",
+    messages=[{"role": "user", "content": "Write a short product description."}],
+)
 
-print(response.text)
+print(response.choices[0].message.content)
 ```
 
-### After: using Nygen Router
+### After: calling through Nygen Router
 
 ```python
-from nygen_router import ProviderRouter
+response = router.invoke(
+    [
+        CallVariant(
+            protocol=ApiProtocol.OPENAI_CHAT,
+            operation="chat.completions.create",
+            arguments={
+                "messages": [
+                    {"role": "user", "content": "Write a short product description."}
+                ]
+            },
+        )
+    ]
+)
 
-router = ProviderRouter(...)
-
-response = router.invoke("Write a short product description.")
-
-print(response.text)
+print(response.choices[0].message.content)
 ```
 
-The application still calls `.invoke(...)` in the same way. The difference is that the single hard-coded LLM provider is replaced by Nygen Router, which can choose between configured providers based on eligibility, recent performance, latency, cost, and other application-specific metrics.
+The call remains native to the provider SDK. The difference is that Nygen Router
+chooses an eligible provider and injects that provider's configured model. The
+winning provider's original SDK response is returned unchanged.
 
-## Plain Python
+## Minimal router setup
 
-Use the router directly when you are calling model APIs yourself.
+Configure equivalent models available through two OpenAI-compatible provider
+endpoints. `ScoreBasedPolicy` ranks them using recent success and latency
+observations stored in DuckDB. With no history, its round-robin tie breaker gives
+each provider a chance to collect observations.
 
 ```python
-from nygen_router import ProviderRouter, ProviderConfig, ApiProtocol
+from nygen_router import (
+    ApiProtocol,
+    CallVariant,
+    DuckDBMetricsStore,
+    ProviderConfig,
+    ProviderRouter,
+    ScoreBasedPolicy,
+)
+
+metrics = DuckDBMetricsStore("router_metrics.duckdb")
 
 router = ProviderRouter(
     providers=[
         ProviderConfig(
             name="provider_a",
             protocol=ApiProtocol.OPENAI_CHAT,
-            model="some-model",
+            model="provider-a/model-name",
             base_url="https://provider-a.example.com/v1",
             api_key_env="PROVIDER_A_API_KEY",
         ),
         ProviderConfig(
             name="provider_b",
             protocol=ApiProtocol.OPENAI_CHAT,
-            model="some-model",
+            model="provider-b/model-name",
             base_url="https://provider-b.example.com/v1",
             api_key_env="PROVIDER_B_API_KEY",
         ),
-    ]
+    ],
+    policy=ScoreBasedPolicy(use_streaming=False),
+    metrics_store=metrics,
 )
 
-response = router.invoke("Write a short product description.")
 
-print(response.text)
+def ask(prompt: str) -> str:
+    response = router.invoke(
+        [
+            CallVariant(
+                protocol=ApiProtocol.OPENAI_CHAT,
+                operation="chat.completions.create",
+                arguments={
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                },
+            )
+        ]
+    )
+    return response.choices[0].message.content or ""
+
+
+try:
+    print(ask("Write a short product description."))
+finally:
+    metrics.close()
 ```
 
-The application keeps one model-call interface, while Nygen Router decides which configured provider should handle the request.
+`model` is deliberately absent from `CallVariant.arguments`: the router inserts
+the model configured for whichever provider it selects. API keys can also be
+passed directly to `ProviderConfig`, but environment-variable names keep secrets
+out of source code.
 
----
+The `ask()` function is also a small integration boundary. Framework code can
+depend on that function without pretending Nygen Router ships a framework-specific
+model adapter.
 
 ## LangChain
 
-Use the LangChain adapter anywhere you would normally pass a chat model.
+LangChain can call the same router explicitly through a `RunnableLambda`. The
+router is responsible only for the model call; LangChain still owns prompt and
+workflow composition.
 
 ```python
-from nygen_router import ProviderRouter, ProviderConfig, ApiProtocol
-from nygen_router.integrations.langchain import ChatNygenRouter
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnableLambda
 
-router = ProviderRouter(
-    providers=[
-        ProviderConfig(
-            name="provider_a",
-            protocol=ApiProtocol.OPENAI_CHAT,
-            model="some-model",
-            base_url="https://provider-a.example.com/v1",
-            api_key_env="PROVIDER_A_API_KEY",
-        ),
-        ProviderConfig(
-            name="provider_b",
-            protocol=ApiProtocol.OPENAI_CHAT,
-            model="some-model",
-            base_url="https://provider-b.example.com/v1",
-            api_key_env="PROVIDER_B_API_KEY",
-        ),
-    ]
+prompt = PromptTemplate.from_template(
+    "Write a short product description for {product}."
 )
 
-llm = ChatNygenRouter(router)
 
-response = llm.invoke("Write a short product description.")
+def call_router(prompt_value) -> str:
+    return ask(prompt_value.to_string())
 
-print(response.content)
+
+workflow = prompt | RunnableLambda(call_router)
+result = workflow.invoke({"product": "wireless headphones"})
+
+print(result)
 ```
 
-For existing LangChain workflows, the rest of the chain can stay the same.
+This is ordinary LangChain composition around an explicit `ProviderRouter`
+call. It does not rely on a Nygen Router LangChain adapter.
+
+## Pydantic
+
+Ordinary Pydantic models can validate structured text returned through the same
+router boundary.
 
 ```python
-chain = prompt | llm | parser
+import json
 
-result = chain.invoke({
-    "product": "wireless headphones"
-})
+from pydantic import BaseModel, Field
+
+
+class ProductDescription(BaseModel):
+    description: str = Field(min_length=1, max_length=300)
+
+
+schema = json.dumps(ProductDescription.model_json_schema())
+text = ask(
+    "Write a short product description for wireless headphones. "
+    f"Return only valid JSON matching this schema: {schema}"
+)
+result = ProductDescription.model_validate_json(text)
+
+print(result.description)
 ```
 
----
-
-## CrewAI
-
-Use the CrewAI adapter as the LLM for an agent.
-
-```python
-from crewai import Agent
-from nygen_router import ProviderRouter, ProviderConfig, ApiProtocol
-from nygen_router.integrations.crewai import NygenCrewAILLM
-
-router = ProviderRouter(
-    providers=[
-        ProviderConfig(
-            name="provider_a",
-            protocol=ApiProtocol.OPENAI_CHAT,
-            model="some-model",
-            base_url="https://provider-a.example.com/v1",
-            api_key_env="PROVIDER_A_API_KEY",
-        ),
-        ProviderConfig(
-            name="provider_b",
-            protocol=ApiProtocol.OPENAI_CHAT,
-            model="some-model",
-            base_url="https://provider-b.example.com/v1",
-            api_key_env="PROVIDER_B_API_KEY",
-        ),
-    ]
-)
-
-llm = NygenCrewAILLM(router)
-
-researcher = Agent(
-    role="Researcher",
-    goal="Find concise and accurate information",
-    backstory="You are a careful research assistant.",
-    llm=llm,
-)
-```
-
-The CrewAI agent, tasks, tools, and orchestration stay the same. Nygen Router only handles provider selection for the model calls.
-
----
+Pydantic validates the result after the provider call. This example uses no
+Pydantic AI integration or router-specific Pydantic adapter.
 
 ## Runtime provider selection
 
-For each request, Nygen Router can:
+For each call, Nygen Router:
 
 ```text
-1. Check which providers are eligible.
-2. Filter providers by required capabilities, such as tool calling or streaming.
-3. Score the remaining providers using application-specific rules.
-4. Send the request to the selected provider.
-5. Record runtime metrics such as latency, cost, errors, and provider health.
-6. Use recent performance data to improve future routing decisions.
+1. Excludes disabled, unavailable, unsupported, or temporarily benched providers.
+2. Orders eligible providers using the configured policy.
+3. Sends the matching native CallVariant with the selected provider's model.
+4. Falls back on retryable provider failures while eligible alternatives remain.
+5. Records success, latency, errors, and stream timing in the configured metrics store.
+6. Uses that recent history to improve later choices when ScoreBasedPolicy is enabled.
 ```
 
-This means routing is based on how providers perform inside your application, not only on static benchmarks.
+Capability inference, cost-aware routing, built-in adapters for additional
+provider protocols, and framework-specific adapters are not part of the current
+shipped implementation. The examples above show the integration surface
+available today: workflows keep their own structure and delegate only the
+provider call to Nygen Router.

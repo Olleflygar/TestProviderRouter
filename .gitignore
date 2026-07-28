@@ -11,3 +11,5 @@ venv/
 htmlcov/
 WorkflowTests/*.duckdb
 WorkflowTests/*.duckdb.wal
+
+CODEBASE_AUDIT.md
