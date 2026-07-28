@@ -94,27 +94,23 @@ router = ProviderRouter(
     metrics_store=metrics,
 )
 
-try:
+def call_router(prompt: str) -> str:
     response = router.invoke(
         [
             CallVariant(
                 protocol=ApiProtocol.OPENAI_CHAT,
                 operation="chat.completions.create",
                 arguments={
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": "Write a short product description.",
-                        }
-                    ],
+                    "messages": [{"role": "user", "content": prompt}],
                     "stream": False,
                 },
             )
         ]
     )
-    print(response.choices[0].message.content)
-finally:
-    metrics.close()
+    return response.choices[0].message.content or ""
+
+
+print(call_router("Write a short product description."))
 ```
 
 `model` is deliberately absent from `CallVariant.arguments`: the router inserts
@@ -136,26 +132,9 @@ prompt = PromptTemplate.from_template(
     "Write a short product description for {product}."
 )
 
-
-def call_router(prompt_value) -> str:
-    response = router.invoke(
-        [
-            CallVariant(
-                protocol=ApiProtocol.OPENAI_CHAT,
-                operation="chat.completions.create",
-                arguments={
-                    "messages": [
-                        {"role": "user", "content": prompt_value.to_string()}
-                    ],
-                    "stream": False,
-                },
-            )
-        ]
-    )
-    return response.choices[0].message.content or ""
-
-
-workflow = prompt | RunnableLambda(call_router)
+workflow = prompt | RunnableLambda(
+    lambda prompt_value: call_router(prompt_value.to_string())
+)
 result = workflow.invoke({"product": "wireless headphones"})
 
 print(result)
@@ -180,34 +159,18 @@ class ProductDescription(BaseModel):
 
 
 schema = json.dumps(ProductDescription.model_json_schema())
-response = router.invoke(
-    [
-        CallVariant(
-            protocol=ApiProtocol.OPENAI_CHAT,
-            operation="chat.completions.create",
-            arguments={
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": (
-                            "Write a short product description for wireless headphones. "
-                            f"Return only valid JSON matching this schema: {schema}"
-                        ),
-                    }
-                ],
-                "stream": False,
-            },
-        )
-    ]
+text = call_router(
+    "Write a short product description for wireless headphones. "
+    f"Return only valid JSON matching this schema: {schema}"
 )
-content = response.choices[0].message.content or ""
-result = ProductDescription.model_validate_json(content)
+result = ProductDescription.model_validate_json(text)
 
 print(result.description)
 ```
 
 Pydantic validates the result after the provider call. This example uses no
-Pydantic AI integration or router-specific Pydantic adapter.
+Pydantic AI integration or router-specific Pydantic adapter. Close the shared
+DuckDB store with `metrics.close()` when the application shuts down.
 
 ## Runtime provider selection
 
