@@ -1,0 +1,562 @@
+You are implementing PR12 in the current `nygen-router` repository. Complete the
+work end to end, including implementation, tests, documentation synchronization,
+validation, Git commits, and the required local tags. Do not push commits or tags.
+
+Repository root:
+
+`/Users/olleflygar/Developer/TestProviderRouter`
+
+Package root:
+
+`/Users/olleflygar/Developer/TestProviderRouter/ProviderRouter`
+
+## Outcome
+
+Add first-class support for routed OpenAI Responses API model-execution calls,
+with feature parity with the shipped OpenAI Chat Completions SDK adapter wherever
+the Responses API has equivalent behavior.
+
+The supported and documented Responses operation is synchronous and streaming
+`responses.create`. Preserve native OpenAI SDK arguments, response objects, and
+streaming event objects. Do not turn the router into a generalized LLM schema or
+a provider-resource management proxy.
+
+Use the existing OpenAI Chat Completions SDK adapter as the primary reference:
+
+- `ProviderRouter/src/nygen_router/adapters/openai_compatible.py`
+- `ProviderRouter/src/nygen_router/adapters/base.py`
+- `ProviderRouter/src/nygen_router/router.py`
+- `ProviderRouter/src/nygen_router/errors.py`
+- `ProviderRouter/tests/test_openai_compatible_adapter.py`
+- `ProviderRouter/tests/test_router_stream.py`
+- `ProviderRouter/tests/test_fallback.py`
+
+Treat current source and tests as the primary description of shipped behavior,
+then `Projectplan/Newprojectplan.md` as the current roadmap, and
+`Projectplan/OldProjectPlan.md` as historical rationale.
+
+## Non-negotiable repository rules
+
+Read and follow, in full, before changing anything:
+
+- `AGENTS.md`
+- `ProviderRouter/AGENTS.md`
+- any more-local `AGENTS.md` that exists in a directory you touch
+
+In particular:
+
+- Do not monkeypatch internal collaborators in tests. Do not use
+  `monkeypatch.setattr(...)` or `unittest.mock.patch(...)` to replace objects a
+  module references internally. Use public constructor/factory/protocol seams.
+  Environment-variable monkeypatching remains allowed.
+- Do not delete existing tests. Update an existing assertion only where PR12
+  deliberately changes that exact behavior, and add new test files alongside
+  existing regression coverage.
+- Keep `from nygen_router import ProviderRouter` lightweight.
+- Do not import `openai`, `httpx`, Pydantic AI, or any other provider/framework
+  SDK at module import time. Provider SDK imports must remain lazy inside the
+  method bodies that need them. `router.py` must stay entirely SDK-free.
+- Pydantic remains the only core runtime dependency. The existing `openai`
+  package remains an optional extra. Do not add `pydantic-ai`.
+- Do not leak API keys in errors, logs, responses, fixtures, or snapshots.
+- Preserve the native pass-through design: the router chooses a provider; it
+  does not translate provider request or response schemas.
+- Avoid unrelated refactoring and unrelated roadmap work, including PR21
+  capability inference, PR22 general pre-flight dispatch validation, PR24
+  framework-neutral usage instrumentation, PR26 sticky routing, and any
+  response-ID affinity system.
+
+## Git safety and required tags
+
+Perform read-only inspection first. Before editing:
+
+1. Inspect `git status --short --branch`, the current HEAD, existing tags, and
+   the relevant recent history.
+2. Preserve all user-owned or unrelated changes. A local tag cannot capture
+   uncommitted state, so if the worktree is not clean, do not silently absorb,
+   discard, overwrite, or commit unrelated changes. Resolve the baseline with
+   the user before proceeding.
+3. Confirm that neither `pr12-start` nor `pr12-complete` already exists. Never
+   move, delete, or force-replace an existing tag without explicit permission.
+4. Immediately before the first PR12-related file change, create the local tag:
+
+   `git tag pr12-start`
+
+The start tag must identify the exact clean pre-implementation commit.
+
+Create sensible local commit(s) for the completed PR12 work so that the final tag
+actually contains the implementation. Do not place `pr12-complete` on a commit
+that omits uncommitted PR12 changes.
+
+Create `pr12-complete` only after every implementation, test, documentation, and
+validation criterion below is satisfied and the final PR12 state is committed:
+
+`git tag pr12-complete`
+
+Leave both tags and all commits local and ready to push. Do not push anything.
+
+## Shipped Chat adapter behavior that PR12 must match
+
+Before implementing, inspect the current files and Git history rather than
+assuming this summary is exhaustive. Preserve these established behaviors:
+
+- The OpenAI SDK is lazily imported.
+- `openai.OpenAI` receives the configured API key, base URL, timeout, an
+  injectable `http_client`, and `max_retries=0`; cross-provider fallback is the
+  router's retry mechanism.
+- The router chooses the matching `CallVariant` by protocol, copies its opaque
+  arguments, and injects the selected provider's model without mutating the
+  original variant.
+- Dotted SDK operation dispatch is resolved dynamically with `getattr`.
+- Invalid operation paths and incompatible keyword arguments become transparent
+  router errors with their original `AttributeError` or `TypeError` chained.
+- SDK timeouts, connections, HTTP statuses, and other SDK errors map onto the
+  router error hierarchy without losing provider messages, structured fields,
+  response bodies, or original exceptions.
+- Non-streaming success returns the real typed SDK response untouched.
+- SDK streams are wrapped behind `NormalizedStream`; yielded SDK objects remain
+  unchanged and unbuffered.
+- Stream wrappers observe completion markers and usage, map mid-iteration
+  transport/SDK failures, and propagate `close()`.
+- `RouterStream` owns stream fallback, restart visibility, metrics, health,
+  time-to-first-chunk, total duration, empty-stream handling, silent truncation
+  detection, and close semantics.
+- A successful stream is recorded only when its outcome is known, not when it
+  merely opens.
+
+The Chat adapter arrived through the provider-native API redesign in commit
+`790a03f` and gained first-class streaming in commits `35544ef` and `3a9c587`.
+Use those changes and the current source/tests to understand the intended seams.
+
+## Implementation phase 1: Responses adapter
+
+Implement a distinct Responses adapter and Responses stream wrapper, using names
+consistent with:
+
+- `OpenAIResponsesAdapter`
+- `OpenAIResponsesStream`
+- a focused module such as
+  `ProviderRouter/src/nygen_router/adapters/openai_responses.py`
+
+Keep shared OpenAI SDK client construction, dynamic dispatch, and exception
+mapping in one implementation path. A small, scoped extraction or protected
+stream-wrapper hook in the existing adapter is acceptable when it prevents
+duplicating the Chat adapter's behavior. Do not broadly redesign or rename the
+working Chat adapter, and do not break its public or tested behavior.
+
+Required adapter behavior:
+
+1. Use the existing `openai` optional dependency and lazy imports. If the
+   minimum declared OpenAI SDK version is too old to provide `responses.create`
+   and the typed events used by the implementation, raise the existing lower
+   bound to the earliest version the implementation actually supports while
+   retaining the project's compatible upper-bound policy. Add no new runtime
+   dependency.
+2. Configure the SDK client equivalently to the Chat adapter, including the
+   public injectable HTTP-client seam used by tests and `max_retries=0`.
+3. Resolve `responses.create` through the same dotted-operation dispatch
+   convention. The guaranteed public operation surface for this PR is
+   `responses.create`.
+4. Pass `CallVariant.arguments` through unchanged except for the router's
+   established model injection. Do not translate Chat `messages` into Responses
+   `input`, invent a shared request schema, normalize tools, or reshape
+   structured-output configuration.
+5. Return a non-streaming `openai.types.responses.Response` object untouched on
+   an ordinary successful call. Native SDK conveniences such as `output_text`
+   remain available because the original object is returned.
+6. Support every native `responses.create` input that the selected installed
+   SDK/provider accepts, including text and multimodal input, instructions,
+   tools and function calls, structured output, reasoning options, continuation
+   fields, and streaming. The router must not inspect those opaque arguments.
+7. Preserve the Chat adapter's timeout, connection, HTTP, missing-SDK,
+   unsupported-operation, invalid-argument, verbatim-message, structured-field,
+   and exception-chaining behavior.
+8. Do not claim support for `responses.retrieve`, `responses.delete`,
+   `responses.cancel`, response input-item listing, or other stored-resource
+   management operations. Do not strip the router-injected model to make those
+   operations work.
+
+### Provider-owned state boundary
+
+Response IDs and conversation IDs are owned by the provider endpoint/account
+that created them. Retrieval, deletion, cancellation, and history management
+must remain the caller's responsibility through that exact provider's native
+SDK client.
+
+Fields such as `previous_response_id` or provider-owned conversation IDs may
+pass through `responses.create`, but the router does not promise that a later
+call will select the same provider. Document that stateless calls are safe
+across interchangeable providers, while stateful continuation requires the
+caller to preserve provider affinity or manage provider-owned state outside the
+router.
+
+Do not add response-ID tracking, provider-affinity persistence, lifecycle APIs,
+or sticky routing. Background `responses.create` may pass through natively, but
+PR12 does not route the later retrieve/cancel lifecycle.
+
+## Responses streaming semantics
+
+Responses streaming uses typed server-sent events, not Chat Completion chunks.
+Yield ordinary native SDK streaming events in order and unchanged. Do not
+buffer, concatenate, convert, or normalize them.
+
+The Responses stream wrapper must understand the API's terminal shapes:
+
+### `response.completed`
+
+- Recognize it as terminal success.
+- Mark the normalized stream completed.
+- Retain the terminal response's native usage object when present.
+- Yield the native event unchanged.
+
+### `response.incomplete`
+
+This is an explicit terminal, served result, not a transport failure or a
+silently truncated stream.
+
+- Recognize it as terminal and prevent stream-interruption fallback.
+- Yield/return the native event or response unchanged.
+- Retain native usage when present.
+- Do not retry, fall back, bench the provider, or synthesize
+  `ProviderStreamInterruptedError`.
+- Under the existing binary metrics contract, record the provider attempt as
+  served/successful, matching the Chat adapter's current treatment of terminal
+  finish reasons such as `length`.
+- Emit exactly one visible standard-logging `WARNING` for every incomplete
+  response, streaming and non-streaming. Include the provider name, model,
+  response ID when available, and `incomplete_details.reason`. Do not include
+  request content or secrets.
+- Current typed reasons include `max_output_tokens` and `content_filter`.
+  Preserve an unknown/future reason rather than crashing.
+- For a naturally exhausted stream, emit the warning after streamed output
+  where feasible. Correctness and exactly-once visibility take precedence over
+  an impossible guarantee about stdout/stderr display ordering. Never call
+  `print()` from library code.
+
+### `response.failed` and `error`
+
+These are provider-declared failures, not successful terminal data.
+
+- Convert them into a transparent router error that preserves the native typed
+  event, embedded response when present, provider error code, message, parameter
+  when present, provider name, and model.
+- Add a narrowly named Responses-specific `ProviderError` subclass if needed.
+  Do not invent an HTTP status for an in-stream event, and do not set a typed
+  SDK event as `.original` because it is not an exception. Expose it on a clear
+  structured attribute instead.
+- Categorize only codes whose meaning is clear:
+  rate-limit codes as `RATE_LIMIT`, explicit server failures as
+  `SERVER_ERROR`, explicit timeout codes as `TIMEOUT`, and invalid
+  prompt/input/configuration codes as `BAD_REQUEST`. Unknown or future codes
+  remain `UNKNOWN`. Preserve the exact provider code/message regardless of
+  category.
+- Apply the existing router fallback, metrics, health, and stream-restart rules
+  for the resulting category. `BAD_REQUEST` remains a global fail-fast category
+  and must not bench the provider.
+- Ensure failures raised while iterating remain within the router error
+  hierarchy and retain any real exception as `__cause__`/`.original` where an
+  exception actually exists.
+
+### Missing or unfamiliar terminal event
+
+- Any recognized Responses event establishes that the wrapper understands the
+  stream shape.
+- If a recognized Responses stream yields at least one event but ends without
+  `response.completed`, `response.incomplete`, or a declared failure/error,
+  treat it as a silently interrupted stream through the existing
+  `ProviderStreamInterruptedError` path.
+- A zero-event stream remains a failed attempt under the existing empty-stream
+  contract.
+- Preserve existing behavior for a genuinely unfamiliar shape: do not invent a
+  failure without evidence, and retain the existing deduplicated warning
+  behavior where applicable.
+- Propagate `close()` to the underlying SDK stream and preserve current
+  idempotent/context-manager semantics in `RouterStream`.
+
+Apply equivalent status handling to non-streaming `Response` objects where the
+SDK returns an explicit `completed`, `incomplete`, or `failed` status:
+completed returns raw; incomplete returns raw with the required warning; failed
+raises the transparent Responses-specific router error. Do not normalize queued
+or in-progress background responses; return them natively and document the
+provider-affinity limitation.
+
+## Router, configuration, and exports
+
+Make the Responses protocol a built-in supported protocol without coupling the
+router to the SDK:
+
+- `ApiProtocol.OPENAI_RESPONSES` already exists; retain its value.
+- Register it in the built-in `SUPPORTED_PROTOCOLS`.
+- Update the default adapter factory to return `OpenAIResponsesAdapter` for
+  `OPENAI_RESPONSES`.
+- Keep `router.py` free of `openai` and `httpx` imports.
+- Update provider validation and error wording so configuration behavior and
+  supported-protocol messages accurately cover both built-in OpenAI protocols.
+  Require `base_url` for `OPENAI_RESPONSES` providers just as the current
+  configuration requires it for `OPENAI_CHAT`, and add the corresponding
+  validation coverage.
+- Update adapter/package exports only where the current public architecture
+  expects them.
+- Do not activate `ProviderCapabilities.supports_responses_api` filtering.
+  Capabilities remain unused until PR21.
+- Preserve custom `adapter_factory` and `supported_protocols` extension seams.
+
+## Implementation phase 2: preserve and verify global fail-fast behavior
+
+The originally proposed cross-protocol fallback correction has been explicitly
+withdrawn. Do not implement protocol-scoped continuation for bad calls.
+
+The agreed reason is:
+
+> Invalid operations, incompatible arguments, missing SDKs, and HTTP 400/422
+> responses are treated as likely caller or protocol-configuration defects that
+> should surface immediately during development rather than being hidden when
+> another protocol variant succeeds. This prevents a misconfigured preferred
+> path from silently being replaced by a secondary provider in a long-running
+> workflow. These failures do not bench the provider. General pre-flight
+> validation may improve how early they are detected in PR22, but
+> cross-protocol recovery from them is intentionally out of scope.
+
+Only after the Responses adapter and its focused tests are implemented and
+passing, add/adjust regression coverage proving the existing behavior remains
+intentional and consistent.
+
+Preserve global stopping for:
+
+- `ErrorCategory.BAD_REQUEST` (currently HTTP 400/422)
+- `ErrorCategory.INVALID_OPERATION` (including unsupported operation, invalid
+  operation arguments, and missing required SDK)
+
+Verify all three router paths:
+
+1. ordinary non-streaming fallback in `ProviderRouter.invoke`;
+2. an active normalized stream failure in `RouterStream._fail`; and
+3. failure while opening a replacement stream in `RouterStream._restart`.
+
+Required regression expectations:
+
+- A stop-category failure from an OpenAI Chat variant does not try an available
+  Responses provider.
+- A stop-category failure from a Responses variant does not try an available
+  Chat provider.
+- The same behavior holds for streaming restart paths.
+- The real failure remains visible through the established direct or aggregate
+  error surface and metrics record.
+- Stop-category failures never change provider health or bench the provider.
+- `StreamFailurePolicy.RAISE` continues to prevent mid-stream regeneration.
+- Retryable failures such as timeout, connection failure, 429, auth, 5xx, and
+  unknown errors still fall back across protocols, selecting each provider's
+  matching `CallVariant`, operation, arguments, and model.
+
+Do not pull PR22 pre-flight validation into PR12.
+
+## Tests
+
+Add focused tests, preferably in new files such as:
+
+- `ProviderRouter/tests/test_openai_responses_adapter.py`
+- a focused mixed-protocol/router test file if that keeps the cases clearer
+
+Reuse the existing documented public seams. Drive SDK behavior end to end with
+`httpx.MockTransport` wrapped in an injected `httpx.Client`, as the Chat adapter
+tests do. Do not require real API keys or network access.
+
+At minimum, cover:
+
+### Adapter and non-streaming
+
+- Correct `/responses` endpoint, authorization, base URL, timeout/client
+  configuration, and `max_retries=0` behavior through observable outcomes.
+- Native request payload pass-through with the expected router-injected model.
+- Native `Response` object identity, `output_text`, output items, and usage.
+- Native tool/function-call and structured-output argument pass-through without
+  router translation; representative cases are sufficient because arguments
+  are deliberately opaque.
+- Unsupported dotted operation and incompatible arguments with original causes.
+- Missing optional SDK behavior without adding a core import dependency.
+- HTTP 401/403, 400/422, 429, 404, 5xx, timeout, connection, non-JSON body, and
+  verbatim structured error preservation, reusing shared mapping tests where
+  duplication would add no value.
+- Non-streaming completed, incomplete, failed, queued/in-progress behavior as
+  scoped above.
+- Exactly-once incomplete warning content and absence of secrets.
+
+### Responses stream wrapper
+
+- SDK stream is wrapped as `NormalizedStream`.
+- Native typed events are yielded unchanged and in order.
+- `response.completed` marks completion and retains usage.
+- `response.incomplete` is terminal, retains reason/usage, warns exactly once,
+  and is not treated as interruption.
+- `response.failed` and `error` preserve their native details in router errors
+  and map clear codes to the correct categories.
+- A recognized event stream ending without a terminal event is interrupted.
+- A zero-event stream is interrupted.
+- Mid-stream timeout, connection/transport, SDK, error-event, and malformed SSE
+  failures never leak an unwrapped foreign exception.
+- Closing the wrapper closes the underlying response.
+
+### Router integration
+
+- `OPENAI_RESPONSES` is eligible through the default built-in registry and
+  selects `OpenAIResponsesAdapter`.
+- A Responses `CallVariant(operation="responses.create", arguments=...)`
+  receives the selected provider's model without mutating the variant.
+- Non-streaming and streaming Responses results flow through router metrics,
+  health, TTFT, duration, close, restart callbacks, and fallback exactly like
+  equivalent Chat calls.
+- A retryable failure can fall back Chat -> Responses and Responses -> Chat,
+  and each attempt receives its own matching protocol variant.
+- Incomplete Responses do not fall back or bench and are recorded consistently
+  with the agreed served-result semantics.
+- Declared Responses failures apply the expected fallback/health behavior.
+- The global fail-fast regressions listed in the prior section.
+- Providers using unsupported future/custom protocols and custom adapter
+  factories retain their existing behavior.
+
+Tests must not depend on internal module paths being patched. If a testability
+problem appears, expose the smallest real public constructor/factory/protocol
+seam consistent with the existing architecture.
+
+## Validation checkpoint before documentation synchronization
+
+After implementing the adapter, router registration, errors, and tests:
+
+1. Run the focused Responses adapter tests.
+2. Run focused router streaming/fallback/configuration tests.
+3. Run the full existing suite.
+4. Fix every regression before proceeding.
+5. Confirm the Chat adapter still passes its complete existing test file.
+6. Confirm a core import does not require `openai` or `httpx`.
+
+Do not begin final documentation synchronization until the runtime behavior is
+implemented and verified.
+
+## Final repository synchronization
+
+Once implementation and tests are stable, perform a documentation-only
+synchronization pass. During this phase, introduce no new runtime behavior and
+no unrelated code changes. Update comments/docstrings only where they describe
+the now-completed behavior.
+
+Review and update all relevant explanatory material, including:
+
+- root `README.md`
+- `ProviderRouter/README.md`
+- root `AGENTS.md`
+- `ProviderRouter/AGENTS.md`
+- `Projectplan/Newprojectplan.md`
+- relevant architecture/design explanations and historical cross-references
+- setup and optional-dependency guidance
+- minimal usage and streaming examples
+- protocol/adapter support lists
+- error and fallback documentation
+- inline comments and docstrings
+- tracked packaging explanatory metadata if project conventions regenerate it
+
+Required documentation outcomes:
+
+1. Explicitly mark PR12 as shipped in `Projectplan/Newprojectplan.md`.
+2. Describe `OPENAI_RESPONSES` and `responses.create` as built-in support.
+3. Provide correct synchronous and streaming Responses examples using native
+   `input` and native typed output/events.
+4. Explain important Chat-versus-Responses differences:
+   `messages` versus `input`, Chat chunks versus typed Responses events,
+   terminal event handling, usage location, and native output access.
+5. Document the `response.incomplete` behavior and visible warning, including
+   `max_output_tokens` and `content_filter`, no fallback, and no provider bench.
+6. Document explicit `response.failed`/`error` behavior.
+7. Document that global fail-fast behavior for bad requests and invalid
+   operations is intentional across protocol variants; do not describe it as a
+   pending contradiction or bug.
+8. Document that retryable provider failures still fall back across protocols.
+9. State that retrieve/delete/cancel/history management and response-ID
+   affinity are provider-native caller responsibilities, not router operations.
+10. Warn that `previous_response_id`, conversation IDs, stored responses, and
+    background lifecycle operations require caller-managed provider affinity;
+    stateless routed calls are the safe interchangeable-provider pattern.
+11. Remove or revise stale statements saying Responses support or PR12 remains
+    unimplemented.
+12. Update `AGENTS.md` constraints that currently say only `OPENAI_CHAT` exists,
+    while preserving durable lazy-import, pass-through, testing, and
+    low-dependency rules.
+13. Preserve `OldProjectPlan.md` as historical rationale. Do not rewrite history;
+    add only a narrowly necessary clarification if a passage otherwise presents
+    obsolete behavior as current.
+14. Correct stale file-name casing or old `ProviderRouterPR1` paths in current
+    explanatory material where encountered. Historical path references may
+    remain when clearly historical.
+
+Search the repository for stale phrases and references, including variations of:
+
+- "Only the OpenAI Chat Completions protocol"
+- "only supported protocol is 'openai_chat'"
+- "Responses API ... planned"
+- "PR12 ... unshipped"
+- `ProviderRouterPR1`
+- `NewProjectPlan.md` versus the actual `Newprojectplan.md`
+- old claims about unrecognized Responses stream shapes
+
+Do not manufacture documentation changes where no text is affected.
+
+## Final quality checks
+
+Use the package's configured environment and current project commands. From
+`ProviderRouter`, run at least:
+
+```sh
+.venv/bin/ruff format .
+.venv/bin/ruff format --check .
+.venv/bin/ruff check .
+.venv/bin/mypy src
+.venv/bin/pytest tests/test_openai_responses_adapter.py -v
+.venv/bin/pytest
+.venv/bin/coverage run -m pytest
+.venv/bin/coverage report
+.venv/bin/python -c "from nygen_router import ProviderRouter; print(ProviderRouter)"
+```
+
+Also run any additional focused mixed-protocol test file created by PR12. The
+automated lightweight-import coverage must verify absence of optional SDKs, not
+merely run the import in the development environment where they are installed.
+
+Use the repository's `.venv/bin/...` executables when that is the established
+working environment. Do not make live provider calls; live tests must remain
+skipped without explicit credentials.
+
+Inspect the final diff and repository status:
+
+- no API keys or secrets;
+- no accidental generated/cache files;
+- no deleted regression tests;
+- no internal monkeypatching;
+- no module-level provider SDK import;
+- no Pydantic AI or other new core dependency;
+- no unrelated refactor or roadmap work;
+- no runtime changes introduced during documentation synchronization;
+- all current documentation agrees with shipped behavior;
+- PR12 is marked shipped;
+- all PR12 changes are committed;
+- the working tree is clean.
+
+If any required check cannot run, exhaust safe in-scope remedies. Do not create
+`pr12-complete` while a required criterion is failing or unverified. Report the
+exact blocker instead.
+
+## Completion
+
+Only after every criterion above is satisfied:
+
+1. Confirm the final committed diff contains only PR12 and its documentation
+   synchronization.
+2. Create local tag `pr12-complete` on the final PR12 commit.
+3. Confirm both `pr12-start` and `pr12-complete` point to the intended commits.
+4. Do not push commits or tags.
+5. Report:
+   - implementation summary;
+   - supported Responses behavior and explicit limitations;
+   - test/quality results;
+   - documentation synchronized;
+   - final commit ID;
+   - both local tags;
+   - confirmation that nothing was pushed.
