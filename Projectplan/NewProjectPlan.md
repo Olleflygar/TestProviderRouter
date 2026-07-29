@@ -62,63 +62,7 @@ before dispatch to classify requests into broad size buckets. Aggregation and
 score-based routing can then compare providers within the relevant bucket
 instead of blending small and large prompts.
 
-### 4. PR13 — Storage versioning and shared-backend foundation
-
-**Summary:** Prepare the storage layer for evolving schemas and managed
-databases.
-
-Add explicit schema migrations, remote connection handling, and reporting
-queries while preserving storage-neutral public protocols. Database engines,
-sessions, and raw SQL rows remain private implementation details.
-
-### 5. PR22 — Pre-flight `CallVariant` validation
-
-**Summary:** Validate operations and arguments before attempting a provider.
-
-Resolve supported operations and check argument compatibility before entering
-the fallback loop. Invalid calls fail without network traffic or misleading
-provider-health changes.
-
-### 6. PR21 — Automatic capability filtering
-
-**Summary:** Exclude providers that cannot satisfy tools, streaming, or
-structured-output requirements.
-
-Inspect the relevant `CallVariant` arguments and compare inferred requirements
-with provider capabilities. This restores the hard-filter behaviour removed by
-the PR3R redesign while keeping interpretation limited to known protocol
-fields.
-
-### 7. PR25 — Durable local provider health
-
-**Summary:** Persist provider cooldowns, rate limits, and health observations
-across router lifecycles.
-
-Introduce a storage-neutral health-state interface and a DuckDB-backed local
-implementation. This first stage promises durable state on one installation,
-not organization-wide coordination, and storage failures continue to degrade
-safely to in-memory health.
-
-### 8. PR14 — Postgres/Supabase organizational state
-
-**Summary:** Share metrics and health across applications within an
-organization.
-
-Implement Postgres/Supabase backends for both metrics and provider-health state
-using the interfaces established by PR13 and PR25. DuckDB remains the local
-default; Postgres/Supabase provides the actual multi-application organizational
-store.
-
-### 9. PR15 — Routing profiles
-
-**Summary:** Offer simple profiles for speed, reliability, or balanced routing.
-
-Profiles configure the scoring weights and history settings that already exist
-rather than introducing a separate scoring system. Cost is excluded from the
-standard profiles, and capability requirements remain hard filters rather than
-weighted preferences.
-
-### 10. PR26 — Configurable sticky routing
+### 4. PR26 — Configurable sticky routing
 
 **Summary:** Allow users to opt into retaining a successful provider for future
 calls.
@@ -129,7 +73,7 @@ healthy. The precise affinity and expiration configuration will be resolved
 when constructing this PR's prompt; stickiness remains disabled unless
 selected.
 
-### 11. PR27 — Configurable same-provider retry policy
+### 5. PR27 — Configurable same-provider retry policy
 
 **Summary:** Control bounded retries before cross-provider fallback.
 
@@ -137,6 +81,62 @@ Keep this separate from sticky routing because retrying a failed request has
 different latency and duplicate-work risks. Retry limits and eligible failure
 categories are explicit configuration, with unsafe request and authentication
 failures excluded and normal fallback preserved after the budget is exhausted.
+
+### 6. PR13 — Storage versioning and shared-backend foundation
+
+**Summary:** Prepare the storage layer for evolving schemas and managed
+databases.
+
+Add explicit schema migrations, remote connection handling, and reporting
+queries while preserving storage-neutral public protocols. Database engines,
+sessions, and raw SQL rows remain private implementation details.
+
+### 7. PR22 — Pre-flight `CallVariant` validation
+
+**Summary:** Validate operations and arguments before attempting a provider.
+
+Resolve supported operations and check argument compatibility before entering
+the fallback loop. Invalid calls fail without network traffic or misleading
+provider-health changes.
+
+### 8. PR21 — Automatic capability filtering
+
+**Summary:** Exclude providers that cannot satisfy tools, streaming, or
+structured-output requirements.
+
+Inspect the relevant `CallVariant` arguments and compare inferred requirements
+with provider capabilities. This restores the hard-filter behaviour removed by
+the PR3R redesign while keeping interpretation limited to known protocol
+fields.
+
+### 9. PR25 — Durable local provider health
+
+**Summary:** Persist provider cooldowns, rate limits, and health observations
+across router lifecycles.
+
+Introduce a storage-neutral health-state interface and a DuckDB-backed local
+implementation. This first stage promises durable state on one installation,
+not organization-wide coordination, and storage failures continue to degrade
+safely to in-memory health.
+
+### 10. PR14 — Postgres/Supabase organizational state
+
+**Summary:** Share metrics and health across applications within an
+organization.
+
+Implement Postgres/Supabase backends for both metrics and provider-health state
+using the interfaces established by PR13 and PR25. DuckDB remains the local
+default; Postgres/Supabase provides the actual multi-application organizational
+store.
+
+### 11. PR15 — Routing profiles
+
+**Summary:** Offer simple profiles for speed, reliability, or balanced routing.
+
+Profiles configure the scoring weights and history settings that already exist
+rather than introducing a separate scoring system. Cost is excluded from the
+standard profiles, and capability requirements remain hard filters rather than
+weighted preferences.
 
 ### 12. PR6 — Manual token-cost calculation
 
