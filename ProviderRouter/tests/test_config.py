@@ -52,6 +52,16 @@ def test_missing_base_url_rejected_for_openai_chat() -> None:
         )
 
 
+def test_missing_base_url_rejected_for_openai_responses() -> None:
+    with pytest.raises(ValidationError):
+        ProviderConfig(
+            name="provider_a",
+            protocol=ApiProtocol.OPENAI_RESPONSES,
+            model="model-a",
+            api_key="secret",
+        )
+
+
 def test_missing_api_key_and_api_key_env_rejected() -> None:
     with pytest.raises(ValidationError):
         ProviderConfig(

@@ -89,12 +89,20 @@ class OpenAICompatibleAdapter:
             raise mapped from exc
 
         if isinstance(response, openai.Stream):
-            return OpenAIChatStream(
-                response,
-                provider_name=name,
-                model=model,
-                timeout_seconds=self.config.timeout_seconds,
-            )
+            return self._wrap_stream(response)
+        return self._handle_response(response)
+
+    def _wrap_stream(self, stream: Any) -> NormalizedStream:
+        """Wrap the SDK stream shape this adapter understands."""
+        return OpenAIChatStream(
+            stream,
+            provider_name=self.config.name,
+            model=self.config.model,
+            timeout_seconds=self.config.timeout_seconds,
+        )
+
+    def _handle_response(self, response: Any) -> Any:
+        """Observe a non-streaming response without changing its identity."""
         return response
 
 
@@ -174,21 +182,33 @@ class OpenAIChatStream(NormalizedStream):
         so an unrecognized type becomes a plain ProviderError rather than
         reaching the consumer as an SDK-shaped surprise.
         """
-        mapped = _map_sdk_exception(
+        return _map_stream_exception(
             exc,
             provider_name=self._provider_name,
             model=self._model,
             timeout_seconds=self._timeout_seconds,
         )
-        if mapped is not None:
-            return mapped
-        return ProviderError(
-            f"Provider {self._provider_name!r} stream failed for model {self._model!r} "
-            f"({type(exc).__name__}): {exc}",
-            provider_name=self._provider_name,
-            model=self._model,
-            original=exc,
-        )
+
+
+def _map_stream_exception(
+    exc: Exception, *, provider_name: str, model: str, timeout_seconds: float
+) -> ProviderError:
+    """Map any exception escaping SDK stream iteration to a router error."""
+    mapped = _map_sdk_exception(
+        exc,
+        provider_name=provider_name,
+        model=model,
+        timeout_seconds=timeout_seconds,
+    )
+    if mapped is not None:
+        return mapped
+    return ProviderError(
+        f"Provider {provider_name!r} stream failed for model {model!r} "
+        f"({type(exc).__name__}): {exc}",
+        provider_name=provider_name,
+        model=model,
+        original=exc,
+    )
 
 
 def _map_sdk_exception(

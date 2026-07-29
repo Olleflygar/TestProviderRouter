@@ -75,9 +75,10 @@ class ProviderConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_provider_requirements(self) -> Self:
-        """Cross-field checks: base_url for OPENAI_CHAT, and some API key source."""
-        if self.protocol == ApiProtocol.OPENAI_CHAT and self.base_url is None:
-            raise ValueError("base_url is required for OPENAI_CHAT providers.")
+        """Cross-field checks: base_url for OpenAI protocols, and some API key source."""
+        openai_protocols = {ApiProtocol.OPENAI_CHAT, ApiProtocol.OPENAI_RESPONSES}
+        if self.protocol in openai_protocols and self.base_url is None:
+            raise ValueError(f"base_url is required for {self.protocol.name} providers.")
         if self.api_key is None and self.api_key_env is None:
             raise ValueError("At least one of api_key or api_key_env is required.")
         return self

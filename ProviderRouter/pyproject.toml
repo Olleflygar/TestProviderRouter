@@ -14,7 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 openai = [
-    "openai>=1,<2",
+    "openai>=1.66,<2",
 ]
 duckdb = [
     "duckdb>=0.10,<2",
@@ -24,7 +24,7 @@ dev = [
     "duckdb>=0.10,<2",
     "httpx>=0.24,<1",
     "mypy>=1,<2",
-    "openai>=1,<2",
+    "openai>=1.66,<2",
     "pytest>=7,<9",
     "python-dotenv>=1,<2",
     "ruff>=0.6,<1",

@@ -44,7 +44,8 @@ class UnsupportedProtocolError(NygenRouterError):
         self.protocol = protocol
         super().__init__(
             f"Provider {provider_name!r} uses protocol {str(protocol)!r}, which is not "
-            f"supported yet (the only supported protocol is 'openai_chat')."
+            f"supported by the built-in adapter factory (supported protocols are "
+            f"'openai_chat' and 'openai_responses')."
         )
 
 
@@ -166,6 +167,35 @@ class ProviderStreamInterruptedError(ProviderError):
     """
 
 
+class ProviderResponsesError(ProviderError):
+    """A Responses API terminal event or response declared generation failed."""
+
+    def __init__(
+        self,
+        *,
+        provider_name: str,
+        model: str,
+        message: str,
+        error_code: str | None,
+        param: str | None = None,
+        event: Any = None,
+        response: Any = None,
+    ) -> None:
+        self.message = message
+        self.error_code = error_code
+        self.param = param
+        self.event = event
+        self.response = response
+        tags = "/".join(tag for tag in (error_code, param) if tag)
+        tag_suffix = f" [{tags}]" if tags else ""
+        super().__init__(
+            f"Provider {provider_name!r} Responses API failed for model {model!r}: "
+            f"{message}{tag_suffix}",
+            provider_name=provider_name,
+            model=model,
+        )
+
+
 class ProviderHTTPError(ProviderError):
     """A provider returned a non-2xx HTTP status.
 
@@ -261,6 +291,8 @@ def categorize_error(exc: Exception) -> ErrorCategory:
         return ErrorCategory.CONNECTION
     if isinstance(exc, ProviderStreamInterruptedError):
         return ErrorCategory.STREAM_INTERRUPTED
+    if isinstance(exc, ProviderResponsesError):
+        return _categorize_responses_code(exc.error_code)
     if isinstance(exc, ProviderHTTPError):
         status = exc.status_code
         if status == 429:
@@ -274,4 +306,34 @@ def categorize_error(exc: Exception) -> ErrorCategory:
         if status in (400, 422):
             return ErrorCategory.BAD_REQUEST
         return ErrorCategory.UNKNOWN
+    return ErrorCategory.UNKNOWN
+
+
+def _categorize_responses_code(code: str | None) -> ErrorCategory:
+    """Classify only provider codes whose meaning is explicit and stable."""
+    if code in {"rate_limit", "rate_limit_exceeded"}:
+        return ErrorCategory.RATE_LIMIT
+    if code in {"internal_server_error", "server_error"}:
+        return ErrorCategory.SERVER_ERROR
+    if code in {"request_timeout", "timeout", "vector_store_timeout"}:
+        return ErrorCategory.TIMEOUT
+    if code in {
+        "empty_image_file",
+        "failed_to_download_image",
+        "image_file_not_found",
+        "image_file_too_large",
+        "image_parse_error",
+        "image_too_large",
+        "image_too_small",
+        "invalid_base64_image",
+        "invalid_image",
+        "invalid_image_format",
+        "invalid_image_mode",
+        "invalid_image_url",
+        "invalid_input",
+        "invalid_prompt",
+        "invalid_request",
+        "unsupported_image_media_type",
+    }:
+        return ErrorCategory.BAD_REQUEST
     return ErrorCategory.UNKNOWN

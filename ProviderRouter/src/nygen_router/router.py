@@ -10,6 +10,7 @@ from typing import Any
 
 from nygen_router.adapters.base import NormalizedStream, ProviderAdapter
 from nygen_router.adapters.openai_compatible import OpenAICompatibleAdapter
+from nygen_router.adapters.openai_responses import OpenAIResponsesAdapter
 from nygen_router.config import ApiProtocol, ProviderConfig
 from nygen_router.errors import (
     ConfigError,
@@ -40,10 +41,8 @@ AdapterFactory = Callable[[ProviderConfig], ProviderAdapter]
 
 logger = logging.getLogger(__name__)
 
-# Protocols the built-in adapter factory can serve. Adding a new adapter
-# (e.g. one for OPENAI_RESPONSES) means registering its protocol here so the
-# eligibility filter stops excluding it.
-SUPPORTED_PROTOCOLS = frozenset({ApiProtocol.OPENAI_CHAT})
+# Protocols the built-in adapter factory can serve.
+SUPPORTED_PROTOCOLS = frozenset({ApiProtocol.OPENAI_CHAT, ApiProtocol.OPENAI_RESPONSES})
 
 # Failure categories that abort the whole run immediately instead of falling
 # back to the next eligible provider: the call itself is broken (malformed
@@ -487,9 +486,11 @@ class ProviderRouter:
 
     @staticmethod
     def _default_adapter_for(provider: ProviderConfig) -> ProviderAdapter:
-        """Map a provider's protocol to its adapter (only OPENAI_CHAT exists so far)."""
+        """Map a provider's protocol to its built-in adapter."""
         if provider.protocol == ApiProtocol.OPENAI_CHAT:
             return OpenAICompatibleAdapter(provider)
+        if provider.protocol == ApiProtocol.OPENAI_RESPONSES:
+            return OpenAIResponsesAdapter(provider)
         # Unreachable via invoke(): unsupported protocols are excluded by the
         # eligibility filter first. Kept as a guard for direct/custom callers.
         raise UnsupportedProtocolError(provider.name, provider.protocol)  # pragma: no cover
@@ -537,6 +538,11 @@ class RouterStream:
 
     def __iter__(self) -> RouterStream:
         return self
+
+    @property
+    def usage(self) -> Any:
+        """Expose the current provider stream's native usage object, if any."""
+        return self._stream.usage
 
     def __next__(self) -> Any:
         while True:
