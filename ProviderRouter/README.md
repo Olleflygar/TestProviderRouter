@@ -14,15 +14,26 @@ Only the OpenAI Chat Completions protocol is implemented so far, dispatched via
 the official `openai` Python SDK (used against any OpenAI-compatible `base_url`,
 not just OpenAI itself). Every provider attempt is recorded as an observational
 metrics event behind a swappable `MetricsStore` (DuckDB by default, SQLite as a
-fully-supported alternative) -- see "Metrics persistence" below. Scoring, the
-Responses API, and framework adapters are future PRs.
+fully-supported alternative) -- see "Metrics persistence" below. Metrics
+aggregation, score calculation, score-based routing, recency weighting,
+provider health, and streaming fallback are implemented. The Responses API,
+token-usage instrumentation, additional storage layers, and framework adapters
+remain planned work.
+
+The source and tests define shipped behavior. See
+[`../Projectplan/NewProjectPlan.md`](../Projectplan/NewProjectPlan.md) for the
+current roadmap and
+[`../Projectplan/OldProjectPlan.md`](../Projectplan/OldProjectPlan.md) for
+historical design rationale. When they disagree, the source and tests take
+precedence, followed by the current roadmap.
 
 ## Local Development
 
 Requires **Python 3.12+**. Do not use a conda env on Python 3.10 for this package.
+From the repository root:
 
 ```sh
-cd ProviderRouterPR1
+cd ProviderRouter
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
@@ -125,8 +136,8 @@ etc.) -- `ProviderConfig.capabilities` exists and can be set, but nothing reads
 it yet. A provider that can't handle a given call today discovers that the same
 way any other failure is discovered: the call fails and the router falls back to
 the next eligible provider. Automatic capability-based pre-flight filtering,
-driven from a call's own `arguments`, is a planned follow-up (see
-`Projectplan/ProjectPlan.md`, PR 21).
+driven from a call's own `arguments`, is planned in
+[`../Projectplan/NewProjectPlan.md`](../Projectplan/NewProjectPlan.md) (PR21).
 
 If filtering removes every configured provider, `invoke()` raises
 `NoEligibleProvidersError`, whose message enumerates each excluded provider with
@@ -319,6 +330,11 @@ When your configured providers expose the same logical model through different
 API protocols, supply one `CallVariant` per protocol -- the router picks
 whichever variant matches the provider it's about to try:
 
+The built-in adapter currently supports only `OPENAI_CHAT`. The
+`ANTHROPIC_MESSAGES` variant below illustrates the multi-protocol call shape
+for a future or custom adapter; without such an adapter, that provider is
+excluded as unsupported.
+
 ```python
 response = router.invoke(
     [
@@ -451,7 +467,7 @@ raise only router errors from it, and report `completed` and `usage`.
 
 Every provider attempt (success or failure) is recorded as one observational
 `MetricsEvent` -- provider name, model, protocol, success, latency, and error
-type -- so score-based routing (a later PR) has real history to work from.
+type -- so the implemented score-based policy has real history to work from.
 Excluded providers are not recorded.
 
 Streams are recorded once, when the stream ends, never when it opens -- headers
@@ -492,8 +508,9 @@ returned. **DuckDB is single-process**: it allows only one writing process
 per file. If several local processes need to share one store, use
 `SQLiteMetricsStore(path)` instead, which uses Python's stdlib `sqlite3` (no
 extra install) and handles cross-process file locking natively. For shared,
-multi-machine routing history, a Postgres/Supabase-backed store is a planned
-future backend.
+multi-machine routing history, a Postgres/Supabase-backed store remains planned
+in [`../Projectplan/NewProjectPlan.md`](../Projectplan/NewProjectPlan.md)
+(PR13, PR25, and PR14).
 
 Storage writes are best-effort and never replace or modify a provider response.
 The router logs one short warning when a configured store first fails, continues
@@ -523,7 +540,7 @@ fixture at a factory for your backend.
 ## Metrics aggregation
 
 `aggregate_stats` turns recorded attempts into one `ProviderStats` per
-provider -- the input score-based routing will use, and a readable summary of
+provider -- the input score-based routing uses, and a readable summary of
 what each provider has actually been doing:
 
 ```python
@@ -591,7 +608,9 @@ for exploration—there is no separate exploration-bonus switch.
 
 Cost is deliberately not a scoring factor. Automatic pricing is outside the
 router's core model, and manually configured cost remains the deferred,
-optional work described in PR 6.
+optional work described in
+[`../Projectplan/NewProjectPlan.md`](../Projectplan/NewProjectPlan.md) (PR24
+followed by PR6).
 
 ## Score-based routing
 
@@ -614,6 +633,8 @@ Its constructor settings are:
 - `weights=None`: use the default `ScoreWeights`.
 - `lookback_hours=336.0`: query the latest 336 hours, which is 14 days, and
   count every event in that window equally.
+- `half_life_hours=None`: keep flat weighting over `lookback_hours`; a positive
+  value replaces that window with the recency behavior described below.
 - `use_streaming=False`: score regular-call history. Set it to `True` to score
   streaming success and TTFT instead.
 - `tie_break_policy=None`: use an internal `RoundRobinPolicy`.
@@ -686,15 +707,19 @@ debugging. The contract:
   `__cause__` and `.original`.
 - **The error type names the stage.** `ConfigError` / `MissingApiKeyError`
   (configuration), `ModelArgumentConflictError` / `DuplicateCallVariantProtocolError`
-  (malformed call, before any provider is contacted), `ProviderSDKNotInstalledError`
-  (missing optional dependency), `NoProvidersConfiguredError` (no providers
-  configured), `NoEligibleProvidersError` (all providers filtered out before any
-  call), `RouterExhaustedError` (every provider tried failed), `UnsupportedOperationError`
-  / `InvalidOperationArgumentsError` (bad `operation`/`arguments`),
+  (malformed call, before any provider is contacted),
+  `UnsupportedProtocolError` (no adapter for a configured protocol),
+  `ProviderSDKNotInstalledError` (missing optional dependency),
+  `NoProvidersConfiguredError` (no providers configured),
+  `NoEligibleProvidersError` (all providers filtered out before any call),
+  `RouterExhaustedError` (every provider tried failed),
+  `UnsupportedOperationError` / `InvalidOperationArgumentsError` (bad
+  `operation`/`arguments`),
   `ProviderTimeoutError` / `ProviderConnectionError` / `ProviderError` (transport),
   `ProviderHTTPError` (HTTP status), `ProviderStreamInterruptedError` (a stream
-  ended without the provider ever marking it finished). Messages always name the
-  provider and model.
+  ended without the provider ever marking it finished). Provider-specific
+  errors name the provider and model; aggregate errors enumerate the relevant
+  providers.
 - **Originals are chained, never re-wrapped.** Transport and SDK failures keep
   the exact `openai`/`httpx` exception type in the message and attach it as both
   `__cause__` and `.original`.

@@ -190,3 +190,9 @@ provider protocols, and framework-specific adapters are not part of the current
 shipped implementation. The examples above show the integration surface
 available today: workflows keep their own structure and delegate only the
 provider call to Nygen Router.
+
+## Workflow examples
+
+Manual LangChain and Pydantic workflow examples live under `WorkflowTests`.
+They make real network calls and maintain local routing history, so review
+[`WorkflowTests/README.md`](WorkflowTests/README.md) before running them.

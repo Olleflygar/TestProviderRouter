@@ -21,11 +21,11 @@ class ProviderStats:
     needs to see. A provider with populated regular figures and all-zero
     streaming ones (or the reverse) is normal.
 
-    The four count fields are ``float`` even though this module only ever
-    produces whole numbers: PR 10 fills them with fractional decayed weights,
-    and reserving the type now keeps that from being a breaking change. The
-    three tallies stay ``int`` -- exact, unweighted, diagnostic only, never
-    read by scoring and never decayed.
+    The four count fields are ``float`` because a weighted aggregation --
+    recency decay, for instance -- makes them fractional; under the default
+    flat weighting they are whole numbers. The three tallies stay ``int`` --
+    exact, unweighted, diagnostic only, never read by scoring and never
+    decayed.
 
     A ``*_success_rate`` is None exactly when its attempt count is zero, and a
     ``*_avg_latency_ms`` is None when there is no successful attempt carrying a
@@ -65,10 +65,9 @@ def aggregate_stats(
     with no evidence rather than a missing key its caller has to special-case.
     Events from any other provider are ignored.
 
-    ``weight_fn`` decides how much each event counts for. It is accepted but
-    unused here -- with the default every event weighs 1.0, which is plain
-    counting -- and exists so PR 10 can supply recency decay without changing
-    this signature or anything that calls it.
+    ``weight_fn`` decides how much each event counts for, which is how a
+    caller applies recency decay. With the default every event weighs 1.0,
+    which is plain counting.
     """
     weight_of = _flat_weight if weight_fn is None else weight_fn
     accumulators = {name: _Accumulator() for name in dict.fromkeys(provider_names)}

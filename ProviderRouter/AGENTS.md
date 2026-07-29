@@ -1,7 +1,13 @@
-# ProviderRouterPR1 Agent Guide
+# ProviderRouter Agent Guide
 
 Implementation rules for this package:
 
+- The current source and tests define shipped behavior. Use
+  `../Projectplan/NewProjectPlan.md` for the current roadmap and
+  `../Projectplan/OldProjectPlan.md` for historical rationale, in that order.
+  The constraints below describe the current implementation. An explicitly
+  scoped roadmap item may replace the corresponding current constraint, but
+  unrelated work must not pull planned features forward.
 - Core imports must stay lightweight: `from nygen_router import ProviderRouter`
   must never require any provider SDK to be installed.
 - No provider SDK imports at module level, anywhere -- not even inside an
@@ -12,11 +18,11 @@ Implementation rules for this package:
   `openai` extra, and in `_map_sdk_exception`'s in-body import, which is
   reached only after `openai` itself imported successfully. `router.py` stays
   entirely SDK-free -- no `openai`, no `httpx`, not even lazily.
-- Do not add LangChain, Pydantic AI, Supabase, or OpenTelemetry yet. DuckDB
-  shipped in PR4 as the metrics-storage default -- see below -- but it too
-  follows the lazy-import rule: `storage/duckdb.py` never imports `duckdb` at
-  module level, only inside method bodies, so the core import stays clean
-  without it installed.
+- LangChain, Pydantic AI, Supabase, and OpenTelemetry remain optional roadmap
+  layers and must not become core dependencies. DuckDB is the current
+  metrics-storage default, but it follows the same lazy-import rule:
+  `storage/duckdb.py` imports `duckdb` only inside method bodies, so the core
+  import stays clean without it installed.
 - Do not leak API keys in errors, logs, responses, or tests.
 - Use typed models, not raw dictionaries, in core APIs -- `CallVariant`,
   `ProviderConfig`, `EligibilityResult`, etc. The one deliberate exception is
@@ -38,14 +44,14 @@ Implementation rules for this package:
   that can't actually handle a call's `arguments` fails at call time like any
   other provider error, rather than being excluded pre-flight. Restoring
   pre-flight capability filtering (inferred from a call's own `arguments`,
-  compared against `ProviderConfig.capabilities`) is a planned follow-up --
-  see `Projectplan/ProjectPlan.md`, PR 21. Do not build that inference logic
-  as part of unrelated work; it needs its own PR.
+  compared against `ProviderConfig.capabilities`) is planned in
+  `../Projectplan/NewProjectPlan.md` (PR21). Do not build that inference logic
+  as part of unrelated work.
 - A successful `invoke()` call returns the provider SDK's raw response object,
   completely untouched -- no wrapper, no `.attempts`/`.excluded` attached to
-  it. Do not reintroduce a response wrapper; if per-call observability is
-  needed later, that is PR 19's job (logging hooks), not a field on the return
-  value.
+  it. Do not reintroduce a response wrapper; planned logging and observability
+  hooks belong at their own boundaries, not in a field on the return value
+  (see PR19 and PR20 in the current roadmap).
 - Round robin rotates among eligible providers, and a failed provider falls
   back to the next eligible one, re-picking whichever `CallVariant` matches
   the new provider's protocol. An auth failure (401/403) benches a provider
@@ -110,15 +116,17 @@ Avoid the "peel the onion" debugging that plagues comparable routers:
 - Prefer common terminology: HTTP status + reason phrase, and the exact
   `openai`/`httpx` exception type name for transport and dispatch failures.
 
-## Metrics persistence (PR4)
+## Metrics persistence
 
 `ProviderRouter` records one `MetricsEvent` per provider attempt so
-score-based routing (PR7-10) has real history to work from:
+score-based routing has real history to work from:
 
 - `MetricsStore` (`storage/base.py`) is a `typing.Protocol` with exactly two
   methods -- `record_attempt` and `query_recent`. Do not add aggregation,
-  delete, or migration methods to it; aggregation happens in Python over
-  `query_recent`'s output (PR7), never in per-backend SQL.
+  delete, or migration methods to it in unrelated work; aggregation happens
+  in Python over `query_recent`'s output, never in per-backend SQL. The planned
+  storage-foundation work in PR13 may deliberately evolve the storage
+  interfaces and migration design.
 - `DuckDBMetricsStore` (`storage/duckdb.py`) is the default, pointed at
   `~/.nygen_router/metrics.duckdb`. It lazy-imports `duckdb` inside its
   methods only -- never at module level -- so the core import stays clean
@@ -135,20 +143,24 @@ score-based routing (PR7-10) has real history to work from:
   installed) must never disturb a successful LLM response. Latency is one
   `time.perf_counter()` window around `adapter.invoke()`, recorded exactly as
   measured, on both success and failure.
-- Do not build cross-process coordination for DuckDB, async/batched writes,
-  schema versioning, or any query beyond `query_recent` -- all explicitly out
-  of scope for PR4; see `Projectplan/ProjectPlan.md`'s PR4/PR7/PR13 sections.
+- Do not add cross-process coordination for DuckDB, async/batched writes,
+  schema versioning, or queries beyond `query_recent` as unrelated work.
+  Schema migrations, remote connection handling, and reporting queries belong
+  to the explicitly scoped PR13 storage-foundation work in the current
+  roadmap.
 - New columns are added to `_ADDED_COLUMNS` in `storage/base.py`, which every
   backend replays against its table on connect (check `PRAGMA table_info`, then
-  `ALTER TABLE ADD COLUMN` whatever is missing). PR23 established this; PR6 and
-  PR24 reuse it rather than inventing another mechanism. Added-column DDL must
-  carry no constraints -- DuckDB rejects them in `ALTER TABLE ADD COLUMN`, even
-  though it accepts them in `CREATE TABLE`.
+  `ALTER TABLE ADD COLUMN` whatever is missing). Until PR13 deliberately
+  replaces this mechanism, new columns use it rather than inventing another
+  migration path; this includes the earlier PR24 token-usage work in the
+  current roadmap. Added-column DDL must carry no constraints -- DuckDB rejects
+  them in `ALTER TABLE ADD COLUMN`, even though it accepts them in
+  `CREATE TABLE`.
 
-## Metrics aggregation (PR7)
+## Metrics aggregation
 
 `aggregate_stats(events, provider_names, *, weight_fn=None)` in `stats.py`
-turns recorded events into one `ProviderStats` per provider, for PR8's scoring:
+turns recorded events into one `ProviderStats` per provider for scoring:
 
 - Pure and query-only: a function over a list of `MetricsEvent`, with no store,
   router, or adapter involved and no window logic of its own. Callers filter
@@ -161,25 +173,26 @@ turns recorded events into one `ProviderStats` per provider, for PR8's scoring:
   fast -- and a success carrying no latency at all contributes nothing rather
   than a 0.0.
 - Every requested name gets an entry, including one with no events (counts `0`,
-  rates and averages `None`), matching `health_report()`'s precedent: PR8's
+  rates and averages `None`), matching `health_report()`'s precedent: the
   optimistic-start blend needs a real entry to fall back on.
-- The four count fields are typed `float` although this PR only produces whole
-  numbers -- reserved for PR10's fractional decayed weights. Do not "simplify"
-  them to `int`. The three tallies stay `int`: exact, unweighted, diagnostic,
-  never scored and never decayed.
-- `weight_fn` exists but does nothing yet: it defaults to a flat 1.0 per event.
-  Write every count, rate, and average through it as if weighting always
-  mattered -- never a separate weighted and unweighted code path -- so PR10 can
-  supply real decay without touching this signature. Do not implement decay
-  here.
+- The four count fields are typed `float` because recency weighting can make
+  them fractional; with the default flat weighting they remain whole numbers.
+  Do not "simplify" them to `int`. The three tallies stay `int`: exact,
+  unweighted, diagnostic, never scored and never decayed.
+- `weight_fn` controls how much each event contributes and is used by
+  `ScoreBasedPolicy` for exponential recency decay. It defaults to a flat 1.0
+  per event. Write every count, rate, and average through it; never create
+  separate weighted and unweighted aggregation paths.
 - No per-model grouping: a `ProviderConfig` fixes one model, so provider
-  identity already implies model identity. No cost stat (PR6, deferred).
+  identity already implies model identity. Cost statistics remain optional
+  future work dependent on usage instrumentation and user-supplied prices
+  (PR24 and PR6 in the current roadmap).
 - Provider names are the identity key for both metrics and health, which is why
   `__init__` rejects duplicates. Renaming a provider therefore restarts its
   recorded history; that is accepted and documented in the README, not a bug to
   fix with fuzzy matching.
 
-## Score calculation (PR8)
+## Score calculation
 
 `calculate_provider_score(stats, weights, *, use_streaming=False)` in
 `scoring.py` is a pure function from one `ProviderStats` record to one frozen,
@@ -198,7 +211,7 @@ explainable `ProviderScore`:
 - Keep this module independent of adapters, storage, providers, and I/O. It
   operates only on the values passed to it.
 
-## Score-based routing (PR9)
+## Score-based routing
 
 The `Policy` protocol is now
 `order(eligible: list[ProviderConfig], context: RoutingContext)`. The router
@@ -206,7 +219,7 @@ builds a fresh frozen context per `invoke()` from its own metrics store; custom
 policies must accept that second argument. `RoundRobinPolicy` accepts and
 ignores it.
 
-`ScoreBasedPolicy` connects PR7 aggregation to PR8 scoring:
+`ScoreBasedPolicy` connects metrics aggregation to score calculation:
 
 - Call its tie-break policy exactly once on a copy of the eligible list before
   reading history. This is both the stable tie order and the graceful fallback
@@ -221,19 +234,19 @@ ignores it.
 - `use_streaming` is fixed at policy construction and never inferred from
   `CallVariant.arguments`. A policy instance scores one call type for its
   entire lifetime.
-- `half_life_hours=None` preserves PR9's flat `lookback_hours` behavior
-  exactly. A positive half-life replaces that window entirely: query the
+- `half_life_hours=None` preserves flat `lookback_hours` behavior exactly. A
+  positive half-life replaces that window entirely: query the
   latest six half-lives and pass exponential event weights
   `0.5 ** (age_hours / half_life_hours)` to aggregation. The multiplier six is
   fixed, and the same half-life applies to every provider and metric.
 - Decay affects scoring evidence only. The exact diagnostic error,
   rate-limit, and timeout counts remain unweighted.
 
-## Provider health (PR5)
+## Provider health
 
 `ProviderRouter` benches temporarily-bad providers so they stop being called,
-extending the auth bench PR3 shipped. Never bench silently -- that is the whole
-point of the feature:
+including after authentication failures. Never bench silently -- that is the
+whole point of the feature:
 
 - Transitions live on `ProviderHealthState` (`health.py`) as `record_failure`
   / `record_success`, not in the fallback loop; the loop only reports what
@@ -262,7 +275,7 @@ point of the feature:
   last error, so a fully-benched router still enumerates root causes. The
   trigger is stored on the state when the bench is taken -- do not infer it
   from the failure count, which a 429 neither increments nor resets.
-- Bench logging (one slice pulled forward from PR19) dedups per bench episode:
+- Bench logging deduplicates per bench episode:
   the first bench warns, repeat benches within that episode are DEBUG, and the
   first success logs one INFO recovery and re-arms the warning so a later,
   separate outage is not buried. `reset_health` drops the entry entirely, so a
@@ -273,15 +286,16 @@ point of the feature:
   An unknown provider name raises `ConfigError`; a typo'd reset that silently
   no-ops is the exact failure this feature exists to prevent.
 - Health is in-memory and lives and dies with the router instance. Do not
-  persist it, do not add per-provider `HealthConfig` overrides, escalating
-  cooldowns, `Retry-After` handling, or any global give-up counter -- each was
-  considered and deferred or rejected; see `Projectplan/ProjectPlan.md`'s PR5
-  section.
+  persist it as unrelated work, and do not add per-provider `HealthConfig`
+  overrides, escalating cooldowns, `Retry-After` handling, or any global
+  give-up counter. Durable local health is separately planned in PR25; the
+  other alternatives were considered and deferred or rejected in
+  `../Projectplan/OldProjectPlan.md`.
 - `ErrorCategory.STREAM_INTERRUPTED` counts toward `failure_threshold` and is
   never a STOP category: a chronically truncating provider is a broken
   provider, even though each of its calls starts out looking healthy.
 
-## Streaming (PR23)
+## Streaming
 
 A stream's real outcome happens after `invoke()` has returned, inside the
 consumer's own loop, so the returned object is the only place the router can
@@ -325,6 +339,7 @@ still act:
   helpers on `ProviderRouter`; `invoke()` and `RouterStream` keep two thin,
   separate loops. Do not rewrite them into one attempt engine.
 - Do not add per-call overrides for `stream_failure_policy` or `on_restart`, a
-  max-restarts knob, or any async support -- all considered and deferred; see
-  `Projectplan/ProjectPlan.md`'s PR23 section. Usage is exposed on the wrapper
-  but persisted by nobody until PR24.
+  max-restarts knob, or any async support as unrelated work -- all were
+  considered and deferred in `../Projectplan/OldProjectPlan.md`. Usage is
+  exposed on the wrapper but is not persisted until the planned PR24
+  framework-neutral usage instrumentation is implemented.

@@ -12,8 +12,8 @@ class MetricsStore(Protocol):
     """The minimum interface every metrics backend implements.
 
     Deliberately just record + query: aggregation happens in Python over
-    query_recent's output (PR 7), never in per-backend SQL, so a custom
-    backend stays trivial to implement.
+    query_recent's output (see ``aggregate_stats``), never in per-backend SQL,
+    so a custom backend stays trivial to implement.
     """
 
     def record_attempt(self, event: MetricsEvent) -> None: ...
@@ -29,8 +29,8 @@ class MetricsStore(Protocol):
 
 # Shared by DuckDBMetricsStore and SQLiteMetricsStore so the two engines stay
 # byte-identical in schema and behavior -- only columns with a real data
-# source today; later PRs add theirs (tokens: PR 24, request_size_bucket:
-# PR 11, required_tools: PR 21, cost: PR 6).
+# source today. Planned ones (tokens, request_size_bucket, required_tools,
+# cost) arrive with the features that populate them.
 CREATE_PROVIDER_ATTEMPTS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS provider_attempts (
     id TEXT PRIMARY KEY,
@@ -58,8 +58,8 @@ INSERT_PROVIDER_ATTEMPT_SQL = (
 # Columns added after this table's first release, newest last. A metrics file
 # written by an earlier version predates them, and CREATE TABLE IF NOT EXISTS
 # leaves such a file untouched -- so every backend checks for them on connect
-# and adds what is missing. PR 23 is the first PR to need this; PR 6 and PR 24
-# add their columns to this tuple rather than inventing another mechanism.
+# and adds what is missing. Every later column is appended to this tuple
+# rather than getting a migration mechanism of its own.
 #
 # The added-column DDL deliberately omits the NOT NULL that the CREATE above
 # carries on `stream`: DuckDB rejects constraints in ALTER TABLE ADD COLUMN
@@ -159,8 +159,9 @@ def row_to_event(row: Sequence[Any]) -> MetricsEvent:
         success=bool(success),
         latency_ms=None if latency_ms is None else float(latency_ms),
         error_type=None if error_type is None else str(error_type),
-        # A row migrated from a pre-PR-23 file has no stream value of its own;
-        # the column default reads back as 0, which is what those rows were.
+        # A row migrated from a file written before `stream` existed has no
+        # value of its own; the column default reads back as 0, which is what
+        # those rows were.
         stream=bool(stream),
         total_duration_ms=None if total_duration_ms is None else float(total_duration_ms),
     )

@@ -44,7 +44,7 @@ class UnsupportedProtocolError(NygenRouterError):
         self.protocol = protocol
         super().__init__(
             f"Provider {provider_name!r} uses protocol {str(protocol)!r}, which is not "
-            f"supported yet (PR 1 supports only 'openai_chat')."
+            f"supported yet (the only supported protocol is 'openai_chat')."
         )
 
 

@@ -41,7 +41,7 @@ AdapterFactory = Callable[[ProviderConfig], ProviderAdapter]
 logger = logging.getLogger(__name__)
 
 # Protocols the built-in adapter factory can serve. Adding a new adapter
-# (e.g. OPENAI_RESPONSES in PR12) means registering its protocol here so the
+# (e.g. one for OPENAI_RESPONSES) means registering its protocol here so the
 # eligibility filter stops excluding it.
 SUPPORTED_PROTOCOLS = frozenset({ApiProtocol.OPENAI_CHAT})
 
@@ -69,7 +69,7 @@ class StreamFailurePolicy(StrEnum):
 class StreamRestart:
     """One mid-stream switch of provider, reported to ``on_restart``.
 
-    An object rather than positional arguments so later PRs can add fields
+    An object rather than positional arguments so new fields can be added
     without breaking callbacks already in the wild. ``error`` is the failed
     provider's own exception, never a router summary of it.
 

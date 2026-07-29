@@ -1,13 +1,14 @@
 # Nygen ProviderRouter Agent Guide
 
-Repo-wide rules that apply to every PR package folder (ProviderRouterPR1,
-ProviderRouterPR2, ...). Package-local AGENT.md files add rules specific to
-that package; they do not replace these.
+These repository-wide rules apply to every file in this repository.
+Package-local `AGENTS.md` files add rules for their own directory trees; they
+supplement rather than replace this file.
 
-See `ProviderRouterPR1/Projectplan/ProjectPlan.md` for the full project plan
-and the "Testing philosophy" section it contains -- the two rules below are
-the summary of that section, repeated here so they apply automatically to
-every future PR folder without needing to be copied into each one.
+Use the current source and tests as the primary description of shipped
+behavior. Use `Projectplan/NewProjectPlan.md` for the current roadmap and
+`Projectplan/OldProjectPlan.md` for historical rationale. When they disagree,
+apply them in that order. The two rules below preserve the testing philosophy
+from the plans without requiring it to be copied into package-local guidance.
 
 ## Testing rules (non-negotiable)
 
