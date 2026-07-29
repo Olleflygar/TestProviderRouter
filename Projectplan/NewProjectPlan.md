@@ -12,9 +12,9 @@ optional layers and must not become core import dependencies.
 
 ## Current implementation status
 
-Repository history and source confirm that PR1–5, PR7–10, PR23, and the PR3R
-`CallVariant` redesign have shipped. The old project plan contains 14 unshipped
-PRs: PR6, PR11–22, and PR24.
+Repository history and source confirm that PR1–5, PR7–10, PR12, PR23, and the
+PR3R `CallVariant` redesign have shipped. The old project plan contains 13
+unshipped PRs: PR6, PR11, PR13–22, and PR24.
 
 The roadmap below preserves those PR identifiers, revises overlapping scopes
 where necessary, and adds four candidate PRs. It is ordered by recommended
@@ -32,18 +32,28 @@ implementation sequence rather than numerical PR order.
 - Provider responses retain their native SDK identity unless a framework
   integration explicitly translates them at its own boundary.
 
+## Recently shipped
+
+### PR12 — OpenAI Responses API adapter
+
+**Shipped:** First-class synchronous and streaming OpenAI Responses support.
+
+`OPENAI_RESPONSES` is registered as a built-in protocol for native
+`responses.create` calls. The adapter returns native SDK `Response` objects and
+typed streaming events unchanged, observes completed/incomplete/failed terminal
+states, and shares OpenAI client construction and exception mapping with Chat
+Completions. Incomplete results are served with one visible warning and without
+fallback or provider benching; declared failure events preserve their typed
+details in `ProviderResponsesError`.
+
+Bad requests and invalid operations remain intentional global fail-fast errors
+across protocol variants, while retryable provider failures fall back between
+Chat and Responses. Stored-resource lifecycle operations and provider-owned
+response/conversation affinity remain caller responsibilities.
+
 ## Upcoming PRs
 
-### 1. PR12 — OpenAI Responses API adapter
-
-**Summary:** Add first-class support for the OpenAI Responses protocol.
-
-Translate Responses API operations and streaming events at the adapter boundary
-while leaving routing logic protocol-neutral. The adapter should recognize
-terminal stream events so incomplete streams can be distinguished from
-successful completion.
-
-### 2. PR24 — Framework-neutral token usage instrumentation
+### 1. PR24 — Framework-neutral token usage instrumentation
 
 **Summary:** Record provider-reported input, output, reasoning, and cache-token
 metrics.
@@ -53,7 +63,7 @@ usage record covering streaming and non-streaming responses. Provider adapters
 extract available usage without mutating or wrapping the returned SDK object;
 missing or unfamiliar usage must not break a successful call.
 
-### 3. PR11 — Prompt-size metrics and routing buckets
+### 2. PR11 — Prompt-size metrics and routing buckets
 
 **Summary:** Relate provider latency and reliability to prompt size.
 
@@ -62,7 +72,7 @@ before dispatch to classify requests into broad size buckets. Aggregation and
 score-based routing can then compare providers within the relevant bucket
 instead of blending small and large prompts.
 
-### 4. PR26 — Configurable sticky routing
+### 3. PR26 — Configurable sticky routing
 
 **Summary:** Allow users to opt into retaining a successful provider for future
 calls.
@@ -73,7 +83,7 @@ healthy. The precise affinity and expiration configuration will be resolved
 when constructing this PR's prompt; stickiness remains disabled unless
 selected.
 
-### 5. PR27 — Configurable same-provider retry policy
+### 4. PR27 — Configurable same-provider retry policy
 
 **Summary:** Control bounded retries before cross-provider fallback.
 
@@ -82,7 +92,7 @@ different latency and duplicate-work risks. Retry limits and eligible failure
 categories are explicit configuration, with unsafe request and authentication
 failures excluded and normal fallback preserved after the budget is exhausted.
 
-### 6. PR13 — Storage versioning and shared-backend foundation
+### 5. PR13 — Storage versioning and shared-backend foundation
 
 **Summary:** Prepare the storage layer for evolving schemas and managed
 databases.
@@ -91,7 +101,7 @@ Add explicit schema migrations, remote connection handling, and reporting
 queries while preserving storage-neutral public protocols. Database engines,
 sessions, and raw SQL rows remain private implementation details.
 
-### 7. PR22 — Pre-flight `CallVariant` validation
+### 6. PR22 — Pre-flight `CallVariant` validation
 
 **Summary:** Validate operations and arguments before attempting a provider.
 
@@ -99,7 +109,7 @@ Resolve supported operations and check argument compatibility before entering
 the fallback loop. Invalid calls fail without network traffic or misleading
 provider-health changes.
 
-### 8. PR21 — Automatic capability filtering
+### 7. PR21 — Automatic capability filtering
 
 **Summary:** Exclude providers that cannot satisfy tools, streaming, or
 structured-output requirements.
@@ -109,7 +119,7 @@ with provider capabilities. This restores the hard-filter behaviour removed by
 the PR3R redesign while keeping interpretation limited to known protocol
 fields.
 
-### 9. PR25 — Durable local provider health
+### 8. PR25 — Durable local provider health
 
 **Summary:** Persist provider cooldowns, rate limits, and health observations
 across router lifecycles.
@@ -119,7 +129,7 @@ implementation. This first stage promises durable state on one installation,
 not organization-wide coordination, and storage failures continue to degrade
 safely to in-memory health.
 
-### 10. PR14 — Postgres/Supabase organizational state
+### 9. PR14 — Postgres/Supabase organizational state
 
 **Summary:** Share metrics and health across applications within an
 organization.
@@ -129,7 +139,7 @@ using the interfaces established by PR13 and PR25. DuckDB remains the local
 default; Postgres/Supabase provides the actual multi-application organizational
 store.
 
-### 11. PR15 — Routing profiles
+### 10. PR15 — Routing profiles
 
 **Summary:** Offer simple profiles for speed, reliability, or balanced routing.
 
@@ -138,7 +148,7 @@ rather than introducing a separate scoring system. Cost is excluded from the
 standard profiles, and capability requirements remain hard filters rather than
 weighted preferences.
 
-### 12. PR6 — Manual token-cost calculation
+### 11. PR6 — Manual token-cost calculation
 
 **Summary:** Estimate cost from user-supplied prices and recorded usage.
 
@@ -146,7 +156,7 @@ Add per-million-token pricing configuration and calculate estimated request
 cost from PR24's neutral usage record. Pricing remains visibility-only by
 default: no scraping and no automatic cost influence on core routing.
 
-### 13. PR28 — Optional local metrics dashboard
+### 12. PR28 — Optional local metrics dashboard
 
 **Summary:** Provide a read-only single-page view of provider performance.
 
@@ -155,7 +165,7 @@ rate-limit history, token usage, and configured cost estimates from the
 reporting interface. Ship it as an optional local web extra so dashboard
 dependencies do not affect the core import.
 
-### 14. PR16 — Environment and configuration factories
+### 13. PR16 — Environment and configuration factories
 
 **Summary:** Make common router setup concise and repeatable.
 
@@ -164,7 +174,7 @@ retaining direct `ProviderConfig` construction. Factories may select routing
 profiles and optional stores but must not hide invalid configuration or
 silently enable sticky routing and retries.
 
-### 15. PR19 — Configurable logging hooks
+### 14. PR19 — Configurable logging hooks
 
 **Summary:** Expose routing decisions and failures through standard Python
 logging.
@@ -174,7 +184,7 @@ sticky-provider changes, and storage degradation. Existing internal warnings
 should be consolidated into documented events without adding print-based
 output.
 
-### 16. PR20 — Optional observability hooks
+### 15. PR20 — Optional observability hooks
 
 **Summary:** Integrate routing activity with tracing and custom callbacks.
 
@@ -182,7 +192,7 @@ Provide optional OpenTelemetry, Logfire, and callback integrations using the
 neutral metrics and event model. Observability failures and missing optional
 packages must never break provider calls or the lightweight core import.
 
-### 17. PR18 — Pydantic-AI adapter (very low priority)
+### 16. PR18 — Pydantic-AI adapter (very low priority)
 
 **Summary:** Allow a Pydantic-AI agent to use the router as a model
 implementation.
@@ -197,7 +207,7 @@ The router cannot necessarily be passed directly to a Pydantic-AI `Agent`
 because it does not implement Pydantic AI's model interface. The integration
 must import the router, while the router core must not import Pydantic AI.
 
-### 18. PR17 — LangChain adapter (very low priority)
+### 17. PR17 — LangChain adapter (very low priority)
 
 **Summary:** Allow the router to behave like a LangChain chat model.
 

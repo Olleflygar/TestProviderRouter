@@ -31,10 +31,13 @@ Implementation rules for this package:
   router code (see the design principle below).
 - Required tests must not require real API keys (a live provider test may exist,
   but it must skip when its key is unset).
-- Only the `OPENAI_CHAT` protocol is implemented, dispatched dynamically:
-  `CallVariant.operation` (e.g. `"chat.completions.create"`) is resolved via
+- `OPENAI_CHAT` and `OPENAI_RESPONSES` are built-in protocols, dispatched
+  dynamically: `CallVariant.operation` (for example
+  `"chat.completions.create"` or `"responses.create"`) is resolved via
   `getattr` against an `openai.OpenAI` client, not a hardcoded per-operation
-  method map -- adding a new operation needs no adapter changes.
+  method map. The supported Responses operation is synchronous and streaming
+  `responses.create`; provider-resource retrieval, deletion, cancellation, and
+  history remain caller-owned native SDK work.
 - Hard filters (eligibility) run before routing: enabled, not auth-benched, not
   in cooldown, resolvable API key, protocol has a registered adapter, and
   protocol has a matching `CallVariant` in this specific call. Apart from the
@@ -57,14 +60,15 @@ Implementation rules for this package:
   the new provider's protocol. An auth failure (401/403) benches a provider
   for the rest of the run (`FilterReason.AUTH_DISABLED_THIS_RUN`), and a 429
   or repeated failures bench it temporarily (`FilterReason.IN_COOLDOWN`) --
-  see "Provider health" below; a bad request (400/422), an unresolvable
-  `operation`, or `arguments` that don't match the resolved operation's
-  signature all stop the run immediately instead of trying more providers --
-  these are call-shape problems every provider sharing that protocol would hit
-  identically, so continuing would only bury the real cause. Health state
-  lives on `ProviderRouter` so the filter and any policy can see it. When every
-  tried provider fails, `RouterExhaustedError` enumerates each real failure
-  rather than blending them.
+  see "Provider health" below; a bad request (400/422 or an explicit Responses
+  invalid-input code), an unresolvable `operation`, `arguments` that don't
+  match the resolved operation's signature, or a missing SDK all stop the run
+  immediately instead of trying more providers, including providers using
+  another protocol variant. This global fail-fast rule keeps a broken preferred
+  path visible instead of silently replacing it. Retryable failures still
+  cross protocols. Health state lives on `ProviderRouter` so the filter and any
+  policy can see it. When every tried provider fails, `RouterExhaustedError`
+  enumerates each real failure rather than blending them.
 - Every provider attempt (success or failure) is persisted as one
   `MetricsEvent` behind the swappable `MetricsStore` protocol -- see
   "Metrics persistence" below. Excluded providers are not recorded.
@@ -313,6 +317,14 @@ still act:
   folds them into its own types around `.create()`. The dispatch-specific
   `TypeError`/`AttributeError` handling stays in `invoke()` alone: a mid-stream
   `TypeError` must never be reported as the caller's arguments being wrong.
+- Responses streams yield native typed events unchanged.
+  `response.completed` and `response.incomplete` are terminal served results;
+  incomplete results warn once and do not trigger fallback or benching.
+  `response.failed` and `error` become `ProviderResponsesError` with their
+  native event/response and structured fields retained. Any recognized
+  Responses stream that ends without a terminal result is silently truncated;
+  a genuinely unfamiliar event shape retains the general unrecognized-shape
+  behavior below.
 - `RouterStream` (`router.py`) is a pass-through iterator. Never buffer,
   reorder, or synthesize chunks, and never yield a router-invented marker
   object. Per-chunk work stays at one completion check.

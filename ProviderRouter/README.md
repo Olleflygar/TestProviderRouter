@@ -10,15 +10,16 @@ filters out providers that cannot satisfy the call (hard filters), rotates
 between the eligible providers (round robin), and falls back to another eligible
 provider when one fails.
 
-Only the OpenAI Chat Completions protocol is implemented so far, dispatched via
-the official `openai` Python SDK (used against any OpenAI-compatible `base_url`,
-not just OpenAI itself). Every provider attempt is recorded as an observational
-metrics event behind a swappable `MetricsStore` (DuckDB by default, SQLite as a
-fully-supported alternative) -- see "Metrics persistence" below. Metrics
-aggregation, score calculation, score-based routing, recency weighting,
-provider health, and streaming fallback are implemented. The Responses API,
-token-usage instrumentation, additional storage layers, and framework adapters
-remain planned work.
+OpenAI Chat Completions and OpenAI Responses are built in, both dispatched via
+the official `openai` Python SDK and usable against an OpenAI-compatible
+`base_url`, not just OpenAI itself. The supported Responses operation is
+synchronous or streaming `responses.create`. Every provider attempt is recorded
+as an observational metrics event behind a swappable `MetricsStore` (DuckDB by
+default, SQLite as a fully-supported alternative) -- see "Metrics persistence"
+below. Metrics aggregation, score calculation, score-based routing, recency
+weighting, provider health, and streaming fallback are implemented.
+Token-usage instrumentation, additional storage layers, provider-resource
+management, and framework adapters remain planned or caller-owned work.
 
 The source and tests define shipped behavior. See
 [`../Projectplan/NewProjectPlan.md`](../Projectplan/NewProjectPlan.md) for the
@@ -89,12 +90,106 @@ include `"model"` in `arguments`: the router always injects the selected
 provider's configured `model` itself, and raises before contacting any provider
 if `arguments` already has one.
 
+## OpenAI Responses API
+
+Configure a Responses endpoint with `OPENAI_RESPONSES` and call only the
+supported model-execution operation, `responses.create`:
+
+```python
+router = ProviderRouter(
+    providers=[
+        ProviderConfig(
+            name="provider_a",
+            protocol=ApiProtocol.OPENAI_RESPONSES,
+            model="my-model",
+            base_url="https://api.provider-a.com/v1",
+            api_key_env="PROVIDER_A_API_KEY",
+        )
+    ]
+)
+
+response = router.invoke(
+    [
+        CallVariant(
+            protocol=ApiProtocol.OPENAI_RESPONSES,
+            operation="responses.create",
+            arguments={
+                "input": "Explain why the sky appears blue.",
+                "instructions": "Answer in two sentences.",
+            },
+        )
+    ]
+)
+print(response.output_text)
+```
+
+The return value is the original `openai.types.responses.Response`. Native
+output items, function calls, tool results, structured output, reasoning fields,
+and usage remain available exactly as the installed SDK provides them. The
+router does not translate Chat `messages` into Responses `input`, normalize
+tools, or inspect any other native argument.
+
+Streaming also returns the provider SDK's typed events unchanged:
+
+```python
+stream = router.invoke(
+    [
+        CallVariant(
+            protocol=ApiProtocol.OPENAI_RESPONSES,
+            operation="responses.create",
+            arguments={"input": "Count from one to three.", "stream": True},
+        )
+    ]
+)
+
+for event in stream:
+    if event.type == "response.output_text.delta":
+        print(event.delta, end="")
+
+if stream.usage is not None:
+    print(stream.usage.total_tokens)
+```
+
+The native API differences remain visible:
+
+| Behavior | Chat Completions | Responses |
+| --- | --- | --- |
+| Request content | `messages` | `input` |
+| Stream items | `ChatCompletionChunk` | typed Responses events |
+| Success marker | non-null `finish_reason` | `response.completed` |
+| Served partial result | terminal finish reason such as `length` | `response.incomplete` |
+| Stream usage | optional final usage chunk | terminal event's `response.usage` |
+| Native text access | `response.choices[...]` | `response.output_text` and `response.output` |
+
+`response.incomplete` is terminal and served, including reasons such as
+`max_output_tokens` and `content_filter`. The router returns or yields it,
+records success under the current binary metrics contract, and emits exactly
+one standard-logging warning naming the provider, model, response ID, and reason.
+It does not retry, fall back, or bench the provider. Unknown future reasons are
+reported without being rejected.
+
+`response.failed` and `error` are provider-declared failures. They become
+`ProviderResponsesError`, which preserves the typed event, embedded response,
+provider code, message, and parameter. Clearly retryable codes use the normal
+fallback and health rules; invalid input codes remain global fail-fast errors.
+Queued or in-progress background responses pass through natively.
+
+Only `responses.create` is routed. Retrieval, deletion, cancellation, input-item
+listing, history, and background lifecycle management remain the caller's
+responsibility through the exact provider's native SDK client. Response IDs and
+conversation IDs belong to the endpoint/account that created them.
+`previous_response_id`, conversations, stored responses, and background calls
+may pass through `responses.create`, but the router does not promise that a
+later call will pick the same provider. Preserve provider affinity yourself for
+stateful continuation; stateless calls are safe across interchangeable
+providers.
+
 ## Installing the openai SDK
 
 The core package (`from nygen_router import ProviderRouter`) never requires any
 provider SDK -- that import always works with just `pydantic` installed. The
-`OPENAI_CHAT` protocol's adapter lazily imports `openai` only when it's actually
-invoked, so install the matching extra to use it:
+`OPENAI_CHAT` and `OPENAI_RESPONSES` adapters lazily import `openai` only when
+actually invoked, so install the matching extra to use either:
 
 ```sh
 pip install "nygen-router[openai]"
@@ -172,14 +267,23 @@ happens next:
 - **Auth (HTTP 401/403)** -- record the failure, try the next provider, and bench
   the failing provider for the rest of this process. It is then excluded from
   later calls on the same router with `FilterReason.AUTH_DISABLED_THIS_RUN`.
-- **Bad request (other 4xx, e.g. 400/422)** -- stop immediately. A malformed
-  request is unlikely to fare better on another provider, and trying more would
-  only bury the real cause under unrelated failures.
+- **Bad request (HTTP 400/422, or an explicit Responses invalid-input code)** --
+  stop immediately. A malformed request is unlikely to fare better on another
+  provider, and trying more would only bury the real cause under unrelated
+  failures.
 - **Bad `operation`/`arguments`** -- stop immediately. A `CallVariant.operation`
   that doesn't resolve on the provider's SDK client, or `arguments` that don't
   match its signature, is a caller/config mistake -- every provider sharing that
   protocol would fail the exact same way, so the router surfaces it rather than
   masking it under more failures.
+
+Bad requests, invalid operations/arguments, and a missing required SDK stop the
+entire call even when another protocol variant is available. This global
+fail-fast behavior is intentional: a misconfigured preferred path should remain
+visible instead of silently being replaced by a secondary protocol. These
+failures never bench the provider. Retryable timeout, connection, auth,
+rate-limit, 5xx, and unknown failures still fall back across protocols, using
+each provider's matching operation, arguments, and model.
 
 If every provider actually tried fails (or an unrecoverable failure stops the
 run early), `invoke()` raises `RouterExhaustedError`, whose message enumerates
@@ -330,10 +434,9 @@ When your configured providers expose the same logical model through different
 API protocols, supply one `CallVariant` per protocol -- the router picks
 whichever variant matches the provider it's about to try:
 
-The built-in adapter currently supports only `OPENAI_CHAT`. The
-`ANTHROPIC_MESSAGES` variant below illustrates the multi-protocol call shape
-for a future or custom adapter; without such an adapter, that provider is
-excluded as unsupported.
+Both variants below use built-in adapters. If the selected Chat provider fails
+with a retryable provider error, a Responses provider can be tried next, and
+vice versa:
 
 ```python
 response = router.invoke(
@@ -344,9 +447,9 @@ response = router.invoke(
             arguments={"messages": [{"role": "user", "content": "Hello"}]},
         ),
         CallVariant(
-            protocol=ApiProtocol.ANTHROPIC_MESSAGES,
-            operation="messages.create",
-            arguments={"messages": [{"role": "user", "content": "Hello"}]},
+            protocol=ApiProtocol.OPENAI_RESPONSES,
+            operation="responses.create",
+            arguments={"input": "Hello"},
         ),
     ]
 )
@@ -358,7 +461,9 @@ protocol already supplied raises `DuplicateCallVariantProtocolError`.
 ## Streaming
 
 Pass `stream=True` and iterate. Nothing else changes: the chunks are the
-provider SDK's own objects, in order, unbuffered.
+provider SDK's own objects, in order, unbuffered. Chat yields
+`ChatCompletionChunk` objects; Responses yields typed events such as
+`response.output_text.delta`, as shown in the Responses section above.
 
 ```python
 response = router.invoke(
@@ -423,7 +528,8 @@ router = ProviderRouter(providers=[...], stream_failure_policy=StreamFailurePoli
 
 `RAISE` re-raises the provider's own error, unchanged, after recording the
 failed attempt. Both policies stop immediately on a malformed call (a 400, a
-bad `operation`), since no other provider would do better.
+bad `operation`), across protocol variants, since hiding a broken preferred
+path behind another variant would make configuration defects harder to find.
 
 ### Stopping early
 
@@ -448,7 +554,11 @@ code and records nothing.
 ### When truncation cannot be detected
 
 A stream counts as successful only if it ended after the provider marked it
-finished. For OpenAI-compatible chat streams that marker is `finish_reason`.
+finished. For OpenAI-compatible Chat streams that marker is `finish_reason`;
+for Responses streams it is `response.completed` or the explicitly served
+terminal result `response.incomplete`. A recognized Responses stream that ends
+without either terminal event is treated as interrupted. A declared
+`response.failed` or `error` event is a provider failure, not stream data.
 
 If a provider sends chunks in a shape the adapter does not recognize, there is
 no marker to read, so the router will not claim a truncation it cannot
@@ -716,10 +826,12 @@ debugging. The contract:
   `UnsupportedOperationError` / `InvalidOperationArgumentsError` (bad
   `operation`/`arguments`),
   `ProviderTimeoutError` / `ProviderConnectionError` / `ProviderError` (transport),
-  `ProviderHTTPError` (HTTP status), `ProviderStreamInterruptedError` (a stream
+  `ProviderHTTPError` (HTTP status), `ProviderResponsesError` (a native
+  `response.failed`/`error` result), `ProviderStreamInterruptedError` (a stream
   ended without the provider ever marking it finished). Provider-specific
   errors name the provider and model; aggregate errors enumerate the relevant
-  providers.
+  providers. `ProviderResponsesError.event` and `.response` retain typed native
+  objects; `.error_code`, `.message`, and `.param` retain provider fields.
 - **Originals are chained, never re-wrapped.** Transport and SDK failures keep
   the exact `openai`/`httpx` exception type in the message and attach it as both
   `__cause__` and `.original`.

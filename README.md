@@ -118,6 +118,63 @@ the model configured for whichever provider it selects. API keys can also be
 passed directly to `ProviderConfig`, but environment-variable names keep secrets
 out of source code.
 
+## OpenAI Responses API
+
+`OPENAI_RESPONSES` is also built in. Use the native Responses `input` field and
+read the real SDK response, including conveniences such as `output_text`:
+
+```python
+responses_router = ProviderRouter(
+    providers=[
+        ProviderConfig(
+            name="provider_a_responses",
+            protocol=ApiProtocol.OPENAI_RESPONSES,
+            model="provider-a/model-name",
+            base_url="https://provider-a.example.com/v1",
+            api_key_env="PROVIDER_A_API_KEY",
+        )
+    ],
+    metrics_store=None,
+)
+
+response = responses_router.invoke(
+    [
+        CallVariant(
+            protocol=ApiProtocol.OPENAI_RESPONSES,
+            operation="responses.create",
+            arguments={"input": "Write a short product description."},
+        )
+    ]
+)
+print(response.output_text)
+```
+
+For streaming, pass `stream=True` and iterate native typed Responses events:
+
+```python
+stream = responses_router.invoke(
+    [
+        CallVariant(
+            protocol=ApiProtocol.OPENAI_RESPONSES,
+            operation="responses.create",
+            arguments={"input": "Write a short product description.", "stream": True},
+        )
+    ]
+)
+
+for event in stream:
+    if event.type == "response.output_text.delta":
+        print(event.delta, end="")
+```
+
+Chat uses `messages` and yields Chat Completion chunks; Responses uses `input`
+and yields typed events ending in `response.completed` or
+`response.incomplete`. An incomplete response is a served result: it warns once
+but does not fall back or bench the provider. Stored responses, continuation
+IDs, conversations, and background lifecycles are provider-owned state; callers
+must preserve provider affinity when using them. Stateless routed calls are the
+safe interchangeable-provider pattern.
+
 ## LangChain
 
 LangChain can call the same router explicitly through a `RunnableLambda`. The
@@ -185,8 +242,8 @@ For each call, Nygen Router:
 6. Uses that recent history to improve later choices when ScoreBasedPolicy is enabled.
 ```
 
-Capability inference, cost-aware routing, built-in adapters for additional
-provider protocols, and framework-specific adapters are not part of the current
+Capability inference, cost-aware routing, built-in adapters beyond the two
+OpenAI protocols, and framework-specific adapters are not part of the current
 shipped implementation. The examples above show the integration surface
 available today: workflows keep their own structure and delegate only the
 provider call to Nygen Router.
