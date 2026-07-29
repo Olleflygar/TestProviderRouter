@@ -15,3 +15,4 @@ WorkflowTests/*.duckdb.wal
 
 CODEBASE_AUDIT.md
 scoring_health_summary.tex
+prompt_constructions.txt
