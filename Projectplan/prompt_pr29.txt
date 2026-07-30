@@ -1,0 +1,759 @@
+# Execution prompt: PR29 — Corrective metrics identity and history partitioning
+
+You are implementing **PR29 — Corrective metrics identity and history partitioning** in the existing `nygen-router` repository.
+
+This is an implementation task, not a design task. The specification below is the approved result of a requirements interview concerning a recently discovered correctness flaw. The corrective PR was not previously specified in `Projectplan/Newprojectplan.md`, `Projectplan/OldProjectPlan.md`, or the other planning files.
+
+If the earlier metrics-partitioning conversation is available, read it as the primary rationale. This prompt is its complete, authoritative implementation specification. Use the current repository to identify exact integration points and established patterns. Do not redesign or expand the agreed behavior. If this specification genuinely conflicts with an unchangeable repository constraint, stop and report the conflict rather than inventing a resolution.
+
+Work in the existing repository and package at `ProviderRouter/`. Do not create a sibling project.
+
+## Sources and precedence
+
+Before making changes, read in full:
+
+- root `AGENTS.md`;
+- `ProviderRouter/AGENTS.md`;
+- `ProviderRouter/README.md`;
+- `Projectplan/Newprojectplan.md`;
+- the relevant historical sections of `Projectplan/OldProjectPlan.md`;
+- current metrics, storage, configuration, routing, policy, aggregation, scoring, health, error, adapter, and streaming source;
+- all tests touching those areas;
+- existing PR execution prompts to follow repository conventions.
+
+The current source and tests describe shipped behavior. This PR deliberately supersedes current claims that:
+
+- provider name is the metrics or health identity;
+- provider names must be unique;
+- one fixed model means name-only aggregation is sufficient;
+- `MetricsEvent.stream` adequately identifies call type;
+- `ScoreBasedPolicy.use_streaming` should independently select the scored call type;
+- older `provider_attempts` schemas should always be altered in place;
+- every schema column must wait until its producer PR.
+
+Only the changes explicitly described below supersede those constraints. Preserve all unrelated architecture and behavior.
+
+## Problem
+
+Metrics history is currently queried for the entire recent window and aggregated mainly by provider name. The default DuckDB database is shared at `~/.nygen_router/metrics.duckdb`. Reusing a display name across applications, environments, models, protocols, provider accounts, endpoints, credentials, or configurations can blend unrelated history and produce incorrect routing scores.
+
+Provider name is also used by health and diagnostic structures. Once duplicate display names are allowed, name-only health, attempts, exclusions, errors, and restart records become ambiguous.
+
+Streaming telemetry has a related semantic flaw: `stream=True` currently means a stream successfully opened. A requested streaming call that fails before opening is recorded as a failed regular call. Streaming scoring consequently misses the failure, while regular history may incorrectly receive it.
+
+PR29 establishes explicit scope, stable provider identity, declared call type, and unambiguous streaming observations before global/shared storage work continues.
+
+## Git workflow
+
+Work on the current branch in place.
+
+Before the first PR29-related repository change:
+
+1. Inspect repository status.
+2. If the worktree is dirty, stop and report the existing changes; do not overwrite or absorb them.
+3. Confirm `pr29-start` and `pr29-complete` do not already exist unexpectedly.
+4. Create local tag `pr29-start` on the current commit immediately before the first PR29 change.
+5. If creating the tag requires an approval prompt, first explain plainly that permission is needed to write the local Git tag marking the pre-implementation state.
+
+Create `Projectplan/prompt_pr29.txt` as the planning-history copy of this execution specification, following the existing per-PR prompt convention.
+
+Commit logical milestones with clear messages. Do not push commits or tags. Create `pr29-complete` only after every implementation, validation, documentation, diff-review, commit, and clean-worktree requirement below is satisfied.
+
+## Authoritative identity model
+
+### Required provider identity
+
+Add a required, nonblank, stable `provider_id: str` field to `ProviderConfig`.
+
+`provider_id` is the canonical identity wherever program behavior must distinguish configured providers:
+
+- metrics recording and matching;
+- aggregation and scoring;
+- health state;
+- health reports and reset operations;
+- provider attempts;
+- eligibility and exclusion records;
+- fallback and restart records;
+- provider-specific exception attributes;
+- internal dictionaries, sets, and lookup keys.
+
+Reject duplicate provider IDs within one `ProviderRouter` before any routing work. The error must name every duplicated ID without exposing secrets.
+
+`ProviderConfig.name` remains required and nonblank but becomes display metadata. Duplicate names within one router are valid. Recommend distinct names in documentation, but do not enforce uniqueness.
+
+Where duplicate names could make diagnostics ambiguous, logs, errors, reports, and callbacks must expose both display name and provider ID. For example:
+
+```text
+Provider "OpenAI" (id="openai-project-a") timed out
+```
+
+Retain provider names in public diagnostic records where they help humans, but never use them as identity or filtering keys.
+
+Separate provider IDs are expected for distinct performance or failure domains, including different:
+
+- provider accounts;
+- API-key quota domains;
+- deployments;
+- gateways;
+- endpoints that should learn independently.
+
+Do not record, hash, compare, or expose API keys. Users distinguish credentials through explicit provider IDs.
+
+The same provider ID may intentionally appear in different metrics scopes. This enables explicitly requested cross-scope history sharing.
+
+Changing display name alone preserves history. Changing model or protocol creates a different metrics partition. Changing base URL alone does not automatically create a different partition; assigning a new provider ID is how a user declares a different account, endpoint, deployment, quota, or failure domain.
+
+### Required metrics scope
+
+Add a required, nonblank, plain-string `metrics_scope` configuration to `ProviderRouter`.
+
+Prefer a required keyword argument so callers must specify it explicitly without silently falling into a shared default:
+
+```python
+router = ProviderRouter(
+    providers=[...],
+    metrics_scope="customer-support:production",
+)
+```
+
+Every newly recorded event must contain a non-null scope. There is no unscoped event-writing mode and no default `"global"` or `"default"` scope.
+
+Add a public `HistoryScope` enum with at least:
+
+```python
+HistoryScope.CURRENT
+HistoryScope.ALL
+```
+
+`ScoreBasedPolicy.history_scope` defaults to `HistoryScope.CURRENT`.
+
+- `CURRENT` reads only events matching the router’s current required `metrics_scope`.
+- `ALL` deliberately ignores scope during reads and combines otherwise matching provider partitions across every recorded scope.
+- `ALL` affects reading only. Events written by that router still contain its configured scope.
+
+Export new public types consistently from the package root without adding optional import dependencies.
+
+## Declared call type
+
+Add a public required enum to `CallVariant`:
+
+```python
+class CallType(StrEnum):
+    REGULAR = "regular"
+    STREAMING = "streaming"
+```
+
+Every `CallVariant` must explicitly declare `call_type`; there is no default.
+
+Example:
+
+```python
+CallVariant(
+    protocol=ApiProtocol.OPENAI_CHAT,
+    operation="chat.completions.create",
+    call_type=CallType.STREAMING,
+    arguments={
+        "messages": [...],
+        "stream": True,
+    },
+)
+```
+
+The router must never inspect native arguments to infer, validate, inject, or reconcile call type. In particular, do not read `arguments["stream"]`. The caller owns consistency between `CallVariant.call_type` and native provider arguments.
+
+Continue passing `CallVariant.arguments` through unchanged except for the existing model injection. Document `call_type` as router metadata, not request-shaping configuration.
+
+All variants supplied to one `ProviderRouter.invoke()` must declare the same call type. Fallback must never change a caller from a regular response contract to a streaming response contract or vice versa.
+
+Validate this before contacting a provider. Add a narrow typed router error, following the existing `DuplicateCallVariantProtocolError` and transparent-error patterns, for mixed call types. It must describe the conflicting protocols/call types without inspecting arguments or leaking secrets.
+
+Place the invocation’s call type in frozen `RoutingContext`.
+
+Remove `ScoreBasedPolicy.use_streaming` as a public configuration source. The policy must automatically score the partition matching `RoutingContext.call_type`. Do not retain two independently configurable settings that can contradict each other.
+
+## Metrics partition
+
+For score-based routing, matching observations are identified by:
+
+```text
+metrics_scope, when HistoryScope.CURRENT
++ provider_id
++ model
++ protocol
++ CallVariant.call_type
+```
+
+When `HistoryScope.ALL` is selected, scope is intentionally omitted from matching, while every other dimension remains required.
+
+These are not PR29 partition dimensions:
+
+- provider display name;
+- base URL;
+- operation string;
+- capabilities or tools;
+- request-size bucket.
+
+Request-size bucket is reserved in the schema by this PR but becomes a matching/scoring dimension only when PR11 implements its producer and routing behavior.
+
+## Metrics event and schema
+
+Redesign `MetricsEvent` to include at least:
+
+```python
+metrics_scope: str
+provider_id: str
+provider_name: str
+model: str
+protocol: ApiProtocol
+call_type: CallType
+success: bool
+stream_opened: bool | None
+latency_ms: float | None
+total_duration_ms: float | None
+error_type: str | None
+request_size_bucket: str | None
+id: str
+timestamp: datetime
+```
+
+Preserve established UUID and timezone-aware UTC behavior.
+
+Use `provider_name` only as recorded display metadata. Current configuration supplies the display name used in current stats, logs, and reports; an old event’s former name must not prevent matching the same provider ID.
+
+Replace the overloaded `stream` field with explicit `call_type` and `stream_opened` semantics in the new schema. Do not preserve the old ambiguous meaning in new runtime logic.
+
+Define the new `provider_attempts` table along these lines, using the project’s existing cross-engine-compatible SQL conventions:
+
+```sql
+CREATE TABLE IF NOT EXISTS provider_attempts (
+    id TEXT PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    metrics_scope TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    provider_name TEXT NOT NULL,
+    model TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    call_type TEXT NOT NULL,
+    success INTEGER NOT NULL,
+    stream_opened INTEGER,
+    latency_ms REAL,
+    total_duration_ms REAL,
+    error_type TEXT,
+    request_size_bucket TEXT
+)
+```
+
+Keep serialization and deserialization column order mirrored in one shared source, as today. DuckDB and SQLite must remain byte-equivalent in logical schema and behavior.
+
+### Existing databases: no migration and no modification
+
+Keep the table name `provider_attempts`. Do not introduce another database file or versioned table.
+
+Previous history format is completely out of scope:
+
+- no `ALTER TABLE`;
+- no migration;
+- no backfill;
+- no inferred scope;
+- no inferred provider ID;
+- no inferred call type;
+- no row updates;
+- no row deletion;
+- no table deletion or recreation;
+- no automatic database deletion;
+- no compatibility query over legacy rows.
+
+When `provider_attempts` already exists, inspect its schema read-only. If it does not match the complete new required schema, leave the table and database untouched and treat the store as unavailable through the project’s established graceful-degradation behavior. Raise an actionable storage/schema mismatch internally so direct store users can understand the incompatibility; router calls must continue without allowing metrics failure to replace a provider response.
+
+Do not silently create another database, rename the old table, or fragment history.
+
+The maintainer’s local pre-PR29 database contains only development/test history and may be removed manually outside this PR. The implementing session must not remove or modify it.
+
+Remove or retire the current automatic `_ADDED_COLUMNS` migration behavior as necessary to enforce this contract. Update migration tests deliberately rather than deleting them: they must now prove an incompatible legacy table is detected and remains unchanged.
+
+For a newly absent table, create the exact new schema. If a supposedly new-format table exists but is malformed, do not repair, delete, or recreate it.
+
+## Reserved request-size bucket
+
+Add nullable `request_size_bucket TEXT` to the new schema and `request_size_bucket: str | None = None` to `MetricsEvent`.
+
+Round-trip explicitly supplied values through DuckDB and SQLite conformance tests, but PR29 must not:
+
+- inspect request arguments;
+- estimate request size;
+- assign bucket values in the router;
+- define final bucket boundaries;
+- define the final PR11 enum;
+- filter by bucket;
+- aggregate by bucket;
+- score by bucket.
+
+All PR29 router-produced events record `NULL`.
+
+Update `Projectplan/Newprojectplan.md`, the PR11 section of `Projectplan/OldProjectPlan.md`, `ProviderRouter/AGENTS.md`, and other relevant planning guidance so future PR11 prompt construction and execution clearly understand:
+
+- PR29 already added the event field and database column;
+- PR11 must populate it;
+- PR11 owns estimation, bucket values/boundaries, query filtering, aggregation, and bucket-aware scoring;
+- PR11 must not add the column a second time.
+
+Document this as an explicit scoped exception to the former “columns arrive only with their data source” rule.
+
+## MetricsStore query contract
+
+Preserve the small, pluggable `MetricsStore` abstraction with `record_attempt` and `query_recent`. Do not expose database sessions, SQL rows, engines, DuckDB objects, or SQLite objects outside storage implementations.
+
+Evolve `query_recent` consistently for the corrected dimensions:
+
+```python
+query_recent(
+    *,
+    since: datetime,
+    metrics_scope: str | None = None,
+    provider_id: str | None = None,
+    model: str | None = None,
+    protocol: ApiProtocol | None = None,
+    call_type: CallType | None = None,
+) -> list[MetricsEvent]
+```
+
+Semantics:
+
+- `since` remains required and timezone-aware.
+- `metrics_scope=<string>` filters to that exact scope.
+- `metrics_scope=None` intentionally means all scopes.
+- Other non-null filters match exactly.
+- Remove provider-name filtering; name is not identity.
+- Results remain chronological ascending.
+- DuckDB, SQLite, and test fakes implement the same contract.
+- Use parameterized SQL only.
+
+Do not add bucket filtering yet.
+
+## Aggregation and scoring
+
+Replace name-only aggregation with composite matching.
+
+`aggregate_stats` must remain pure Python over events already returned by the store. It must have enough typed input to compare each event against the current configured providers and invocation call type.
+
+For every provider being scored, require exact equality of:
+
+```text
+event.provider_id == provider.provider_id
+event.model == provider.model
+event.protocol == provider.protocol
+event.call_type == context.call_type
+```
+
+Scope is selected by the preceding store query:
+
+- current scope for `HistoryScope.CURRENT`;
+- all scopes for `HistoryScope.ALL`.
+
+Events that mismatch any required dimension must not affect attempts, successes, latency, errors, or scores.
+
+Return and look up statistics by unique `provider_id`, never by display name. Update `ProviderStats` and `ProviderScore` identity fields accordingly. They may retain the current configuration’s display name as non-key metadata.
+
+Preserve the existing regular and streaming statistical fields unless a smaller internal adjustment is required, but ensure only the declared invocation call type influences the selected score. Propagate `CallType` through scoring coherently; do not reintroduce an independently configurable streaming boolean.
+
+`ScoreBasedPolicy` must:
+
+1. call its tie-break policy exactly once on a copy of eligible providers;
+2. use `RoutingContext.metrics_scope` and its own `HistoryScope` to make one recent-history query;
+3. aggregate only matching provider/model/protocol/call-type events;
+4. retain current recency weighting behavior;
+5. retain optimistic-start behavior for a partition with no evidence;
+6. calculate scores keyed by provider ID;
+7. use one stable descending sort, preserving tie-break order;
+8. gracefully return tie-break order when metrics are unavailable.
+
+`HistoryScope.ALL` deliberately combines matching provider IDs across scopes. It must not combine different provider IDs, models, protocols, or call types.
+
+Preserve current score mathematics unless identity/call-type plumbing requires signature changes. Do not introduce request-size scoring, cost scoring, operation scoring, cache changes, or new weights.
+
+## Streaming telemetry semantics
+
+For every attempt, distinguish:
+
+- `call_type`: what the caller declared;
+- `stream_opened`: what the router observed;
+- `success`: whether the attempt ultimately succeeded;
+- completion/interruption through the existing stream machinery.
+
+Required cases:
+
+| Declared call type | Stream opened | Result | Recorded classification |
+| --- | --- | --- | --- |
+| Regular | Not applicable | Success/failure | `REGULAR`, `stream_opened=None`, real success |
+| Streaming | No | Opening failure | `STREAMING`, `stream_opened=False`, `success=False` |
+| Streaming | Yes | Mid-stream failure | `STREAMING`, `stream_opened=True`, `success=False` |
+| Streaming | Yes | Completed | `STREAMING`, `stream_opened=True`, `success=True` |
+
+A `NormalizedStream` returned by an adapter establishes `stream_opened=True`. A declared streaming attempt that fails before such a return records `False`.
+
+Continue recording streaming outcomes at the point the outcome is known, not at stream opening. Preserve existing `RouterStream` completion, failure, restart, truncation, close, and health timing unless explicitly changed here.
+
+### Timing
+
+- Regular successful `latency_ms` remains full-response latency.
+- Streaming `latency_ms` always means time to first chunk.
+- If no first chunk arrives, streaming `latency_ms` is `NULL`.
+- Never repurpose streaming `latency_ms` as time until failure.
+- `total_duration_ms` records elapsed attempt time to streaming completion or failure, including failure before a stream opens.
+- Streaming successes with `latency_ms=NULL` do not contribute `0`; they are excluded from average TTFT.
+- Failed attempts never contribute to average latency or TTFT.
+- They still contribute to attempt count, failure rate, error tallies, health, and scoring evidence as appropriate.
+- Preserve the current rule that a stream’s success is decided at observed completion, not opening.
+
+Do not inspect native arguments to verify that declared call type matches the actual provider request. Caller configuration is authoritative. Continue using observed returned shape only for `stream_opened` and existing stream control flow.
+
+## Canonical provider identity across runtime behavior
+
+Convert all internal provider-keyed state from name to provider ID.
+
+At minimum, review and update:
+
+- `ProviderRouter._health`;
+- hard filters;
+- health recording and lookup;
+- `health_report()`;
+- `reset_health()`;
+- duplicate checks;
+- policy score maps;
+- fallback attempt records;
+- `EligibilityResult`;
+- `ProviderAttempt`;
+- `StreamRestart`;
+- stream interruption and restart diagnostics;
+- provider-specific exceptions;
+- adapter error construction;
+- logs and warning deduplication sets where provider identity matters.
+
+`health_report()` must be keyed by provider ID. `reset_health()` accepts provider ID, not display name. Unknown-ID errors list configured IDs and remain transparent.
+
+Public diagnostic records should carry both `provider_id` and `provider_name` where callers need stable identity plus readable display. Provider-specific exceptions must expose `provider_id`; retain `provider_name` for readable messages and compatibility where practical.
+
+Do not allow duplicate names to collide in dictionaries, reports, tests, fake adapter behavior, or logs.
+
+Health remains router-instance-local as before. PR29 changes its key, not its persistence model. Do not pull durable health from PR25 into this PR.
+
+## Expected source touch points
+
+Inspect and update the exact current implementation rather than assuming this list is exhaustive:
+
+- `ProviderRouter/src/nygen_router/config.py`
+- `ProviderRouter/src/nygen_router/types.py`
+- `ProviderRouter/src/nygen_router/metrics.py`
+- `ProviderRouter/src/nygen_router/storage/base.py`
+- `ProviderRouter/src/nygen_router/storage/duckdb.py`
+- `ProviderRouter/src/nygen_router/storage/sqlite.py`
+- `ProviderRouter/src/nygen_router/stats.py`
+- `ProviderRouter/src/nygen_router/scoring.py`
+- `ProviderRouter/src/nygen_router/policies/base.py`
+- `ProviderRouter/src/nygen_router/policies/score_based.py`
+- `ProviderRouter/src/nygen_router/policies/round_robin.py`
+- `ProviderRouter/src/nygen_router/filters.py`
+- `ProviderRouter/src/nygen_router/health.py`
+- `ProviderRouter/src/nygen_router/errors.py`
+- `ProviderRouter/src/nygen_router/router.py`
+- built-in adapters where provider-specific errors are constructed
+- package exports
+- relevant tests
+- documentation and plans listed below
+
+Keep `router.py` SDK-free. Keep DuckDB and provider SDK imports lazy. Do not introduce new runtime dependencies.
+
+## Testing requirements
+
+Follow both repository-wide testing rules:
+
+- no monkeypatching internal collaborators;
+- do not delete existing tests.
+
+Updating an existing test is allowed only where PR29 deliberately changes the exact behavior or required API it asserted. Preserve it as regression coverage under the new contract.
+
+Use public seams, injected stores, fake adapters, fake normalized streams, deterministic clocks, temporary database paths, and environment-variable monkeypatching where appropriate. Do not require real API keys or network calls.
+
+Add focused new regression coverage, preferably in clearly named additive files, for at least the following.
+
+### Configuration and identity
+
+- `ProviderConfig.provider_id` is required, trimmed, and rejects blank values.
+- `ProviderRouter.metrics_scope` is required, trimmed, and rejects blank values.
+- duplicate provider IDs in one router are rejected before calls;
+- duplicate provider names are accepted;
+- diagnostics distinguish duplicate-named providers by ID;
+- renaming a provider while keeping ID/model/protocol/scope preserves its matching history;
+- same display name with different provider IDs never blends;
+- same provider ID with different models never blends;
+- same provider ID/model with different protocols never blends;
+- distinct IDs representing separate API keys have separate health and score histories;
+- no API-key value appears in events, errors, logs, or tests.
+
+### Call type
+
+- `CallVariant.call_type` is required and accepts the enum/string values through established Pydantic behavior;
+- mixed call types in one invocation fail before adapter contact, health changes, or metrics writes;
+- native arguments are passed through unchanged and are never inspected for `stream`;
+- `RoutingContext` carries call type;
+- `ScoreBasedPolicy` automatically selects the matching call-type history;
+- the old independently configurable `use_streaming` behavior is removed from code, tests, and docs.
+
+### Scope behavior
+
+- every router-written event contains the required configured scope;
+- `HistoryScope.CURRENT` is the default;
+- current mode ignores matching events from other scopes;
+- `HistoryScope.ALL` combines otherwise identical partitions across scopes;
+- all-scope mode still writes the current router’s scope;
+- all-scope mode never combines different provider IDs, models, protocols, or call types;
+- score policy makes one query and preserves graceful tie-break fallback.
+
+### Storage and schema
+
+Run the shared conformance suite against SQLite and DuckDB:
+
+- exact schema is created on first use;
+- every event field round-trips correctly;
+- `request_size_bucket=None` round-trips;
+- an explicitly constructed non-null bucket value round-trips, even though router code never produces one;
+- each supported `query_recent` filter works independently and in combination;
+- `metrics_scope=None` returns all scopes;
+- provider name is not a query identity filter;
+- timestamps remain UTC-aware and chronological;
+- IDs remain unique;
+- SQL remains parameterized;
+- close behavior remains valid.
+
+Create incompatible legacy tables in temporary databases and prove for both backends:
+
+- connection/query/write detects incompatibility;
+- the legacy table is not altered;
+- its columns remain unchanged;
+- its rows remain unchanged;
+- no replacement table or database is created;
+- no backfill, delete, or rename occurs;
+- router operation degrades safely when that store is injected.
+
+Do not access or remove the maintainer’s real default metrics file in tests.
+
+### Aggregation and scoring
+
+- aggregation keys results by provider ID;
+- display-name collisions do not collide;
+- wrong ID, model, protocol, or call type events are ignored completely;
+- current and all-scope policy behavior produces expected different scores;
+- a brand-new partition receives the existing optimistic start;
+- flat lookback and recency half-life behavior remain correct;
+- stable tie-breaking and ranked fallback remain correct;
+- request-size bucket values do not affect PR29 aggregation or scoring;
+- exact diagnostic tallies retain their established weighting behavior.
+
+### Streaming telemetry
+
+Cover all four classification rows listed above, including ordinary invocation and fallback/restart paths:
+
+- declared streaming failure before open records `call_type=STREAMING`, `stream_opened=False`, `success=False`;
+- opened stream failure records `stream_opened=True`, `success=False`;
+- completed stream records `stream_opened=True`, `success=True`;
+- regular calls record `stream_opened=None`;
+- no-first-chunk streaming attempts record `latency_ms=None`;
+- pre-open failures record `latency_ms=None` and a measured `total_duration_ms`;
+- mid-stream failures without a first chunk behave the same for latency;
+- successful streams with missing latency are excluded from average TTFT;
+- failed streaming attempts influence streaming success rate but not average TTFT;
+- streaming failures never contaminate regular statistics;
+- existing completion, truncation, restart, close, and health-at-stream-end behavior remains intact.
+
+### Runtime provider identity
+
+- health state for duplicate-named providers remains independent by ID;
+- `health_report()` is keyed by ID;
+- `reset_health(provider_id)` resets only the requested ID;
+- unknown-ID reset errors are clear;
+- eligibility/exclusion results carry stable IDs;
+- fallback attempts carry IDs;
+- restart records identify failed and next provider IDs plus display names;
+- provider-specific errors expose ID and readable name;
+- logs remain useful with duplicate names;
+- no unrelated health semantics change.
+
+### Architectural regression checks
+
+- custom `MetricsStore`, adapter factory, protocol, clock, tie-break policy, and stream seams continue working;
+- core imports remain lightweight without DuckDB, OpenAI, HTTPX, or other optional packages;
+- provider SDK imports remain method-local;
+- successful provider responses remain native and untouched;
+- storage failures never replace successful provider responses;
+- no new external dependency is introduced.
+
+## Implementation validation sequence
+
+During implementation:
+
+1. Run focused tests for each changed layer.
+2. Run storage conformance tests for both backends.
+3. Run metrics aggregation/scoring/policy tests.
+4. Run health, filtering, fallback, mixed-protocol, error, and streaming tests.
+5. Run the full suite.
+6. Fix every regression before documentation synchronization.
+
+Do not make live provider calls.
+
+## Final repository synchronization
+
+Only after runtime behavior and focused/full tests are stable, perform a documentation-only synchronization pass. Do not introduce new runtime behavior during this phase.
+
+Review and update all affected explanatory material, including where relevant:
+
+- root `README.md`;
+- `ProviderRouter/README.md`;
+- root `AGENTS.md`;
+- `ProviderRouter/AGENTS.md`;
+- `Projectplan/Newprojectplan.md`;
+- narrow historical notes in `Projectplan/OldProjectPlan.md`;
+- `Projectplan/prompt_pr29.txt`;
+- metrics/storage/scoring/routing/streaming documentation;
+- configuration and usage examples;
+- migration/setup guidance;
+- comments and docstrings;
+- package exports and public API descriptions.
+
+Required documentation outcomes:
+
+1. Record **PR29 — Corrective metrics identity and history partitioning** as an unplanned prerequisite discovered after the existing roadmap was written.
+2. Mark PR29 shipped only after implementation and validation requirements are satisfied.
+3. Position it before remaining planned metrics and shared-storage work.
+4. Explain the original name-only history-blending flaw.
+5. Document required `provider_id` and `metrics_scope`.
+6. Document duplicate-name support and unique provider-ID enforcement.
+7. Document provider ID as the canonical metrics, health, attempts, and diagnostic identity.
+8. Document `HistoryScope.CURRENT` and explicit `HistoryScope.ALL`.
+9. Document required `CallVariant.call_type` and removal of score-policy `use_streaming`.
+10. Document that native arguments remain opaque and caller configuration must be consistent.
+11. Document `call_type`, `stream_opened`, success, TTFT, total duration, and null-latency averaging semantics.
+12. Document the exact new-schema/no-migration rule.
+13. State that incompatible existing databases are left untouched and must be manually replaced by their owner.
+14. Never instruct runtime code to delete a user database.
+15. Explain that `request_size_bucket` is reserved and null in PR29.
+16. Correct PR11 planning text so it populates and uses the existing field rather than adding it.
+17. Search for and correct stale claims about:
+    - provider names being identity;
+    - unique provider names;
+    - rename causing a metrics cold start;
+    - no per-model grouping;
+    - `event.stream` defining call type;
+    - `use_streaming` configuration;
+    - automatic additive migration of every old table;
+    - PR11 needing to add the bucket column.
+18. Preserve `OldProjectPlan.md` as history. Add narrow correction notes; do not rewrite old PR specifications as though PR29 had existed then.
+19. Use the actual filename casing `Newprojectplan.md` in current references.
+20. Do not manufacture unrelated documentation changes.
+
+## Final quality gates
+
+Run from the package’s established working environment, using its `.venv` executables where available:
+
+```sh
+ruff format .
+ruff check .
+mypy src
+pytest
+coverage run -m pytest
+coverage report
+```
+
+Also run focused lightweight-import validation proving:
+
+```python
+from nygen_router import ProviderRouter
+```
+
+does not require optional provider SDKs, DuckDB, HTTPX, framework integrations, or observability packages.
+
+Review quality output rather than reporting command names alone. Resolve all failures. If any required check cannot run, exhaust safe in-scope remedies and report the blocker. Do not create `pr29-complete` with any required check failing or unverified.
+
+After checks:
+
+1. Inspect `git diff` and committed history for unrelated changes.
+2. Confirm no user database was accessed, deleted, migrated, or modified.
+3. Confirm no existing tests were deleted.
+4. Confirm all PR29 changes, including documentation synchronization, are committed.
+5. Confirm the worktree is clean.
+6. Create local tag `pr29-complete` on the final PR29 commit.
+7. Verify `pr29-start` and `pr29-complete` point to the intended commits.
+8. Do not push.
+
+## Out of scope
+
+Do not implement:
+
+- request-size estimation or bucket assignment;
+- bucket filtering, aggregation, or scoring;
+- PR11’s bucket enum or boundaries;
+- PR13 schema versioning or remote connection foundation;
+- Postgres or Supabase storage;
+- durable health persistence;
+- request argument inspection for streaming, tools, size, or capabilities;
+- capability filtering;
+- operation-name partitioning;
+- base-URL hashing or automatic provider fingerprints;
+- API-key storage, hashing, or comparison;
+- cost, usage, pricing, dashboard, observability, or framework work;
+- automatic deletion, alteration, migration, backfill, or replacement of old databases;
+- unrelated refactoring.
+
+## Completion report
+
+End with these sections:
+
+### Implementation summary
+
+Describe the corrected identity, scope, call-type, schema, streaming, health, query, aggregation, and scoring behavior.
+
+### Files changed
+
+One bullet per file with a concise purpose.
+
+### Approved decisions checklist
+
+Confirm individually:
+
+- required provider ID;
+- required metrics scope;
+- current/all history behavior;
+- duplicate display names;
+- provider ID as canonical runtime identity;
+- required call-type enum;
+- no argument inspection;
+- automatic call-type scoring;
+- streaming observation/timing semantics;
+- exact new schema;
+- no legacy database modification;
+- reserved-only request-size bucket;
+- no PR11 behavior pulled forward.
+
+Mark any deviation explicitly with its reason.
+
+### Tests and quality gates
+
+Report focused tests, full tests, formatting, linting, typing, coverage, and lightweight-import results. Include concise command summaries and failures if any.
+
+### Documentation synchronization
+
+List plans, guidance, examples, migration notes, and stale claims corrected.
+
+### Git state
+
+Report:
+
+- final commit ID;
+- `pr29-start` target;
+- `pr29-complete` target;
+- clean-worktree confirmation;
+- confirmation that nothing was pushed;
+- confirmation that no real user metrics database was modified.
+
+### Deviations and concerns
+
+Report any interpretation, conflict, incomplete validation, or remaining concern, or write `None`.
