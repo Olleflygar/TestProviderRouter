@@ -3,7 +3,9 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
+from nygen_router.config import ApiProtocol
 from nygen_router.metrics import MetricsEvent
 from nygen_router.storage.base import (
     CREATE_PROVIDER_ATTEMPTS_TABLE_SQL,
@@ -11,10 +13,10 @@ from nygen_router.storage.base import (
     TABLE_INFO_SQL,
     build_query_recent_sql,
     event_to_params,
-    existing_column_names,
-    missing_column_sql,
     row_to_event,
+    validate_provider_attempts_schema,
 )
+from nygen_router.types import CallType
 
 
 class SQLiteMetricsStore:
@@ -37,11 +39,19 @@ class SQLiteMetricsStore:
         self,
         *,
         since: datetime,
-        provider_name: str | None = None,
+        metrics_scope: str | None = None,
+        provider_id: str | None = None,
         model: str | None = None,
+        protocol: ApiProtocol | None = None,
+        call_type: CallType | None = None,
     ) -> list[MetricsEvent]:
         query, params = build_query_recent_sql(
-            since=since, provider_name=provider_name, model=model
+            since=since,
+            metrics_scope=metrics_scope,
+            provider_id=provider_id,
+            model=model,
+            protocol=protocol,
+            call_type=call_type,
         )
         connection = self._connect()
         rows = connection.execute(query, params).fetchall()
@@ -54,12 +64,19 @@ class SQLiteMetricsStore:
 
     def _connect(self) -> sqlite3.Connection:
         if self._connection is None:
+            if self.path.exists():
+                uri = f"file:{quote(str(self.path))}?mode=ro"
+                inspection = sqlite3.connect(uri, uri=True)
+                try:
+                    rows = inspection.execute(TABLE_INFO_SQL).fetchall()
+                    if rows:
+                        validate_provider_attempts_schema(rows)
+                finally:
+                    inspection.close()
             self.path.parent.mkdir(parents=True, exist_ok=True)
             connection = sqlite3.connect(str(self.path))
             connection.execute(CREATE_PROVIDER_ATTEMPTS_TABLE_SQL)
-            columns = existing_column_names(connection.execute(TABLE_INFO_SQL).fetchall())
-            for statement in missing_column_sql(columns):
-                connection.execute(statement)
+            validate_provider_attempts_schema(connection.execute(TABLE_INFO_SQL).fetchall())
             connection.commit()
             self._connection = connection
         return self._connection

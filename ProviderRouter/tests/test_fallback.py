@@ -6,6 +6,7 @@ import pytest
 
 from nygen_router import (
     ApiProtocol,
+    CallType,
     CallVariant,
     FilterReason,
     NoEligibleProvidersError,
@@ -22,6 +23,7 @@ from nygen_router import (
 
 def _config(name: str, *, enabled: bool = True) -> ProviderConfig:
     return ProviderConfig(
+        provider_id=name,
         name=name,
         protocol=ApiProtocol.OPENAI_CHAT,
         model="model-a",
@@ -34,6 +36,7 @@ def _config(name: str, *, enabled: bool = True) -> ProviderConfig:
 def _calls() -> list[CallVariant]:
     return [
         CallVariant(
+            call_type=CallType.REGULAR,
             protocol=ApiProtocol.OPENAI_CHAT,
             operation="chat.completions.create",
             arguments={"messages": [{"role": "user", "content": "hi"}]},
@@ -42,12 +45,18 @@ def _calls() -> list[CallVariant]:
 
 
 def _timeout(name: str) -> ProviderTimeoutError:
-    return ProviderTimeoutError(f"Provider {name!r} timed out", provider_name=name, model="model-a")
+    return ProviderTimeoutError(
+        f"Provider {name!r} timed out", provider_id=name, provider_name=name, model="model-a"
+    )
 
 
 def _http(name: str, status: int) -> ProviderHTTPError:
     return ProviderHTTPError(
-        provider_name=name, model="model-a", status_code=status, message=f"status {status}"
+        provider_id=name,
+        provider_name=name,
+        model="model-a",
+        status_code=status,
+        message=f"status {status}",
     )
 
 
@@ -94,7 +103,9 @@ def _router(
     def factory(config: ProviderConfig) -> _ScriptedAdapter:
         return _ScriptedAdapter(config, behaviors, invoked)
 
-    router = ProviderRouter(providers=providers, adapter_factory=factory, policy=_StaticPolicy())
+    router = ProviderRouter(
+        metrics_scope="test", providers=providers, adapter_factory=factory, policy=_StaticPolicy()
+    )
     return router, invoked
 
 
@@ -156,7 +167,7 @@ def test_fallback_tries_second_provider_on_connection_error() -> None:
     fallback path above.
     """
     connect_error = ProviderConnectionError(
-        "could not connect", provider_name="provider_a", model="model-a"
+        "could not connect", provider_id="provider_a", provider_name="provider_a", model="model-a"
     )
     providers = [_config("provider_a"), _config("provider_b")]
     router, invoked = _router(providers, {"provider_a": connect_error})
@@ -229,7 +240,9 @@ def test_all_providers_fail_raises_with_each_distinct_reason() -> None:
 def test_unsupported_operation_stops_immediately_without_trying_more_providers() -> None:
     """A bad operation/arguments is a call-shape problem, not a per-provider one -- stop."""
     providers = [_config("provider_a"), _config("provider_b")]
-    bad_op = UnsupportedOperationError("bad operation", provider_name="provider_a", model="model-a")
+    bad_op = UnsupportedOperationError(
+        "bad operation", provider_id="provider_a", provider_name="provider_a", model="model-a"
+    )
     router, invoked = _router(providers, {"provider_a": bad_op})
 
     with pytest.raises(RouterExhaustedError) as exc_info:

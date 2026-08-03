@@ -8,6 +8,7 @@ import pytest
 
 from nygen_router import (
     ApiProtocol,
+    CallType,
     CallVariant,
     MetricsEvent,
     ProviderConfig,
@@ -34,16 +35,22 @@ class _FakeStore:
         self,
         *,
         since: datetime,
-        provider_name: str | None = None,
+        metrics_scope: str | None = None,
+        provider_id: str | None = None,
         model: str | None = None,
+        protocol: ApiProtocol | None = None,
+        call_type: CallType | None = None,
     ) -> list[MetricsEvent]:
         self.queries.append(since)
         return [
             event
             for event in self.events
             if event.timestamp >= since
-            and (provider_name is None or event.provider_name == provider_name)
+            and (metrics_scope is None or event.metrics_scope == metrics_scope)
+            and (provider_id is None or event.provider_id == provider_id)
             and (model is None or event.model == model)
+            and (protocol is None or event.protocol == protocol)
+            and (call_type is None or event.call_type == call_type)
         ]
 
 
@@ -55,8 +62,11 @@ class _FailingStore:
         self,
         *,
         since: datetime,
-        provider_name: str | None = None,
+        metrics_scope: str | None = None,
+        provider_id: str | None = None,
         model: str | None = None,
+        protocol: ApiProtocol | None = None,
+        call_type: CallType | None = None,
     ) -> list[MetricsEvent]:
         raise RuntimeError("history database is unavailable")
 
@@ -97,6 +107,7 @@ class _ScriptedAdapter:
 
 def _config(name: str, *, enabled: bool = True) -> ProviderConfig:
     return ProviderConfig(
+        provider_id=name,
         name=name,
         protocol=ApiProtocol.OPENAI_CHAT,
         model="model-a",
@@ -115,13 +126,15 @@ def _event(
     stream: bool = False,
 ) -> MetricsEvent:
     return MetricsEvent(
+        provider_id=provider_name,
+        metrics_scope="test",
+        call_type=CallType.STREAMING if stream else CallType.REGULAR,
         provider_name=provider_name,
         model="model-a",
         protocol=ApiProtocol.OPENAI_CHAT,
         success=success,
         latency_ms=latency_ms,
         error_type=None if success else "server_error",
-        stream=stream,
         timestamp=timestamp,
     )
 
@@ -129,6 +142,7 @@ def _event(
 def _calls() -> list[CallVariant]:
     return [
         CallVariant(
+            call_type=CallType.REGULAR,
             protocol=ApiProtocol.OPENAI_CHAT,
             operation="chat.completions.create",
             arguments={"messages": [{"role": "user", "content": "hi"}]},
@@ -183,7 +197,7 @@ def test_best_score_orders_first_and_router_falls_back_to_the_next_ranked() -> N
         tie_break_policy=_ReverseTiePolicy(),
         now=lambda: fixed_now,
     )
-    context = RoutingContext(metrics_store=store)
+    context = RoutingContext(metrics_scope="test", call_type=CallType.REGULAR, metrics_store=store)
 
     assert [provider.name for provider in policy.order(providers, context)] == [
         "best",
@@ -192,12 +206,15 @@ def test_best_score_orders_first_and_router_falls_back_to_the_next_ranked() -> N
     ]
 
     invoked: list[str] = []
-    failure = ProviderTimeoutError("best timed out", provider_name="best", model="model-a")
+    failure = ProviderTimeoutError(
+        "best timed out", provider_id="best", provider_name="best", model="model-a"
+    )
 
     def factory(config: ProviderConfig) -> _ScriptedAdapter:
         return _ScriptedAdapter(config, {"best": failure}, invoked)
 
     router = ProviderRouter(
+        metrics_scope="test",
         providers=providers,
         adapter_factory=factory,
         policy=policy,
@@ -210,7 +227,9 @@ def test_best_score_orders_first_and_router_falls_back_to_the_next_ranked() -> N
 
 def test_equal_scores_keep_default_round_robin_tie_break_order() -> None:
     providers = [_config("provider_a"), _config("provider_b")]
-    context = RoutingContext(metrics_store=_FakeStore())
+    context = RoutingContext(
+        metrics_scope="test", call_type=CallType.REGULAR, metrics_store=_FakeStore()
+    )
     score_policy = ScoreBasedPolicy()
     round_robin = RoundRobinPolicy()
 
@@ -223,7 +242,7 @@ def test_equal_scores_keep_default_round_robin_tie_break_order() -> None:
 def test_no_metrics_store_returns_the_exact_tie_break_result() -> None:
     providers = [_config("provider_a"), _config("provider_b")]
     tie_break = _ReverseTiePolicy()
-    context = RoutingContext(metrics_store=None)
+    context = RoutingContext(metrics_scope="test", call_type=CallType.REGULAR, metrics_store=None)
     policy = ScoreBasedPolicy(tie_break_policy=tie_break)
 
     result = policy.order(providers, context)
@@ -236,7 +255,13 @@ def test_empty_eligible_list_returns_without_querying_history() -> None:
     store = _FakeStore()
     policy = ScoreBasedPolicy()
 
-    assert policy.order([], RoutingContext(metrics_store=store)) == []
+    assert (
+        policy.order(
+            [],
+            RoutingContext(metrics_scope="test", call_type=CallType.REGULAR, metrics_store=store),
+        )
+        == []
+    )
     assert store.queries == []
 
 
@@ -246,7 +271,9 @@ def test_query_failure_degrades_to_tie_break_order_and_deduplicates_warning(
     providers = [_config("provider_a"), _config("provider_b")]
     tie_break = _ReverseTiePolicy()
     policy = ScoreBasedPolicy(tie_break_policy=tie_break)
-    context = RoutingContext(metrics_store=_FailingStore())
+    context = RoutingContext(
+        metrics_scope="test", call_type=CallType.REGULAR, metrics_store=_FailingStore()
+    )
 
     with caplog.at_level(logging.DEBUG, logger="nygen_router.policies.score_based"):
         first = policy.order(providers, context)
@@ -281,13 +308,16 @@ def test_score_policy_only_receives_and_returns_eligible_providers() -> None:
     )
     policy = ScoreBasedPolicy(now=lambda: fixed_now)
 
-    ordered = policy.order(eligible, RoutingContext(metrics_store=store))
+    ordered = policy.order(
+        eligible,
+        RoutingContext(metrics_scope="test", call_type=CallType.REGULAR, metrics_store=store),
+    )
 
     assert [provider.name for provider in ordered] == ["eligible"]
     assert [result.provider_name for result in excluded] == ["disabled"]
 
 
-def test_regular_and_streaming_policy_instances_prefer_opposite_histories() -> None:
+def test_routing_context_call_type_automatically_selects_opposite_histories() -> None:
     fixed_now = datetime(2026, 7, 27, 12, tzinfo=UTC)
     providers = [_config("regular_star"), _config("streaming_star")]
     store = _FakeStore(
@@ -324,12 +354,16 @@ def test_regular_and_streaming_policy_instances_prefer_opposite_histories() -> N
             ),
         ]
     )
-    context = RoutingContext(metrics_store=store)
-    regular_policy = ScoreBasedPolicy(use_streaming=False, now=lambda: fixed_now)
-    streaming_policy = ScoreBasedPolicy(use_streaming=True, now=lambda: fixed_now)
+    policy = ScoreBasedPolicy(now=lambda: fixed_now)
+    regular_context = RoutingContext(
+        metrics_scope="test", call_type=CallType.REGULAR, metrics_store=store
+    )
+    streaming_context = RoutingContext(
+        metrics_scope="test", call_type=CallType.STREAMING, metrics_store=store
+    )
 
-    regular_order = regular_policy.order(providers, context)
-    streaming_order = streaming_policy.order(providers, context)
+    regular_order = policy.order(providers, regular_context)
+    streaming_order = policy.order(providers, streaming_context)
 
     assert [provider.name for provider in regular_order] == [
         "regular_star",
@@ -359,7 +393,10 @@ def test_event_older_than_lookback_has_zero_effect() -> None:
         now=lambda: fixed_now,
     )
 
-    ordered = policy.order(providers, RoutingContext(metrics_store=store))
+    ordered = policy.order(
+        providers,
+        RoutingContext(metrics_scope="test", call_type=CallType.REGULAR, metrics_store=store),
+    )
 
     assert store.queries == [fixed_now - timedelta(hours=24)]
     assert [provider.name for provider in ordered] == ["provider_b", "provider_a"]
@@ -372,7 +409,7 @@ def test_non_positive_lookback_is_rejected(lookback_hours: float) -> None:
 
 
 def test_routing_context_is_frozen() -> None:
-    context = RoutingContext(metrics_store=None)
+    context = RoutingContext(metrics_scope="test", call_type=CallType.REGULAR, metrics_store=None)
 
     with pytest.raises(FrozenInstanceError):
         context.metrics_store = _FakeStore()  # type: ignore[misc]
@@ -388,6 +425,7 @@ def test_custom_two_argument_policy_is_honored_and_receives_the_routers_store() 
         return _ScriptedAdapter(config, {}, invoked)
 
     router = ProviderRouter(
+        metrics_scope="test",
         providers=providers,
         adapter_factory=factory,
         policy=policy,

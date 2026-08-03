@@ -9,6 +9,7 @@ from nygen_router.errors import MissingApiKeyError
 
 def test_valid_openai_compatible_config() -> None:
     config = ProviderConfig(
+        provider_id="provider_a",
         name="provider_a",
         protocol=ApiProtocol.OPENAI_CHAT,
         model="model-a",
@@ -23,6 +24,7 @@ def test_valid_openai_compatible_config() -> None:
 def test_empty_name_rejected() -> None:
     with pytest.raises(ValidationError):
         ProviderConfig(
+            provider_id=" ",
             name=" ",
             protocol=ApiProtocol.OPENAI_CHAT,
             model="model-a",
@@ -34,6 +36,7 @@ def test_empty_name_rejected() -> None:
 def test_empty_model_rejected() -> None:
     with pytest.raises(ValidationError):
         ProviderConfig(
+            provider_id="provider_a",
             name="provider_a",
             protocol=ApiProtocol.OPENAI_CHAT,
             model=" ",
@@ -45,6 +48,7 @@ def test_empty_model_rejected() -> None:
 def test_missing_base_url_rejected_for_openai_chat() -> None:
     with pytest.raises(ValidationError):
         ProviderConfig(
+            provider_id="provider_a",
             name="provider_a",
             protocol=ApiProtocol.OPENAI_CHAT,
             model="model-a",
@@ -55,6 +59,7 @@ def test_missing_base_url_rejected_for_openai_chat() -> None:
 def test_missing_base_url_rejected_for_openai_responses() -> None:
     with pytest.raises(ValidationError):
         ProviderConfig(
+            provider_id="provider_a",
             name="provider_a",
             protocol=ApiProtocol.OPENAI_RESPONSES,
             model="model-a",
@@ -65,6 +70,7 @@ def test_missing_base_url_rejected_for_openai_responses() -> None:
 def test_missing_api_key_and_api_key_env_rejected() -> None:
     with pytest.raises(ValidationError):
         ProviderConfig(
+            provider_id="provider_a",
             name="provider_a",
             protocol=ApiProtocol.OPENAI_CHAT,
             model="model-a",
@@ -74,6 +80,7 @@ def test_missing_api_key_and_api_key_env_rejected() -> None:
 
 def test_explicit_api_key_resolves() -> None:
     config = ProviderConfig(
+        provider_id="provider_a",
         name="provider_a",
         protocol=ApiProtocol.OPENAI_CHAT,
         model="model-a",
@@ -87,6 +94,7 @@ def test_explicit_api_key_resolves() -> None:
 def test_api_key_env_resolves_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PROVIDER_A_API_KEY", "secret-from-env")
     config = ProviderConfig(
+        provider_id="provider_a",
         name="provider_a",
         protocol=ApiProtocol.OPENAI_CHAT,
         model="model-a",
@@ -100,6 +108,7 @@ def test_api_key_env_resolves_from_environment(monkeypatch: pytest.MonkeyPatch) 
 def test_missing_env_var_raises_missing_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("PROVIDER_A_API_KEY", raising=False)
     config = ProviderConfig(
+        provider_id="provider_a",
         name="provider_a",
         protocol=ApiProtocol.OPENAI_CHAT,
         model="model-a",

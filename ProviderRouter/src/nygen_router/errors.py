@@ -8,7 +8,7 @@ if TYPE_CHECKING:
     import httpx
 
     from nygen_router.config import ApiProtocol
-    from nygen_router.types import EligibilityResult, ProviderAttempt
+    from nygen_router.types import CallType, EligibilityResult, ProviderAttempt
 
 
 class NygenRouterError(Exception):
@@ -25,25 +25,32 @@ class ConfigError(NygenRouterError):
     """Invalid configuration, detected before any request is sent."""
 
 
+def _provider_label(provider_name: str, provider_id: str) -> str:
+    return f'Provider "{provider_name}" (id="{provider_id}")'
+
+
 class MissingApiKeyError(ConfigError):
-    def __init__(self, provider_name: str, env_var: str | None = None) -> None:
+    def __init__(self, provider_id: str, provider_name: str, env_var: str | None = None) -> None:
         """Build a message hinting how to supply the missing key."""
+        self.provider_id = provider_id
         self.provider_name = provider_name
         self.env_var = env_var
         if env_var:
             hint = f"pass api_key=... to ProviderConfig or set the {env_var!r} environment variable"
         else:
             hint = "pass api_key=... to ProviderConfig or set api_key_env to a populated variable"
-        super().__init__(f"No API key for provider {provider_name!r}: {hint}.")
+        super().__init__(f"No API key for {_provider_label(provider_name, provider_id)}: {hint}.")
 
 
 class UnsupportedProtocolError(NygenRouterError):
-    def __init__(self, provider_name: str, protocol: object) -> None:
+    def __init__(self, provider_id: str, provider_name: str, protocol: object) -> None:
         """Flag a provider configured with a protocol no adapter handles yet."""
+        self.provider_id = provider_id
         self.provider_name = provider_name
         self.protocol = protocol
         super().__init__(
-            f"Provider {provider_name!r} uses protocol {str(protocol)!r}, which is not "
+            f"{_provider_label(provider_name, provider_id)} uses protocol "
+            f"{str(protocol)!r}, which is not "
             f"supported by the built-in adapter factory (supported protocols are "
             f"'openai_chat' and 'openai_responses')."
         )
@@ -73,17 +80,37 @@ class DuplicateCallVariantProtocolError(ConfigError):
         )
 
 
+class MixedCallTypeError(ConfigError):
+    """CallVariants in one invocation declare conflicting response contracts."""
+
+    def __init__(self, conflicts: list[tuple[ApiProtocol, CallType]]) -> None:
+        self.conflicts = conflicts
+        detail = ", ".join(
+            f"{protocol.value}={call_type.value}" for protocol, call_type in conflicts
+        )
+        super().__init__(
+            "All CallVariants in one invoke() call must declare the same call_type; "
+            f"received {detail}."
+        )
+
+
 class ProviderSDKNotInstalledError(ConfigError):
     """The provider SDK a protocol's adapter needs is not installed."""
 
     def __init__(
-        self, provider_name: str, package: str, original: BaseException | None = None
+        self,
+        provider_id: str,
+        provider_name: str,
+        package: str,
+        original: BaseException | None = None,
     ) -> None:
+        self.provider_id = provider_id
         self.provider_name = provider_name
         self.package = package
         self.original = original
         super().__init__(
-            f"Provider {provider_name!r} requires the {package!r} package, which is not "
+            f"{_provider_label(provider_name, provider_id)} requires the {package!r} package, "
+            "which is not "
             f'installed: pip install "nygen-router[{package}]".'
         )
 
@@ -102,7 +129,10 @@ class NoEligibleProvidersError(NygenRouterError):
 
     def __init__(self, exclusions: list[EligibilityResult]) -> None:
         self.exclusions = exclusions
-        detail = "; ".join(f"{result.provider_name}: {result.detail}" for result in exclusions)
+        detail = "; ".join(
+            f'{result.provider_name} (id="{result.provider_id}"): {result.detail}'
+            for result in exclusions
+        )
         super().__init__(f"No eligible providers for this request: {detail}.")
 
 
@@ -117,7 +147,10 @@ class RouterExhaustedError(NygenRouterError):
 
     def __init__(self, attempts: list[ProviderAttempt]) -> None:
         self.attempts = attempts
-        detail = "; ".join(f"{attempt.provider_name}: {attempt.error}" for attempt in attempts)
+        detail = "; ".join(
+            f'{attempt.provider_name} (id="{attempt.provider_id}"): {attempt.error}'
+            for attempt in attempts
+        )
         super().__init__(f"All attempted providers failed: {detail}.")
 
 
@@ -132,10 +165,12 @@ class ProviderError(NygenRouterError):
         self,
         message: str,
         *,
+        provider_id: str,
         provider_name: str,
         model: str,
         original: BaseException | None = None,
     ) -> None:
+        self.provider_id = provider_id
         self.provider_name = provider_name
         self.model = model
         self.original = original
@@ -173,6 +208,7 @@ class ProviderResponsesError(ProviderError):
     def __init__(
         self,
         *,
+        provider_id: str,
         provider_name: str,
         model: str,
         message: str,
@@ -189,8 +225,10 @@ class ProviderResponsesError(ProviderError):
         tags = "/".join(tag for tag in (error_code, param) if tag)
         tag_suffix = f" [{tags}]" if tags else ""
         super().__init__(
-            f"Provider {provider_name!r} Responses API failed for model {model!r}: "
+            f"{_provider_label(provider_name, provider_id)} Responses API failed for model "
+            f"{model!r}: "
             f"{message}{tag_suffix}",
+            provider_id=provider_id,
             provider_name=provider_name,
             model=model,
         )
@@ -208,6 +246,7 @@ class ProviderHTTPError(ProviderError):
     def __init__(
         self,
         *,
+        provider_id: str,
         provider_name: str,
         model: str,
         status_code: int,
@@ -232,8 +271,9 @@ class ProviderHTTPError(ProviderError):
         tags = "/".join(tag for tag in (error_type, error_code) if tag)
         tag_suffix = f" [{tags}]" if tags else ""
         super().__init__(
-            f"Provider {provider_name!r} returned {status} for model {model!r}: "
+            f"{_provider_label(provider_name, provider_id)} returned {status} for model {model!r}: "
             f"{detail}{tag_suffix}",
+            provider_id=provider_id,
             provider_name=provider_name,
             model=model,
             original=original,

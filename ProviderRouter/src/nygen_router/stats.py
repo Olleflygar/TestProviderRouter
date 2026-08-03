@@ -3,8 +3,10 @@ from __future__ import annotations
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 
+from nygen_router.config import ProviderConfig
 from nygen_router.errors import ErrorCategory
 from nygen_router.metrics import MetricsEvent
+from nygen_router.types import CallType
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,7 @@ class ProviderStats:
     latency to average: no evidence is reported as no evidence, never as 0.0.
     """
 
+    provider_id: str
     provider_name: str
     regular_attempt_count: float
     regular_success_count: float
@@ -48,7 +51,8 @@ class ProviderStats:
 
 def aggregate_stats(
     events: Sequence[MetricsEvent],
-    provider_names: Collection[str],
+    providers: Collection[ProviderConfig],
+    call_type: CallType,
     *,
     weight_fn: Callable[[MetricsEvent], float] | None = None,
 ) -> dict[str, ProviderStats]:
@@ -59,7 +63,7 @@ def aggregate_stats(
     here in Python rather than in per-backend SQL, so a custom backend stays
     trivial to implement.
 
-    Every name in ``provider_names`` gets an entry, including one with no
+    Every provider ID in ``providers`` gets an entry, including one with no
     matching events at all -- the same "every configured provider is reported"
     rule ``health_report()`` follows, so a brand-new provider is a real entry
     with no evidence rather than a missing key its caller has to special-case.
@@ -70,13 +74,27 @@ def aggregate_stats(
     which is plain counting.
     """
     weight_of = _flat_weight if weight_fn is None else weight_fn
-    accumulators = {name: _Accumulator() for name in dict.fromkeys(provider_names)}
+    configured = {provider.provider_id: provider for provider in providers}
+    accumulators = {provider_id: _Accumulator() for provider_id in configured}
     for event in events:
-        accumulator = accumulators.get(event.provider_name)
-        if accumulator is None:
+        provider = configured.get(event.provider_id)
+        if provider is None or not _matches_partition(event, provider, call_type):
             continue
+        accumulator = accumulators[event.provider_id]
         accumulator.add(event, weight_of(event))
-    return {name: accumulator.build(name) for name, accumulator in accumulators.items()}
+    return {
+        provider_id: accumulator.build(configured[provider_id])
+        for provider_id, accumulator in accumulators.items()
+    }
+
+
+def _matches_partition(event: MetricsEvent, provider: ProviderConfig, call_type: CallType) -> bool:
+    return (
+        event.provider_id == provider.provider_id
+        and event.model == provider.model
+        and event.protocol == provider.protocol
+        and event.call_type == call_type
+    )
 
 
 def _flat_weight(event: MetricsEvent) -> float:
@@ -128,7 +146,7 @@ class _Accumulator:
     timeouts: int = 0
 
     def add(self, event: MetricsEvent, weight: float) -> None:
-        bucket = self.streaming if event.stream else self.regular
+        bucket = self.streaming if event.call_type is CallType.STREAMING else self.regular
         bucket.add(event, weight)
         if event.success:
             return
@@ -140,9 +158,10 @@ class _Accumulator:
         elif event.error_type == ErrorCategory.TIMEOUT.value:
             self.timeouts += 1
 
-    def build(self, provider_name: str) -> ProviderStats:
+    def build(self, provider: ProviderConfig) -> ProviderStats:
         return ProviderStats(
-            provider_name=provider_name,
+            provider_id=provider.provider_id,
+            provider_name=provider.name,
             regular_attempt_count=self.regular.attempts,
             regular_success_count=self.regular.successes,
             regular_success_rate=self.regular.success_rate,

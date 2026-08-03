@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from nygen_router import ApiProtocol, MetricsEvent
+from nygen_router import ApiProtocol, CallType, MetricsEvent
+from nygen_router.storage.base import MetricsSchemaMismatchError
 from nygen_router.storage.duckdb import DuckDBMetricsStore
 
 _DUCKDB_AVAILABLE = importlib.util.find_spec("duckdb") is not None
@@ -27,6 +28,9 @@ def test_default_path_resolves_under_redirected_home(
 
     store.record_attempt(
         MetricsEvent(
+            provider_id="provider_a",
+            metrics_scope="test",
+            call_type=CallType.REGULAR,
             provider_name="provider_a",
             model="model-a",
             protocol=ApiProtocol.OPENAI_CHAT,
@@ -49,6 +53,9 @@ def test_custom_path_is_honored(tmp_path: Path) -> None:
 
     store.record_attempt(
         MetricsEvent(
+            provider_id="provider_a",
+            metrics_scope="test",
+            call_type=CallType.REGULAR,
             provider_name="provider_a",
             model="model-a",
             protocol=ApiProtocol.OPENAI_CHAT,
@@ -80,6 +87,7 @@ def test_sdk_available_false_warns_only_once_when_router_writes(
             return "response"
 
     config = ProviderConfig(
+        provider_id="provider_a",
         name="provider_a",
         protocol=ApiProtocol.OPENAI_CHAT,
         model="model-a",
@@ -88,6 +96,7 @@ def test_sdk_available_false_warns_only_once_when_router_writes(
     )
     calls = [
         CallVariant(
+            call_type=CallType.REGULAR,
             protocol=ApiProtocol.OPENAI_CHAT,
             operation="chat.completions.create",
             arguments={"messages": []},
@@ -97,6 +106,7 @@ def test_sdk_available_false_warns_only_once_when_router_writes(
     with caplog.at_level(logging.WARNING):
         store = DuckDBMetricsStore(sdk_available=False)
         router = ProviderRouter(
+            metrics_scope="test",
             providers=[config],
             adapter_factory=lambda _: _Adapter(),
             metrics_store=store,
@@ -110,10 +120,10 @@ def test_sdk_available_false_warns_only_once_when_router_writes(
 
 
 @requires_duckdb
-def test_metrics_file_written_before_the_stream_columns_is_migrated_on_connect(
+def test_incompatible_legacy_table_is_detected_and_left_unchanged(
     tmp_path: Path,
 ) -> None:
-    """The same check-and-ALTER as SQLite, since DuckDB is the default backend."""
+    """PR29 never alters, deletes, renames, or backfills a legacy table."""
     import duckdb
 
     path = tmp_path / "metrics.duckdb"
@@ -142,26 +152,30 @@ def test_metrics_file_written_before_the_stream_columns_is_migrated_on_connect(
     connection.close()
 
     store = DuckDBMetricsStore(path)
-    store.record_attempt(
-        MetricsEvent(
-            provider_name="provider_b",
-            model="model-a",
-            protocol=ApiProtocol.OPENAI_CHAT,
-            success=True,
-            latency_ms=8.0,
-            stream=True,
-            total_duration_ms=900.0,
-        )
-    )
-    events = store.query_recent(since=recorded_at - timedelta(seconds=1))
+    with pytest.raises(MetricsSchemaMismatchError, match="left untouched"):
+        store.query_recent(since=recorded_at - timedelta(seconds=1))
 
-    old_event, new_event = events
-    assert old_event.id == "old"
-    assert old_event.stream is False
-    assert old_event.total_duration_ms is None
-    assert new_event.stream is True
-    assert new_event.total_duration_ms == 900.0
-    store.close()
+    inspection = duckdb.connect(str(path), read_only=True)
+    try:
+        columns = inspection.execute("PRAGMA table_info('provider_attempts')").fetchall()
+        rows = inspection.execute("SELECT * FROM provider_attempts").fetchall()
+        tables = inspection.execute("SHOW TABLES").fetchall()
+    finally:
+        inspection.close()
+    assert [row[1] for row in columns] == [
+        "id",
+        "timestamp",
+        "provider_name",
+        "model",
+        "protocol",
+        "success",
+        "latency_ms",
+        "error_type",
+    ]
+    assert rows == [
+        ("old", recorded_at.isoformat(), "provider_a", "model-a", "openai_chat", 1, 5.0, None)
+    ]
+    assert tables == [("provider_attempts",)]
 
 
 @requires_duckdb
@@ -171,6 +185,9 @@ def test_query_recent_reads_back_recorded_events(tmp_path: Path) -> None:
 
     store.record_attempt(
         MetricsEvent(
+            provider_id="provider_a",
+            metrics_scope="test",
+            call_type=CallType.REGULAR,
             provider_name="provider_a",
             model="model-a",
             protocol=ApiProtocol.OPENAI_CHAT,

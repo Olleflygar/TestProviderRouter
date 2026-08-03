@@ -4,6 +4,7 @@ import pytest
 
 from nygen_router import (
     ApiProtocol,
+    CallType,
     CallVariant,
     FilterReason,
     NoEligibleProvidersError,
@@ -25,6 +26,7 @@ def _config(
     api_key_env: str | None = None,
 ) -> ProviderConfig:
     return ProviderConfig(
+        provider_id=name,
         name=name,
         protocol=ApiProtocol.OPENAI_CHAT,
         model="model-a",
@@ -38,6 +40,7 @@ def _config(
 def _calls() -> list[CallVariant]:
     return [
         CallVariant(
+            call_type=CallType.REGULAR,
             protocol=ApiProtocol.OPENAI_CHAT,
             operation="chat.completions.create",
             arguments={"messages": [{"role": "user", "content": "hi"}]},
@@ -81,6 +84,7 @@ def test_provider_without_api_key_is_excluded(monkeypatch: pytest.MonkeyPatch) -
 
 def test_unsupported_protocol_is_excluded() -> None:
     provider = ProviderConfig(
+        provider_id="anthropic",
         name="anthropic",
         protocol=ApiProtocol.ANTHROPIC_MESSAGES,
         model="claude-model",
@@ -188,14 +192,14 @@ def test_all_providers_filtered_out_raises_with_each_specific_reason(
         _config("provider_a", enabled=False),
         _config("provider_c", api_key=None, api_key_env="NYGEN_TEST_MISSING_KEY_2"),
     ]
-    router = ProviderRouter(providers=providers)
+    router = ProviderRouter(metrics_scope="test", providers=providers)
 
     with pytest.raises(NoEligibleProvidersError) as exc_info:
         router.invoke(_calls())
 
     message = str(exc_info.value)
-    assert "provider_a: provider is disabled" in message
-    assert "provider_c: no API key available" in message
+    assert 'provider_a (id="provider_a"): provider is disabled' in message
+    assert 'provider_c (id="provider_c"): no API key available' in message
     assert {result.provider_name for result in exc_info.value.exclusions} == {
         "provider_a",
         "provider_c",
@@ -207,6 +211,7 @@ def test_successful_call_only_invokes_eligible_provider() -> None:
     invoked: list[str] = []
     providers = [_config("provider_a", enabled=False), _config("provider_b")]
     router = ProviderRouter(
+        metrics_scope="test",
         providers=providers,
         adapter_factory=lambda config: _TrackingAdapter(config, invoked),
     )

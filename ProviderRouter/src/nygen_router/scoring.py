@@ -6,6 +6,7 @@ from typing import Self
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from nygen_router.stats import ProviderStats
+from nygen_router.types import CallType
 
 
 class ScoreWeights(BaseModel):
@@ -59,6 +60,7 @@ class ScoreWeights(BaseModel):
 class ProviderScore:
     """One provider's comparable total with its explainable components."""
 
+    provider_id: str
     provider_name: str
     total: float
     success_quality: float
@@ -69,10 +71,10 @@ def calculate_provider_score(
     stats: ProviderStats,
     weights: ScoreWeights,
     *,
-    use_streaming: bool = False,
+    call_type: CallType = CallType.REGULAR,
 ) -> ProviderScore:
     """Turn one provider's operation-specific observations into a pure score."""
-    if use_streaming:
+    if call_type is CallType.STREAMING:
         attempt_count = stats.streaming_attempt_count
         success_count = stats.streaming_success_count
         success_rate = stats.streaming_success_rate
@@ -103,6 +105,7 @@ def calculate_provider_score(
     )
 
     return ProviderScore(
+        provider_id=stats.provider_id,
         provider_name=stats.provider_name,
         total=total,
         success_quality=success_quality,

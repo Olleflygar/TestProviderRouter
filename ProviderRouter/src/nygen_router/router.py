@@ -16,6 +16,7 @@ from nygen_router.errors import (
     ConfigError,
     DuplicateCallVariantProtocolError,
     ErrorCategory,
+    MixedCallTypeError,
     ModelArgumentConflictError,
     NoEligibleProvidersError,
     NoProvidersConfiguredError,
@@ -35,7 +36,7 @@ from nygen_router.metrics import MetricsEvent
 from nygen_router.policies import Policy, RoundRobinPolicy, RoutingContext
 from nygen_router.storage.base import MetricsStore
 from nygen_router.storage.duckdb import DuckDBMetricsStore
-from nygen_router.types import CallVariant, ProviderAttempt
+from nygen_router.types import CallType, CallVariant, ProviderAttempt
 
 AdapterFactory = Callable[[ProviderConfig], ProviderAdapter]
 
@@ -78,8 +79,10 @@ class StreamRestart:
     """
 
     failed_provider: str
+    failed_provider_id: str
     error: Exception
     next_provider: str
+    next_provider_id: str
     chunks_yielded: int
     restart_count: int
 
@@ -108,9 +111,12 @@ class ProviderRouter:
         clock: Callable[[], float] = time.monotonic,
         stream_failure_policy: StreamFailurePolicy = StreamFailurePolicy.RESTART,
         on_restart: Callable[[StreamRestart], None] | None = None,
+        *,
+        metrics_scope: str,
     ):
         self.providers = list(providers)
-        self._reject_duplicate_names(self.providers)
+        self._reject_duplicate_provider_ids(self.providers)
+        self.metrics_scope = self._validate_metrics_scope(metrics_scope)
         self._adapter_factory = adapter_factory or self._default_adapter_for
         self._policy = policy or RoundRobinPolicy()
         # Validated at the boundary so a typo'd key raises here rather than
@@ -169,7 +175,7 @@ class ProviderRouter:
         if not self.providers:
             raise NoProvidersConfiguredError("No providers configured.")
 
-        variants_by_protocol = self._prepare_variants(calls)
+        variants_by_protocol, call_type = self._prepare_variants(calls)
 
         eligible, excluded = filter_eligible_providers(
             self.providers,
@@ -178,11 +184,15 @@ class ProviderRouter:
             health=self._health,
             now=self._clock(),
         )
-        if not eligible:
+        if not eligible or call_type is None:
             raise NoEligibleProvidersError(excluded)
 
         attempts: list[ProviderAttempt] = []
-        context = RoutingContext(metrics_store=self._metrics_store)
+        context = RoutingContext(
+            metrics_store=self._metrics_store,
+            metrics_scope=self.metrics_scope,
+            call_type=call_type,
+        )
         ordered = list(self._policy.order(eligible, context))
         for index, provider in enumerate(ordered):
             variant = variants_by_protocol[provider.protocol]
@@ -194,9 +204,21 @@ class ProviderRouter:
             except Exception as exc:
                 latency_ms = (time.perf_counter() - start) * 1000.0
                 attempts.append(
-                    ProviderAttempt(provider_name=provider.name, success=False, error=exc)
+                    ProviderAttempt(
+                        provider_id=provider.provider_id,
+                        provider_name=provider.name,
+                        success=False,
+                        error=exc,
+                    )
                 )
-                category = self._record_attempt_failure(provider, exc, latency_ms=latency_ms)
+                category = self._record_attempt_failure(
+                    provider,
+                    exc,
+                    call_type=call_type,
+                    latency_ms=(latency_ms if call_type is CallType.REGULAR else None),
+                    stream_opened=(None if call_type is CallType.REGULAR else False),
+                    total_duration_ms=(None if call_type is CallType.REGULAR else latency_ms),
+                )
                 if category in _STOP_CATEGORIES:
                     break
                 continue
@@ -214,16 +236,29 @@ class ProviderRouter:
                     variants_by_protocol=variants_by_protocol,
                     attempts=attempts,
                     started_at=start,
+                    call_type=call_type,
                 )
 
             latency_ms = (time.perf_counter() - start) * 1000.0
-            attempts.append(ProviderAttempt(provider_name=provider.name, success=True))
-            self._record_attempt_success(provider, latency_ms=latency_ms)
+            attempts.append(
+                ProviderAttempt(
+                    provider_id=provider.provider_id,
+                    provider_name=provider.name,
+                    success=True,
+                )
+            )
+            self._record_attempt_success(
+                provider,
+                call_type=call_type,
+                latency_ms=(latency_ms if call_type is CallType.REGULAR else None),
+                stream_opened=(None if call_type is CallType.REGULAR else False),
+                total_duration_ms=(None if call_type is CallType.REGULAR else latency_ms),
+            )
             return response
 
         raise RouterExhaustedError(attempts)
 
-    def reset_health(self, provider_name: str | None = None) -> None:
+    def reset_health(self, provider_id: str | None = None) -> None:
         """Treat one provider -- or every provider, if given None -- as brand new.
 
         Clears the cooldown, failure count, auth bench, and last error, so a
@@ -233,18 +268,18 @@ class ProviderRouter:
         touched: MetricsStore has no delete path, so the history of what
         actually happened survives every reset.
         """
-        if provider_name is None:
+        if provider_id is None:
             self._health.clear()
             return
-        known = sorted(provider.name for provider in self.providers)
-        if provider_name not in known:
+        known = sorted(provider.provider_id for provider in self.providers)
+        if provider_id not in known:
             # A typo'd reset that quietly did nothing is the exact silent
             # failure this router exists to prevent.
             raise ConfigError(
-                f"Cannot reset health for unknown provider {provider_name!r}; "
-                f"configured providers are: {', '.join(repr(name) for name in known)}."
+                f"Cannot reset health for unknown provider ID {provider_id!r}; "
+                f"configured provider IDs are: {', '.join(repr(item) for item in known)}."
             )
-        self._health.pop(provider_name, None)
+        self._health.pop(provider_id, None)
 
     def health_report(self) -> dict[str, ProviderHealthReport]:
         """Report every configured provider's health, so a reset can be an informed choice.
@@ -256,11 +291,16 @@ class ProviderRouter:
         now = self._clock()
         report: dict[str, ProviderHealthReport] = {}
         for provider in self.providers:
-            state = self._health.get(provider.name)
+            state = self._health.get(provider.provider_id)
             if state is None:
-                report[provider.name] = ProviderHealthReport()
+                report[provider.provider_id] = ProviderHealthReport(
+                    provider_id=provider.provider_id,
+                    provider_name=provider.name,
+                )
                 continue
-            report[provider.name] = ProviderHealthReport(
+            report[provider.provider_id] = ProviderHealthReport(
+                provider_id=provider.provider_id,
+                provider_name=provider.name,
                 auth_disabled=state.auth_disabled,
                 consecutive_failures=state.consecutive_failures,
                 cooldown_remaining_seconds=state.cooldown_remaining(now),
@@ -273,8 +313,9 @@ class ProviderRouter:
         provider: ProviderConfig,
         exc: Exception,
         *,
+        call_type: CallType,
         latency_ms: float | None,
-        stream: bool = False,
+        stream_opened: bool | None,
         total_duration_ms: float | None = None,
     ) -> ErrorCategory:
         """Classify one dead attempt, record it, and bench the provider unless the call is at fault.
@@ -287,22 +328,24 @@ class ProviderRouter:
         category = categorize_error(exc)
         self._record_metrics(
             provider,
+            call_type=call_type,
             success=False,
             latency_ms=latency_ms,
             error_type=category.value,
-            stream=stream,
+            stream_opened=stream_opened,
             total_duration_ms=total_duration_ms,
         )
         if category not in _STOP_CATEGORIES:
-            self._record_failure(provider.name, category, exc)
+            self._record_failure(provider, category, exc)
         return category
 
     def _record_attempt_success(
         self,
         provider: ProviderConfig,
         *,
+        call_type: CallType,
         latency_ms: float | None,
-        stream: bool = False,
+        stream_opened: bool | None,
         total_duration_ms: float | None = None,
     ) -> None:
         """Record one attempt the provider actually served, in metrics and in health.
@@ -313,38 +356,45 @@ class ProviderRouter:
         """
         self._record_metrics(
             provider,
+            call_type=call_type,
             success=True,
             latency_ms=latency_ms,
             error_type=None,
-            stream=stream,
+            stream_opened=stream_opened,
             total_duration_ms=total_duration_ms,
         )
-        self._record_success(provider.name)
+        self._record_success(provider)
 
-    def _record_failure(self, provider_name: str, category: ErrorCategory, exc: Exception) -> None:
+    def _record_failure(
+        self, provider: ProviderConfig, category: ErrorCategory, exc: Exception
+    ) -> None:
         """Apply one failure to a provider's health, reporting any bench it starts.
 
         Get-or-create + mutate, never replace: replacing the state object would
         silently zero an existing failure count.
         """
-        state = self._health.setdefault(provider_name, ProviderHealthState())
+        state = self._health.setdefault(provider.provider_id, ProviderHealthState())
         started_bench = state.record_failure(category, str(exc), self._health_config, self._clock())
         if started_bench:
-            self._log_bench(provider_name, state, category)
+            self._log_bench(provider, state, category)
 
-    def _record_success(self, provider_name: str) -> None:
+    def _record_success(self, provider: ProviderConfig) -> None:
         """Clear a provider's failure signal, reporting the end of a bench episode."""
-        state = self._health.get(provider_name)
+        state = self._health.get(provider.provider_id)
         if state is None:
             # No entry means nothing to reset; don't create a bogus one.
             return
         was_benched = state.benched
         state.record_success()
         if was_benched:
-            logger.info("Provider %r recovered; it is no longer benched.", provider_name)
+            logger.info(
+                'Provider "%s" (id="%s") recovered; it is no longer benched.',
+                provider.name,
+                provider.provider_id,
+            )
 
     def _log_bench(
-        self, provider_name: str, state: ProviderHealthState, category: ErrorCategory
+        self, provider: ProviderConfig, state: ProviderHealthState, category: ErrorCategory
     ) -> None:
         """Report a new bench with its real cause; a provider is never benched silently.
 
@@ -365,8 +415,9 @@ class ProviderRouter:
             trigger = f"after {state.consecutive_failures} consecutive failures"
         logger.log(
             logging.DEBUG if state.warned else logging.WARNING,
-            "Benched provider %r %s %s; last error: %s",
-            provider_name,
+            'Benched provider "%s" (id="%s") %s %s; last error: %s',
+            provider.name,
+            provider.provider_id,
             duration,
             trigger,
             state.last_error,
@@ -377,24 +428,29 @@ class ProviderRouter:
         self,
         provider: ProviderConfig,
         *,
+        call_type: CallType,
         success: bool,
         latency_ms: float | None,
         error_type: str | None,
-        stream: bool = False,
+        stream_opened: bool | None,
         total_duration_ms: float | None = None,
     ) -> None:
         """Persist one MetricsEvent for this attempt; never let storage disturb the call."""
         if self._metrics_store is None:
             return
         event = MetricsEvent(
+            metrics_scope=self.metrics_scope,
+            provider_id=provider.provider_id,
             provider_name=provider.name,
             model=provider.model,
             protocol=provider.protocol,
+            call_type=call_type,
             success=success,
+            stream_opened=stream_opened,
             latency_ms=latency_ms,
             error_type=error_type,
-            stream=stream,
             total_duration_ms=total_duration_ms,
+            request_size_bucket=None,
         )
         try:
             self._metrics_store.record_attempt(event)
@@ -435,23 +491,24 @@ class ProviderRouter:
         )
 
     @staticmethod
-    def _reject_duplicate_names(providers: list[ProviderConfig]) -> None:
-        """Reject two configured providers sharing a name, before anything is keyed by it.
-
-        Metrics and health identity are provider names throughout, so a
-        duplicate would silently merge two providers' histories into one and
-        route on the blend. Two entries pointing at the same base_url and model
-        through separate API keys are a supported configuration -- they just
-        need separate names to keep separate histories.
-        """
-        counts = Counter(provider.name for provider in providers)
-        duplicates = sorted(name for name, count in counts.items() if count > 1)
+    def _reject_duplicate_provider_ids(providers: list[ProviderConfig]) -> None:
+        """Reject canonical identity collisions while allowing duplicate names."""
+        counts = Counter(provider.provider_id for provider in providers)
+        duplicates = sorted(provider_id for provider_id, count in counts.items() if count > 1)
         if duplicates:
             raise ConfigError(
-                f"Duplicate provider name(s) in configuration: "
-                f"{', '.join(repr(name) for name in duplicates)}. Provider names key "
-                f"metrics and health history, so each configured provider needs its own."
+                "Duplicate provider ID(s) in configuration: "
+                f"{', '.join(repr(provider_id) for provider_id in duplicates)}."
             )
+
+    @staticmethod
+    def _validate_metrics_scope(metrics_scope: str) -> str:
+        if not isinstance(metrics_scope, str):
+            raise ConfigError("metrics_scope must be a string")
+        value = metrics_scope.strip()
+        if not value:
+            raise ConfigError("metrics_scope must not be empty")
+        return value
 
     @staticmethod
     def _arguments_for(variant: CallVariant, provider: ProviderConfig) -> dict[str, object]:
@@ -463,7 +520,9 @@ class ProviderRouter:
         return {**variant.arguments, "model": provider.model}
 
     @staticmethod
-    def _prepare_variants(calls: list[CallVariant]) -> dict[ApiProtocol, CallVariant]:
+    def _prepare_variants(
+        calls: list[CallVariant],
+    ) -> tuple[dict[ApiProtocol, CallVariant], CallType | None]:
         """Validate every CallVariant once, upfront, before any provider is contacted.
 
         Never mutates a CallVariant's arguments -- the same variant is reused
@@ -479,7 +538,13 @@ class ProviderRouter:
         for variant in variants_by_protocol.values():
             if "model" in variant.arguments:
                 raise ModelArgumentConflictError(variant.protocol, variant.operation)
-        return variants_by_protocol
+        declared_types = {variant.call_type for variant in variants_by_protocol.values()}
+        if len(declared_types) > 1:
+            raise MixedCallTypeError(
+                [(variant.protocol, variant.call_type) for variant in variants_by_protocol.values()]
+            )
+        call_type = next(iter(declared_types), None)
+        return variants_by_protocol, call_type
 
     def _adapter_for(self, provider: ProviderConfig) -> ProviderAdapter:
         return self._adapter_factory(provider)
@@ -493,7 +558,9 @@ class ProviderRouter:
             return OpenAIResponsesAdapter(provider)
         # Unreachable via invoke(): unsupported protocols are excluded by the
         # eligibility filter first. Kept as a guard for direct/custom callers.
-        raise UnsupportedProtocolError(provider.name, provider.protocol)  # pragma: no cover
+        raise UnsupportedProtocolError(
+            provider.provider_id, provider.name, provider.protocol
+        )  # pragma: no cover
 
 
 class RouterStream:
@@ -523,6 +590,7 @@ class RouterStream:
         variants_by_protocol: dict[ApiProtocol, CallVariant],
         attempts: list[ProviderAttempt],
         started_at: float,
+        call_type: CallType,
     ) -> None:
         self._router = router
         self._stream = stream
@@ -531,6 +599,7 @@ class RouterStream:
         self._variants_by_protocol = variants_by_protocol
         self._attempts = attempts
         self._started_at = started_at
+        self._call_type = call_type
         self._first_chunk_at: float | None = None
         self._chunks_yielded = 0
         self._closed = False
@@ -608,18 +677,22 @@ class RouterStream:
         """
         if self._chunks_yielded == 0:
             return ProviderStreamInterruptedError(
-                f"Provider {self._provider.name!r} ended its stream for model "
+                f'Provider "{self._provider.name}" (id="{self._provider.provider_id}") '
+                f"ended its stream for model "
                 f"{self._provider.model!r} without yielding any chunks; no usable "
                 f"response was produced.",
+                provider_id=self._provider.provider_id,
                 provider_name=self._provider.name,
                 model=self._provider.model,
             )
         if not self._stream.completed:
             if self._stream.recognized:
                 return ProviderStreamInterruptedError(
-                    f"Provider {self._provider.name!r} ended its stream for model "
+                    f'Provider "{self._provider.name}" (id="{self._provider.provider_id}") '
+                    f"ended its stream for model "
                     f"{self._provider.model!r} after {self._chunks_yielded} chunk(s) without "
                     f"ever marking it complete; the response was silently truncated.",
+                    provider_id=self._provider.provider_id,
                     provider_name=self._provider.name,
                     model=self._provider.model,
                 )
@@ -634,18 +707,25 @@ class RouterStream:
         duration_ms = self._duration_ms()
         self._close_underlying()
         self._attempts.append(
-            ProviderAttempt(provider_name=self._provider.name, success=False, error=error)
+            ProviderAttempt(
+                provider_id=self._provider.provider_id,
+                provider_name=self._provider.name,
+                success=False,
+                error=error,
+            )
         )
         category = self._router._record_attempt_failure(
             self._provider,
             error,
+            call_type=self._call_type,
             latency_ms=self._ttft_ms(),
-            stream=True,
+            stream_opened=True,
             total_duration_ms=duration_ms,
         )
         logger.warning(
-            "Provider %r stream died after %d chunk(s) and %.1fms: %s",
+            'Provider "%s" (id="%s") stream died after %d chunk(s) and %.1fms: %s',
             self._provider.name,
+            self._provider.provider_id,
             self._chunks_yielded,
             duration_ms,
             error,
@@ -677,12 +757,20 @@ class RouterStream:
             except Exception as exc:
                 latency_ms = (time.perf_counter() - start) * 1000.0
                 self._attempts.append(
-                    ProviderAttempt(provider_name=provider.name, success=False, error=exc)
+                    ProviderAttempt(
+                        provider_id=provider.provider_id,
+                        provider_name=provider.name,
+                        success=False,
+                        error=exc,
+                    )
                 )
-                # No stream opened, so this is recorded as the plain failed
-                # attempt it is: the stream flag means one actually opened.
                 category = self._router._record_attempt_failure(
-                    provider, exc, latency_ms=latency_ms
+                    provider,
+                    exc,
+                    call_type=self._call_type,
+                    latency_ms=(latency_ms if self._call_type is CallType.REGULAR else None),
+                    stream_opened=(None if self._call_type is CallType.REGULAR else False),
+                    total_duration_ms=(None if self._call_type is CallType.REGULAR else latency_ms),
                 )
                 if category in _STOP_CATEGORIES:
                     break
@@ -720,16 +808,29 @@ class RouterStream:
             except Exception:
                 logger.debug("Closing a non-stream restart response failed.", exc_info=True)
         anomaly = ProviderError(
-            f"Provider {provider.name!r} returned a non-streaming "
+            f'Provider "{provider.name}" (id="{provider.provider_id}") returned a non-streaming '
             f"{type(response).__name__} while restarting a stream for model "
             f"{provider.model!r}; it cannot be spliced into a stream already in progress.",
+            provider_id=provider.provider_id,
             provider_name=provider.name,
             model=provider.model,
         )
         self._attempts.append(
-            ProviderAttempt(provider_name=provider.name, success=False, error=anomaly)
+            ProviderAttempt(
+                provider_id=provider.provider_id,
+                provider_name=provider.name,
+                success=False,
+                error=anomaly,
+            )
         )
-        self._router._record_attempt_failure(provider, anomaly, latency_ms=latency_ms)
+        self._router._record_attempt_failure(
+            provider,
+            anomaly,
+            call_type=self._call_type,
+            latency_ms=(latency_ms if self._call_type is CallType.REGULAR else None),
+            stream_opened=(None if self._call_type is CallType.REGULAR else False),
+            total_duration_ms=(None if self._call_type is CallType.REGULAR else latency_ms),
+        )
 
     def _announce_restart(self, error: Exception, provider: ProviderConfig) -> None:
         """Make a restart visible before the next provider starts regenerating.
@@ -745,12 +846,15 @@ class RouterStream:
             return
         if self._router._on_restart is None:
             logger.warning(
-                "Discarding %d chunk(s) already yielded by provider %r and restarting on "
-                "provider %r, which regenerates from scratch: %s. Register on_restart to "
+                'Discarding %d chunk(s) already yielded by provider "%s" (id="%s") and '
+                'restarting on provider "%s" (id="%s"), which regenerates from scratch: '
+                "%s. Register on_restart to "
                 "handle this in code.",
                 self._chunks_yielded,
                 self._provider.name,
+                self._provider.provider_id,
                 provider.name,
+                provider.provider_id,
                 error,
             )
             return
@@ -759,8 +863,10 @@ class RouterStream:
         self._router._on_restart(
             StreamRestart(
                 failed_provider=self._provider.name,
+                failed_provider_id=self._provider.provider_id,
                 error=error,
                 next_provider=provider.name,
+                next_provider_id=provider.provider_id,
                 chunks_yielded=self._chunks_yielded,
                 restart_count=self.restarts,
             )
@@ -772,11 +878,18 @@ class RouterStream:
         Both callers close the stream immediately afterwards, and a closed
         stream records nothing further, so one attempt cannot be recorded twice.
         """
-        self._attempts.append(ProviderAttempt(provider_name=self._provider.name, success=True))
+        self._attempts.append(
+            ProviderAttempt(
+                provider_id=self._provider.provider_id,
+                provider_name=self._provider.name,
+                success=True,
+            )
+        )
         self._router._record_attempt_success(
             self._provider,
+            call_type=self._call_type,
             latency_ms=self._ttft_ms(),
-            stream=True,
+            stream_opened=True,
             total_duration_ms=self._duration_ms(),
         )
 

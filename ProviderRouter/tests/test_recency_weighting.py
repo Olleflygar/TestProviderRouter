@@ -6,6 +6,7 @@ import pytest
 
 from nygen_router import (
     ApiProtocol,
+    CallType,
     MetricsEvent,
     ProviderConfig,
     RoutingContext,
@@ -30,16 +31,22 @@ class _FakeStore:
         self,
         *,
         since: datetime,
-        provider_name: str | None = None,
+        metrics_scope: str | None = None,
+        provider_id: str | None = None,
         model: str | None = None,
+        protocol: ApiProtocol | None = None,
+        call_type: CallType | None = None,
     ) -> list[MetricsEvent]:
         self.queries.append(since)
         return [
             event
             for event in self.events
             if event.timestamp >= since
-            and (provider_name is None or event.provider_name == provider_name)
+            and (metrics_scope is None or event.metrics_scope == metrics_scope)
+            and (provider_id is None or event.provider_id == provider_id)
             and (model is None or event.model == model)
+            and (protocol is None or event.protocol == protocol)
+            and (call_type is None or event.call_type == call_type)
         ]
 
 
@@ -55,6 +62,7 @@ class _StaticPolicy:
 
 def _config(name: str) -> ProviderConfig:
     return ProviderConfig(
+        provider_id=name,
         name=name,
         protocol=ApiProtocol.OPENAI_CHAT,
         model="model-a",
@@ -72,6 +80,9 @@ def _event(
     latency_ms: float | None = None,
 ) -> MetricsEvent:
     return MetricsEvent(
+        provider_id=provider_name,
+        metrics_scope="test",
+        call_type=CallType.REGULAR,
         provider_name=provider_name,
         model="model-a",
         protocol=ApiProtocol.OPENAI_CHAT,
@@ -112,8 +123,18 @@ def test_explicit_none_is_identical_to_not_passing_half_life() -> None:
         now=lambda: fixed_now,
     )
 
-    omitted_result = omitted.order(providers, RoutingContext(metrics_store=omitted_store))
-    explicit_result = explicit_none.order(providers, RoutingContext(metrics_store=explicit_store))
+    omitted_result = omitted.order(
+        providers,
+        RoutingContext(
+            metrics_scope="test", call_type=CallType.REGULAR, metrics_store=omitted_store
+        ),
+    )
+    explicit_result = explicit_none.order(
+        providers,
+        RoutingContext(
+            metrics_scope="test", call_type=CallType.REGULAR, metrics_store=explicit_store
+        ),
+    )
 
     assert omitted_result == explicit_result
     assert omitted_store.queries == explicit_store.queries
@@ -138,7 +159,10 @@ def test_five_half_life_old_event_has_a_small_but_nonzero_effect() -> None:
         now=lambda: fixed_now,
     )
 
-    ordered = policy.order(providers, RoutingContext(metrics_store=store))
+    ordered = policy.order(
+        providers,
+        RoutingContext(metrics_scope="test", call_type=CallType.REGULAR, metrics_store=store),
+    )
 
     assert _names(ordered) == ["old_history", "no_history"]
 
@@ -146,10 +170,10 @@ def test_five_half_life_old_event_has_a_small_but_nonzero_effect() -> None:
         age_hours = (fixed_now - event.timestamp).total_seconds() / 3600.0
         return 0.5 ** (age_hours / half_life_hours)
 
-    decayed_stats = aggregate_stats([old_event], ["old_history"], weight_fn=decay_weight)[
-        "old_history"
-    ]
-    empty_stats = aggregate_stats([], ["no_history"])["no_history"]
+    decayed_stats = aggregate_stats(
+        [old_event], [_config("old_history")], CallType.REGULAR, weight_fn=decay_weight
+    )["old_history"]
+    empty_stats = aggregate_stats([], [_config("no_history")], CallType.REGULAR)["no_history"]
     weights = ScoreWeights(success_weight=1.0, speed_weight=0.0)
     effect = (
         calculate_provider_score(decayed_stats, weights).total
@@ -185,7 +209,10 @@ def test_recent_failure_lowers_score_more_than_old_failure() -> None:
         now=lambda: fixed_now,
     )
 
-    ordered = policy.order(providers, RoutingContext(metrics_store=store))
+    ordered = policy.order(
+        providers,
+        RoutingContext(metrics_scope="test", call_type=CallType.REGULAR, metrics_store=store),
+    )
 
     assert _names(ordered) == ["old_failure", "recent_failure"]
 
@@ -217,7 +244,10 @@ def test_recent_success_raises_score_more_than_old_success() -> None:
         now=lambda: fixed_now,
     )
 
-    ordered = policy.order(providers, RoutingContext(metrics_store=store))
+    ordered = policy.order(
+        providers,
+        RoutingContext(metrics_scope="test", call_type=CallType.REGULAR, metrics_store=store),
+    )
 
     assert _names(ordered) == ["recent_success", "old_success"]
 
@@ -232,7 +262,10 @@ def test_decay_query_bound_is_exactly_six_half_lives_and_ignores_lookback() -> N
         now=lambda: fixed_now,
     )
 
-    policy.order([_config("provider")], RoutingContext(metrics_store=store))
+    policy.order(
+        [_config("provider")],
+        RoutingContext(metrics_scope="test", call_type=CallType.REGULAR, metrics_store=store),
+    )
 
     assert store.queries == [fixed_now - timedelta(hours=6 * 72)]
 
@@ -257,7 +290,10 @@ def test_event_older_than_six_half_lives_is_not_considered() -> None:
         now=lambda: fixed_now,
     )
 
-    ordered = policy.order(providers, RoutingContext(metrics_store=store))
+    ordered = policy.order(
+        providers,
+        RoutingContext(metrics_scope="test", call_type=CallType.REGULAR, metrics_store=store),
+    )
 
     assert _names(ordered) == ["no_history", "old_history"]
 
@@ -291,10 +327,11 @@ def test_diagnostic_counts_are_identical_with_and_without_decay() -> None:
         ),
     ]
 
-    flat = aggregate_stats(events, ["provider"])["provider"]
+    flat = aggregate_stats(events, [_config("provider")], CallType.REGULAR)["provider"]
     decayed = aggregate_stats(
         events,
-        ["provider"],
+        [_config("provider")],
+        CallType.REGULAR,
         weight_fn=lambda event: (
             0.5 ** (((fixed_now - event.timestamp).total_seconds() / 3600.0) / 24.0)
         ),

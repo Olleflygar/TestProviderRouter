@@ -35,12 +35,13 @@ class OpenAICompatibleAdapter:
     def invoke(self, operation: str, arguments: dict[str, object]) -> Any:
         """Resolve operation on an openai client and call it with arguments, or raise."""
         name = self.config.name
+        provider_id = self.config.provider_id
         model = self.config.model
 
         try:
             import openai
         except ModuleNotFoundError as exc:
-            raise ProviderSDKNotInstalledError(name, "openai", original=exc) from exc
+            raise ProviderSDKNotInstalledError(provider_id, name, "openai", original=exc) from exc
 
         client = openai.OpenAI(
             api_key=self.config.resolve_api_key(),
@@ -56,8 +57,9 @@ class OpenAICompatibleAdapter:
                 target = getattr(target, part)
         except AttributeError as exc:
             raise UnsupportedOperationError(
-                f"Provider {name!r} has no operation {operation!r} on its openai client "
+                f"{_label(name, provider_id)} has no operation {operation!r} on its openai client "
                 f"({type(exc).__name__}): {exc}",
+                provider_id=provider_id,
                 provider_name=name,
                 model=model,
                 original=exc,
@@ -70,15 +72,21 @@ class OpenAICompatibleAdapter:
             # mapping: mid-stream a TypeError means the provider sent something
             # unusable, never that the caller's arguments were wrong.
             raise InvalidOperationArgumentsError(
-                f"Provider {name!r} operation {operation!r} rejected the given arguments for "
+                f"{_label(name, provider_id)} operation {operation!r} rejected the given "
+                "arguments for "
                 f"model {model!r} ({type(exc).__name__}): {exc}",
+                provider_id=provider_id,
                 provider_name=name,
                 model=model,
                 original=exc,
             ) from exc
         except Exception as exc:
             mapped = _map_sdk_exception(
-                exc, provider_name=name, model=model, timeout_seconds=self.config.timeout_seconds
+                exc,
+                provider_id=provider_id,
+                provider_name=name,
+                model=model,
+                timeout_seconds=self.config.timeout_seconds,
             )
             if mapped is None:  # pragma: no cover
                 # Unreachable through .create() today -- the SDK folds even an
@@ -96,6 +104,7 @@ class OpenAICompatibleAdapter:
         """Wrap the SDK stream shape this adapter understands."""
         return OpenAIChatStream(
             stream,
+            provider_id=self.config.provider_id,
             provider_name=self.config.name,
             model=self.config.model,
             timeout_seconds=self.config.timeout_seconds,
@@ -120,11 +129,13 @@ class OpenAIChatStream(NormalizedStream):
         self,
         stream: Any,
         *,
+        provider_id: str,
         provider_name: str,
         model: str,
         timeout_seconds: float,
     ) -> None:
         self._stream = stream
+        self._provider_id = provider_id
         self._provider_name = provider_name
         self._model = model
         self._timeout_seconds = timeout_seconds
@@ -184,6 +195,7 @@ class OpenAIChatStream(NormalizedStream):
         """
         return _map_stream_exception(
             exc,
+            provider_id=self._provider_id,
             provider_name=self._provider_name,
             model=self._model,
             timeout_seconds=self._timeout_seconds,
@@ -191,11 +203,17 @@ class OpenAIChatStream(NormalizedStream):
 
 
 def _map_stream_exception(
-    exc: Exception, *, provider_name: str, model: str, timeout_seconds: float
+    exc: Exception,
+    *,
+    provider_id: str,
+    provider_name: str,
+    model: str,
+    timeout_seconds: float,
 ) -> ProviderError:
     """Map any exception escaping SDK stream iteration to a router error."""
     mapped = _map_sdk_exception(
         exc,
+        provider_id=provider_id,
         provider_name=provider_name,
         model=model,
         timeout_seconds=timeout_seconds,
@@ -203,8 +221,9 @@ def _map_stream_exception(
     if mapped is not None:
         return mapped
     return ProviderError(
-        f"Provider {provider_name!r} stream failed for model {model!r} "
+        f"{_label(provider_name, provider_id)} stream failed for model {model!r} "
         f"({type(exc).__name__}): {exc}",
+        provider_id=provider_id,
         provider_name=provider_name,
         model=model,
         original=exc,
@@ -212,7 +231,12 @@ def _map_stream_exception(
 
 
 def _map_sdk_exception(
-    exc: Exception, *, provider_name: str, model: str, timeout_seconds: float
+    exc: Exception,
+    *,
+    provider_id: str,
+    provider_name: str,
+    model: str,
+    timeout_seconds: float,
 ) -> ProviderError | None:
     """Map one SDK or transport exception onto the router's error hierarchy.
 
@@ -228,22 +252,25 @@ def _map_sdk_exception(
 
     if isinstance(exc, openai.APITimeoutError | httpx.TimeoutException):
         return ProviderTimeoutError(
-            f"Provider {provider_name!r} timed out after {timeout_seconds}s for model "
+            f"{_label(provider_name, provider_id)} timed out after {timeout_seconds}s for model "
             f"{model!r} ({type(exc).__name__}): {exc}",
+            provider_id=provider_id,
             provider_name=provider_name,
             model=model,
             original=exc,
         )
     if isinstance(exc, openai.APIConnectionError | httpx.TransportError):
         return ProviderConnectionError(
-            f"Provider {provider_name!r} could not connect for model {model!r} "
+            f"{_label(provider_name, provider_id)} could not connect for model {model!r} "
             f"({type(exc).__name__}): {exc}",
+            provider_id=provider_id,
             provider_name=provider_name,
             model=model,
             original=exc,
         )
     if isinstance(exc, openai.APIStatusError):
         return ProviderHTTPError(
+            provider_id=provider_id,
             provider_name=provider_name,
             model=model,
             status_code=exc.status_code,
@@ -256,13 +283,18 @@ def _map_sdk_exception(
         )
     if isinstance(exc, openai.OpenAIError):
         return ProviderError(
-            f"Provider {provider_name!r} request failed for model {model!r} "
+            f"{_label(provider_name, provider_id)} request failed for model {model!r} "
             f"({type(exc).__name__}): {exc}",
+            provider_id=provider_id,
             provider_name=provider_name,
             model=model,
             original=exc,
         )
     return None
+
+
+def _label(provider_name: str, provider_id: str) -> str:
+    return f'Provider "{provider_name}" (id="{provider_id}")'
 
 
 def _verbatim_message(body: object, *, fallback: str) -> str:

@@ -23,6 +23,7 @@ from nygen_router.errors import (
 
 def _config() -> ProviderConfig:
     return ProviderConfig(
+        provider_id="provider_a",
         name="provider_a",
         protocol=ApiProtocol.OPENAI_CHAT,
         model="model-a",

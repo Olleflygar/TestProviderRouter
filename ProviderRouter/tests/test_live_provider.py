@@ -17,7 +17,7 @@ import string
 import pytest
 from dotenv import load_dotenv
 
-from nygen_router import ApiProtocol, CallVariant, ProviderConfig
+from nygen_router import ApiProtocol, CallType, CallVariant, ProviderConfig
 from nygen_router.router import ProviderRouter
 
 load_dotenv()
@@ -38,6 +38,7 @@ requires_live_key = pytest.mark.skipif(
 
 def _live_config() -> ProviderConfig:
     return ProviderConfig(
+        provider_id=LIVE_PROVIDER_NAME,
         name=LIVE_PROVIDER_NAME,
         protocol=ApiProtocol.OPENAI_CHAT,
         model=LIVE_MODEL,
@@ -53,11 +54,12 @@ def _normalize(text: str) -> str:
 
 @requires_live_key
 def test_live_provider_returns_hello() -> None:
-    router = ProviderRouter(providers=[_live_config()])
+    router = ProviderRouter(metrics_scope="test", providers=[_live_config()])
 
     response = router.invoke(
         [
             CallVariant(
+                call_type=CallType.REGULAR,
                 protocol=ApiProtocol.OPENAI_CHAT,
                 operation="chat.completions.create",
                 arguments={

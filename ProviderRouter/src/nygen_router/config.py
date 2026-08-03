@@ -28,6 +28,7 @@ class ProviderCapabilities(BaseModel):
 class ProviderConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    provider_id: str
     name: str
     protocol: ApiProtocol
     model: str
@@ -38,10 +39,10 @@ class ProviderConfig(BaseModel):
     timeout_seconds: float = 30.0
     capabilities: ProviderCapabilities = Field(default_factory=ProviderCapabilities)
 
-    @field_validator("name", "model")
+    @field_validator("provider_id", "name", "model")
     @classmethod
     def _must_not_be_empty(cls, value: str) -> str:
-        """Reject blank or whitespace-only values for name/model."""
+        """Reject blank or whitespace-only identity and display values."""
         value = value.strip()
         if not value:
             raise ValueError("must not be empty")
@@ -91,4 +92,4 @@ class ProviderConfig(BaseModel):
             api_key = os.environ.get(self.api_key_env)
             if api_key:
                 return api_key
-        raise MissingApiKeyError(self.name, self.api_key_env)
+        raise MissingApiKeyError(self.provider_id, self.name, self.api_key_env)

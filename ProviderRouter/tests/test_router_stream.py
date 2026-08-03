@@ -8,6 +8,7 @@ import pytest
 
 from nygen_router import (
     ApiProtocol,
+    CallType,
     CallVariant,
     HealthConfig,
     InvalidOperationArgumentsError,
@@ -140,14 +141,18 @@ class _FakeStore:
         self,
         *,
         since: datetime,
-        provider_name: str | None = None,
+        metrics_scope: str | None = None,
+        provider_id: str | None = None,
         model: str | None = None,
+        protocol: ApiProtocol | None = None,
+        call_type: CallType | None = None,
     ) -> list[MetricsEvent]:
         return list(self.events)
 
 
 def _config(name: str) -> ProviderConfig:
     return ProviderConfig(
+        provider_id=name,
         name=name,
         protocol=ApiProtocol.OPENAI_CHAT,
         model="model-a",
@@ -159,6 +164,7 @@ def _config(name: str) -> ProviderConfig:
 def _calls(operation: str = "chat.completions.create") -> list[CallVariant]:
     return [
         CallVariant(
+            call_type=CallType.STREAMING,
             protocol=ApiProtocol.OPENAI_CHAT,
             operation=operation,
             arguments={"messages": [{"role": "user", "content": "hi"}], "stream": True},
@@ -167,7 +173,9 @@ def _calls(operation: str = "chat.completions.create") -> list[CallVariant]:
 
 
 def _timeout(name: str) -> ProviderTimeoutError:
-    return ProviderTimeoutError(f"Provider {name!r} timed out", provider_name=name, model="model-a")
+    return ProviderTimeoutError(
+        f"Provider {name!r} timed out", provider_id=name, provider_name=name, model="model-a"
+    )
 
 
 def _router(
@@ -181,6 +189,7 @@ def _router(
         return _ScriptedAdapter(config, script)
 
     router = ProviderRouter(
+        metrics_scope="test",
         providers=providers,
         adapter_factory=factory,
         policy=_StaticPolicy(),
@@ -199,8 +208,10 @@ def test_non_streaming_call_returns_the_identical_response_object() -> None:
     assert router.invoke(_calls()) is response
     assert len(store.events) == 1
     assert store.events[0].success is True
-    assert store.events[0].stream is False
-    assert store.events[0].total_duration_ms is None
+    assert store.events[0].call_type is CallType.STREAMING
+    assert store.events[0].stream_opened is False
+    assert store.events[0].total_duration_ms is not None
+    assert store.events[0].total_duration_ms >= 0
 
 
 def test_chunks_pass_through_unchanged_and_in_order() -> None:
@@ -231,7 +242,9 @@ def test_mid_stream_failure_falls_back_and_reports_the_restart() -> None:
     assert dying.close_calls == 1
     (restart,) = restarts
     assert restart.failed_provider == "provider_a"
+    assert restart.failed_provider_id == "provider_a"
     assert restart.next_provider == "provider_b"
+    assert restart.next_provider_id == "provider_b"
     assert restart.chunks_yielded == 2
     assert restart.restart_count == 1
     assert restart.error is error  # the provider's real, unwrapped exception
@@ -282,7 +295,7 @@ def test_empty_completed_stream_is_failed_and_restarted_without_a_callback() -> 
     ]
     failed = store.events[0]
     assert failed.error_type == "stream_interrupted"
-    assert failed.stream is True
+    assert failed.stream_opened is True
     assert failed.latency_ms is None
     assert failed.total_duration_ms is not None
     report = router.health_report()["provider_a"]
@@ -419,7 +432,7 @@ def test_raise_policy_reraises_the_providers_real_error_without_falling_back() -
 def test_stop_category_failure_aborts_under_both_policies(policy: StreamFailurePolicy) -> None:
     """A broken call is not a provider problem: no fallback, and no provider is blamed."""
     error = InvalidOperationArgumentsError(
-        "arguments rejected", provider_name="provider_a", model="model-a"
+        "arguments rejected", provider_id="provider_a", provider_name="provider_a", model="model-a"
     )
     script = _Script({"provider_a": [_FakeStream(["a"], error=error)]})
     router, store = _router(
@@ -440,7 +453,11 @@ def test_stop_category_failure_aborts_under_both_policies(policy: StreamFailureP
 def test_every_provider_failing_mid_stream_raises_with_each_distinct_reason() -> None:
     first = _timeout("provider_a")
     second = ProviderHTTPError(
-        provider_name="provider_b", model="model-a", status_code=503, message="upstream down"
+        provider_id="provider_b",
+        provider_name="provider_b",
+        model="model-a",
+        status_code=503,
+        message="upstream down",
     )
     script = _Script(
         {
@@ -482,7 +499,7 @@ def test_pre_stream_failures_are_carried_into_the_exhausted_error() -> None:
         "provider_b",
     ]
     # The attempt that never opened a stream is not recorded as a stream row.
-    assert [event.stream for event in store.events] == [False, True]
+    assert [event.stream_opened for event in store.events] == [False, True]
 
 
 def test_breaking_and_closing_the_loop_closes_the_underlying_stream() -> None:
@@ -533,7 +550,7 @@ def test_close_after_the_completion_marker_records_the_observed_success() -> Non
 
     assert len(store.events) == 1
     assert store.events[0].success is True
-    assert store.events[0].stream is True
+    assert store.events[0].stream_opened is True
 
 
 def test_close_is_idempotent_and_terminal() -> None:
@@ -575,7 +592,7 @@ def test_stream_metrics_record_ttft_and_total_duration_at_stream_end() -> None:
 
     (event,) = store.events
     assert event.success is True
-    assert event.stream is True
+    assert event.stream_opened is True
     assert event.latency_ms is not None
     assert event.total_duration_ms is not None
     assert event.total_duration_ms >= event.latency_ms
@@ -590,7 +607,7 @@ def test_stream_that_never_yielded_a_chunk_records_no_ttft() -> None:
         list(router.invoke(_calls()))
 
     (event,) = store.events
-    assert event.stream is True
+    assert event.stream_opened is True
     assert event.latency_ms is None
     assert event.total_duration_ms is not None  # open to death is still measured
 
@@ -604,7 +621,7 @@ def test_mid_stream_failure_records_total_duration_and_logs_it() -> None:
 
     (event,) = store.events
     assert event.success is False
-    assert event.stream is True
+    assert event.stream_opened is True
     assert event.latency_ms is not None
     assert event.total_duration_ms is not None
 
@@ -622,7 +639,7 @@ def test_unrecognized_stream_shape_counts_a_clean_end_as_completed(
     assert script.invoked == ["provider_a"]  # no fallback: nothing failed
     (event,) = store.events
     assert event.success is True
-    assert event.stream is True
+    assert event.stream_opened is True
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert "chat.completions.create" in warnings[0].getMessage()
@@ -757,7 +774,7 @@ def test_a_restart_that_cannot_open_keeps_falling_back() -> None:
 
     assert list(router.invoke(_calls())) == ["a", "x"]
     assert script.invoked == ["provider_a", "provider_b", "provider_c"]
-    assert [(event.provider_name, event.stream) for event in store.events] == [
+    assert [(event.provider_name, event.stream_opened) for event in store.events] == [
         ("provider_a", True),
         ("provider_b", False),  # no stream ever opened for provider_b
         ("provider_c", True),
@@ -859,7 +876,10 @@ def test_a_stop_category_at_restart_stops_the_search() -> None:
             "provider_a": [_FakeStream(["a"], error=_timeout("provider_a"))],
             "provider_b": [
                 InvalidOperationArgumentsError(
-                    "arguments rejected", provider_name="provider_b", model="model-a"
+                    "arguments rejected",
+                    provider_id="provider_b",
+                    provider_name="provider_b",
+                    model="model-a",
                 )
             ],
         }

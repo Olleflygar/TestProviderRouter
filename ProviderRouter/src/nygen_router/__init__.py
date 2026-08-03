@@ -7,6 +7,7 @@ from nygen_router.errors import (
     DuplicateCallVariantProtocolError,
     InvalidOperationArgumentsError,
     MissingApiKeyError,
+    MixedCallTypeError,
     ModelArgumentConflictError,
     NoEligibleProvidersError,
     NoProvidersConfiguredError,
@@ -25,12 +26,19 @@ from nygen_router.errors import (
 from nygen_router.filters import filter_eligible_providers
 from nygen_router.health import HealthConfig, ProviderHealthReport
 from nygen_router.metrics import MetricsEvent
-from nygen_router.policies import Policy, RoundRobinPolicy, RoutingContext, ScoreBasedPolicy
+from nygen_router.policies import (
+    HistoryScope,
+    Policy,
+    RoundRobinPolicy,
+    RoutingContext,
+    ScoreBasedPolicy,
+)
 from nygen_router.router import ProviderRouter, StreamFailurePolicy, StreamRestart
 from nygen_router.scoring import ProviderScore, ScoreWeights, calculate_provider_score
 from nygen_router.stats import ProviderStats, aggregate_stats
 from nygen_router.storage import DuckDBMetricsStore, MetricsStore, SQLiteMetricsStore
 from nygen_router.types import (
+    CallType,
     CallVariant,
     EligibilityResult,
     FilterReason,
@@ -40,15 +48,18 @@ from nygen_router.types import (
 __all__ = [
     "ApiProtocol",
     "CallVariant",
+    "CallType",
     "ConfigError",
     "DuckDBMetricsStore",
     "DuplicateCallVariantProtocolError",
     "EligibilityResult",
     "FilterReason",
     "HealthConfig",
+    "HistoryScope",
     "InvalidOperationArgumentsError",
     "MetricsEvent",
     "MetricsStore",
+    "MixedCallTypeError",
     "MissingApiKeyError",
     "ModelArgumentConflictError",
     "NoEligibleProvidersError",

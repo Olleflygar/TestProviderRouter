@@ -28,6 +28,7 @@ from nygen_router.errors import ErrorCategory, categorize_error
 
 def _config(*, timeout_seconds: float = 12.5) -> ProviderConfig:
     return ProviderConfig(
+        provider_id="responses_provider",
         name="responses_provider",
         protocol=ApiProtocol.OPENAI_RESPONSES,
         model="model-r",

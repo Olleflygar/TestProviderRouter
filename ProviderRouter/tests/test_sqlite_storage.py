@@ -5,7 +5,10 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from nygen_router import ApiProtocol, MetricsEvent, SQLiteMetricsStore
+import pytest
+
+from nygen_router import ApiProtocol, CallType, MetricsEvent, SQLiteMetricsStore
+from nygen_router.storage.base import MetricsSchemaMismatchError
 
 # The provider_attempts schema as it stood before PR 23 added its two columns,
 # so a file written by an earlier version can be built here for real.
@@ -42,6 +45,9 @@ def test_custom_path_is_honored(tmp_path: Path) -> None:
 
     store.record_attempt(
         MetricsEvent(
+            provider_id="provider_a",
+            metrics_scope="test",
+            call_type=CallType.REGULAR,
             provider_name="provider_a",
             model="model-a",
             protocol=ApiProtocol.OPENAI_CHAT,
@@ -53,10 +59,10 @@ def test_custom_path_is_honored(tmp_path: Path) -> None:
     store.close()
 
 
-def test_metrics_file_written_before_the_stream_columns_is_migrated_on_connect(
+def test_incompatible_legacy_table_is_detected_and_left_unchanged(
     tmp_path: Path,
 ) -> None:
-    """CREATE TABLE IF NOT EXISTS leaves an old file alone, so the columns are added instead."""
+    """PR29 never alters, deletes, renames, or backfills a legacy table."""
     path = tmp_path / "metrics.sqlite"
     recorded_at = datetime.now(UTC) - timedelta(minutes=5)
     connection = sqlite3.connect(str(path))
@@ -69,26 +75,42 @@ def test_metrics_file_written_before_the_stream_columns_is_migrated_on_connect(
     connection.close()
 
     store = SQLiteMetricsStore(path)
-    store.record_attempt(
-        MetricsEvent(
-            provider_name="provider_b",
-            model="model-a",
-            protocol=ApiProtocol.OPENAI_CHAT,
-            success=True,
-            latency_ms=8.0,
-            stream=True,
-            total_duration_ms=900.0,
+    with pytest.raises(MetricsSchemaMismatchError, match="left untouched"):
+        store.record_attempt(
+            MetricsEvent(
+                metrics_scope="test",
+                provider_id="provider_b",
+                provider_name="provider_b",
+                model="model-a",
+                protocol=ApiProtocol.OPENAI_CHAT,
+                call_type=CallType.REGULAR,
+                success=True,
+            )
         )
-    )
-    events = store.query_recent(since=recorded_at - timedelta(seconds=1))
 
-    old_event, new_event = events
-    assert old_event.id == "old"  # the pre-existing row survives the migration
-    assert old_event.stream is False  # backfilled as the non-stream it was
-    assert old_event.total_duration_ms is None
-    assert new_event.stream is True
-    assert new_event.total_duration_ms == 900.0
-    store.close()
+    inspection = sqlite3.connect(str(path))
+    try:
+        columns = inspection.execute("PRAGMA table_info('provider_attempts')").fetchall()
+        rows = inspection.execute("SELECT * FROM provider_attempts").fetchall()
+        tables = inspection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+        ).fetchall()
+    finally:
+        inspection.close()
+    assert [row[1] for row in columns] == [
+        "id",
+        "timestamp",
+        "provider_name",
+        "model",
+        "protocol",
+        "success",
+        "latency_ms",
+        "error_type",
+    ]
+    assert rows == [
+        ("old", recorded_at.isoformat(), "provider_a", "model-a", "openai_chat", 1, 5.0, None)
+    ]
+    assert tables == [("provider_attempts",)]
 
 
 def test_works_with_stdlib_only_no_optional_dependencies(tmp_path: Path) -> None:
@@ -98,6 +120,9 @@ def test_works_with_stdlib_only_no_optional_dependencies(tmp_path: Path) -> None
 
     store.record_attempt(
         MetricsEvent(
+            provider_id="provider_a",
+            metrics_scope="test",
+            call_type=CallType.REGULAR,
             provider_name="provider_a",
             model="model-a",
             protocol=ApiProtocol.OPENAI_CHAT,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from nygen_router import (
     ApiProtocol,
+    CallType,
     CallVariant,
     ProviderConfig,
     ProviderRouter,
@@ -12,6 +13,7 @@ from nygen_router import (
 
 def _config(name: str, *, enabled: bool = True) -> ProviderConfig:
     return ProviderConfig(
+        provider_id=name,
         name=name,
         protocol=ApiProtocol.OPENAI_CHAT,
         model="model-a",
@@ -24,6 +26,7 @@ def _config(name: str, *, enabled: bool = True) -> ProviderConfig:
 def _calls() -> list[CallVariant]:
     return [
         CallVariant(
+            call_type=CallType.REGULAR,
             protocol=ApiProtocol.OPENAI_CHAT,
             operation="chat.completions.create",
             arguments={"messages": [{"role": "user", "content": "hi"}]},
@@ -52,7 +55,7 @@ class _ReversePolicy:
 
 def test_round_robin_rotates_starting_provider() -> None:
     providers = [_config("provider_a"), _config("provider_b"), _config("provider_c")]
-    router = ProviderRouter(providers=providers, adapter_factory=_EchoAdapter)
+    router = ProviderRouter(metrics_scope="test", providers=providers, adapter_factory=_EchoAdapter)
 
     selected = [router.invoke(_calls()) for _ in range(4)]
 
@@ -65,7 +68,7 @@ def test_round_robin_only_rotates_among_eligible_providers() -> None:
         _config("provider_b", enabled=False),  # filtered out, never selected
         _config("provider_c"),
     ]
-    router = ProviderRouter(providers=providers, adapter_factory=_EchoAdapter)
+    router = ProviderRouter(metrics_scope="test", providers=providers, adapter_factory=_EchoAdapter)
 
     selected = [router.invoke(_calls()) for _ in range(4)]
 
@@ -77,6 +80,7 @@ def test_injected_policy_is_honored() -> None:
     """A fake Policy passed via the constructor seam overrides the default rotation."""
     providers = [_config("provider_a"), _config("provider_b")]
     router = ProviderRouter(
+        metrics_scope="test",
         providers=providers,
         adapter_factory=_EchoAdapter,
         policy=_ReversePolicy(),
@@ -88,14 +92,14 @@ def test_injected_policy_is_honored() -> None:
 
 
 def test_round_robin_order_of_empty_eligible_is_empty() -> None:
-    context = RoutingContext(metrics_store=None)
+    context = RoutingContext(metrics_scope="test", call_type=CallType.REGULAR, metrics_store=None)
 
     assert RoundRobinPolicy().order([], context) == []
 
 
 def test_round_robin_accepts_context_without_changing_rotation() -> None:
     providers = [_config("provider_a"), _config("provider_b"), _config("provider_c")]
-    context = RoutingContext(metrics_store=None)
+    context = RoutingContext(metrics_scope="test", call_type=CallType.REGULAR, metrics_store=None)
     policy = RoundRobinPolicy()
 
     assert policy.order(providers, context) == providers

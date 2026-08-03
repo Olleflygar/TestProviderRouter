@@ -7,6 +7,13 @@ from pydantic import BaseModel, ConfigDict, field_serializer
 from nygen_router.config import ApiProtocol
 
 
+class CallType(StrEnum):
+    """The response contract declared by the caller for one invocation."""
+
+    REGULAR = "regular"
+    STREAMING = "streaming"
+
+
 class CallVariant(BaseModel):
     """One native, protocol-specific call, passed straight through to the provider SDK.
 
@@ -20,6 +27,7 @@ class CallVariant(BaseModel):
 
     protocol: ApiProtocol
     operation: str
+    call_type: CallType
     arguments: dict[str, object]
 
 
@@ -39,6 +47,7 @@ class EligibilityResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    provider_id: str
     provider_name: str
     reason: FilterReason
     detail: str
@@ -53,6 +62,7 @@ class ProviderAttempt(BaseModel):
 
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
+    provider_id: str
     provider_name: str
     success: bool
     error: Exception | None = None

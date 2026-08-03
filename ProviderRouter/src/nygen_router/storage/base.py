@@ -1,20 +1,16 @@
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, Protocol
 
 from nygen_router.config import ApiProtocol
 from nygen_router.metrics import MetricsEvent
+from nygen_router.types import CallType
 
 
 class MetricsStore(Protocol):
-    """The minimum interface every metrics backend implements.
-
-    Deliberately just record + query: aggregation happens in Python over
-    query_recent's output (see ``aggregate_stats``), never in per-backend SQL,
-    so a custom backend stays trivial to implement.
-    """
+    """The minimum interface every metrics backend implements."""
 
     def record_attempt(self, event: MetricsEvent) -> None: ...
 
@@ -22,146 +18,197 @@ class MetricsStore(Protocol):
         self,
         *,
         since: datetime,
-        provider_name: str | None = None,
+        metrics_scope: str | None = None,
+        provider_id: str | None = None,
         model: str | None = None,
+        protocol: ApiProtocol | None = None,
+        call_type: CallType | None = None,
     ) -> list[MetricsEvent]: ...
 
 
-# Shared by DuckDBMetricsStore and SQLiteMetricsStore so the two engines stay
-# byte-identical in schema and behavior -- only columns with a real data
-# source today. Planned ones (tokens, request_size_bucket, required_tools,
-# cost) arrive with the features that populate them.
+class MetricsSchemaMismatchError(RuntimeError):
+    """An existing provider_attempts table is not the exact supported schema."""
+
+
 CREATE_PROVIDER_ATTEMPTS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS provider_attempts (
     id TEXT PRIMARY KEY,
     timestamp TEXT NOT NULL,
+    metrics_scope TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
     provider_name TEXT NOT NULL,
     model TEXT NOT NULL,
     protocol TEXT NOT NULL,
+    call_type TEXT NOT NULL,
     success INTEGER NOT NULL,
+    stream_opened INTEGER,
     latency_ms REAL,
+    total_duration_ms REAL,
     error_type TEXT,
-    stream INTEGER NOT NULL DEFAULT 0,
-    total_duration_ms REAL
+    request_size_bucket TEXT
 )
 """
 
-_COLUMNS = (
-    "id, timestamp, provider_name, model, protocol, success, latency_ms, error_type, "
-    "stream, total_duration_ms"
+COLUMN_NAMES = (
+    "id",
+    "timestamp",
+    "metrics_scope",
+    "provider_id",
+    "provider_name",
+    "model",
+    "protocol",
+    "call_type",
+    "success",
+    "stream_opened",
+    "latency_ms",
+    "total_duration_ms",
+    "error_type",
+    "request_size_bucket",
 )
 
+_COLUMNS_SQL = ", ".join(COLUMN_NAMES)
 INSERT_PROVIDER_ATTEMPT_SQL = (
-    f"INSERT INTO provider_attempts ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    f"INSERT INTO provider_attempts ({_COLUMNS_SQL}) VALUES "
+    f"({', '.join('?' for _ in COLUMN_NAMES)})"
 )
-
-# Columns added after this table's first release, newest last. A metrics file
-# written by an earlier version predates them, and CREATE TABLE IF NOT EXISTS
-# leaves such a file untouched -- so every backend checks for them on connect
-# and adds what is missing. Every later column is appended to this tuple
-# rather than getting a migration mechanism of its own.
-#
-# The added-column DDL deliberately omits the NOT NULL that the CREATE above
-# carries on `stream`: DuckDB rejects constraints in ALTER TABLE ADD COLUMN
-# ("Adding columns with constraints not yet supported"), and one statement both
-# engines accept matters more than a constraint no write can violate -- every
-# INSERT names `stream` explicitly and MetricsEvent.stream is a plain bool.
-_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
-    ("stream", "INTEGER DEFAULT 0"),
-    ("total_duration_ms", "REAL"),
-)
-
-
-# Both engines answer this identically: one row per column, name second.
 TABLE_INFO_SQL = "PRAGMA table_info('provider_attempts')"
+_SELECT_PROVIDER_ATTEMPTS_SQL = f"SELECT {_COLUMNS_SQL} FROM provider_attempts WHERE timestamp >= ?"
+
+# Logical schema shared by SQLite and DuckDB. DuckDB reports TEXT as VARCHAR
+# and REAL as FLOAT, while SQLite reports the spellings used in the DDL.
+_EXPECTED_SCHEMA = (
+    ("id", "text", False, True),
+    ("timestamp", "text", True, False),
+    ("metrics_scope", "text", True, False),
+    ("provider_id", "text", True, False),
+    ("provider_name", "text", True, False),
+    ("model", "text", True, False),
+    ("protocol", "text", True, False),
+    ("call_type", "text", True, False),
+    ("success", "integer", True, False),
+    ("stream_opened", "integer", False, False),
+    ("latency_ms", "real", False, False),
+    ("total_duration_ms", "real", False, False),
+    ("error_type", "text", False, False),
+    ("request_size_bucket", "text", False, False),
+)
 
 
-def existing_column_names(rows: Sequence[Sequence[Any]]) -> list[str]:
-    """Pull the column names out of a TABLE_INFO_SQL result."""
-    return [str(row[1]) for row in rows]
+def validate_provider_attempts_schema(rows: Sequence[Sequence[Any]]) -> None:
+    """Reject any existing table that is not exactly the PR29 schema."""
+    actual = []
+    for row in rows:
+        name = str(row[1])
+        logical_type = _logical_type(str(row[2]))
+        not_null = bool(row[3])
+        default = row[4]
+        primary_key = bool(row[5])
+        # SQLite reports a TEXT PRIMARY KEY as nullable even though the primary
+        # key itself prevents NULL identity values. Compare that column by PK.
+        if primary_key:
+            not_null = False
+        actual.append((name, logical_type, not_null, primary_key, default))
+    expected = [(*column, None) for column in _EXPECTED_SCHEMA]
+    if actual != expected:
+        actual_names = ", ".join(item[0] for item in actual) or "<none>"
+        raise MetricsSchemaMismatchError(
+            "Existing provider_attempts schema is incompatible with this nygen-router "
+            f"version (found columns: {actual_names}). The database was left untouched; "
+            "move or replace it manually if its legacy history is no longer needed."
+        )
 
 
-def missing_column_sql(existing_columns: Collection[str]) -> list[str]:
-    """ALTER statements bringing an existing provider_attempts table up to date."""
-    return [
-        f"ALTER TABLE provider_attempts ADD COLUMN {name} {ddl}"
-        for name, ddl in _ADDED_COLUMNS
-        if name not in existing_columns
-    ]
-
-
-_SELECT_PROVIDER_ATTEMPTS_SQL = f"SELECT {_COLUMNS} FROM provider_attempts WHERE timestamp >= ?"
+def _logical_type(value: str) -> str:
+    normalized = value.upper()
+    if normalized in {"TEXT", "VARCHAR"}:
+        return "text"
+    if normalized in {"INTEGER", "INT"}:
+        return "integer"
+    if normalized in {"REAL", "FLOAT", "DOUBLE"}:
+        return "real"
+    return normalized.lower()
 
 
 def event_to_params(event: MetricsEvent) -> tuple[object, ...]:
-    """Serialize a MetricsEvent to positional params for INSERT_PROVIDER_ATTEMPT_SQL.
-
-    The timestamp is serialized to ISO-8601 UTC text in Python -- never via SQL
-    date functions -- so TEXT comparison stays chronologically correct and
-    both engines behave identically.
-    """
+    """Serialize an event in the single shared column order."""
     return (
         event.id,
         event.timestamp.isoformat(),
+        event.metrics_scope,
+        event.provider_id,
         event.provider_name,
         event.model,
         event.protocol.value,
+        event.call_type.value,
         event.success,
+        event.stream_opened,
         event.latency_ms,
-        event.error_type,
-        event.stream,
         event.total_duration_ms,
+        event.error_type,
+        event.request_size_bucket,
     )
 
 
 def build_query_recent_sql(
-    *, since: datetime, provider_name: str | None, model: str | None
+    *,
+    since: datetime,
+    metrics_scope: str | None,
+    provider_id: str | None,
+    model: str | None,
+    protocol: ApiProtocol | None,
+    call_type: CallType | None,
 ) -> tuple[str, list[object]]:
-    """Build the query_recent SQL/params, validating `since` is timezone-aware."""
+    """Build a parameterized recent-history query for every identity dimension."""
     if since.tzinfo is None:
         raise ValueError("since must be timezone-aware")
     query = _SELECT_PROVIDER_ATTEMPTS_SQL
     params: list[object] = [since.isoformat()]
-    if provider_name is not None:
-        query += " AND provider_name = ?"
-        params.append(provider_name)
-    if model is not None:
-        query += " AND model = ?"
-        params.append(model)
+    filters: tuple[tuple[str, object | None], ...] = (
+        ("metrics_scope", metrics_scope),
+        ("provider_id", provider_id),
+        ("model", model),
+        ("protocol", None if protocol is None else protocol.value),
+        ("call_type", None if call_type is None else call_type.value),
+    )
+    for column, value in filters:
+        if value is not None:
+            query += f" AND {column} = ?"
+            params.append(value)
     query += " ORDER BY timestamp ASC"
     return query, params
 
 
 def row_to_event(row: Sequence[Any]) -> MetricsEvent:
-    """Parse one query_recent row back into a MetricsEvent.
-
-    Mirrors event_to_params's column order. Timestamps are parsed back with
-    datetime.fromisoformat(); protocol is parsed back with ApiProtocol(value).
-    """
+    """Deserialize an event from the single shared column order."""
     (
         id_,
         timestamp,
+        metrics_scope,
+        provider_id,
         provider_name,
         model,
         protocol,
+        call_type,
         success,
+        stream_opened,
         latency_ms,
-        error_type,
-        stream,
         total_duration_ms,
+        error_type,
+        request_size_bucket,
     ) = row
     return MetricsEvent(
         id=str(id_),
         timestamp=datetime.fromisoformat(str(timestamp)),
+        metrics_scope=str(metrics_scope),
+        provider_id=str(provider_id),
         provider_name=str(provider_name),
         model=str(model),
         protocol=ApiProtocol(protocol),
+        call_type=CallType(call_type),
         success=bool(success),
+        stream_opened=None if stream_opened is None else bool(stream_opened),
         latency_ms=None if latency_ms is None else float(latency_ms),
-        error_type=None if error_type is None else str(error_type),
-        # A row migrated from a file written before `stream` existed has no
-        # value of its own; the column default reads back as 0, which is what
-        # those rows were.
-        stream=bool(stream),
         total_duration_ms=None if total_duration_ms is None else float(total_duration_ms),
+        error_type=None if error_type is None else str(error_type),
+        request_size_bucket=(None if request_size_bucket is None else str(request_size_bucket)),
     )

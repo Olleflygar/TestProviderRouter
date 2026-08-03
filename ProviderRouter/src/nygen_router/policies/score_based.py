@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 
 from nygen_router.config import ProviderConfig
 from nygen_router.metrics import MetricsEvent
@@ -16,6 +17,13 @@ logger = logging.getLogger(__name__)
 _QUERY_HALF_LIVES = 6
 
 
+class HistoryScope(StrEnum):
+    """Whether scoring reads the router's current scope or every scope."""
+
+    CURRENT = "current"
+    ALL = "all"
+
+
 class ScoreBasedPolicy:
     """Rank eligible providers from recent observations, with stable tie-breaking."""
 
@@ -25,7 +33,7 @@ class ScoreBasedPolicy:
         weights: ScoreWeights | None = None,
         lookback_hours: float = 336.0,
         half_life_hours: float | None = None,
-        use_streaming: bool = False,
+        history_scope: HistoryScope = HistoryScope.CURRENT,
         tie_break_policy: Policy | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
@@ -36,7 +44,7 @@ class ScoreBasedPolicy:
         self._weights = ScoreWeights() if weights is None else weights
         self._lookback_hours = lookback_hours
         self._half_life_hours = half_life_hours
-        self._use_streaming = use_streaming
+        self._history_scope = HistoryScope(history_scope)
         self._tie_break_policy = (
             RoundRobinPolicy() if tie_break_policy is None else tie_break_policy
         )
@@ -65,7 +73,12 @@ class ScoreBasedPolicy:
             weight_fn = decay_weight
 
         try:
-            events = context.metrics_store.query_recent(since=since)
+            events = context.metrics_store.query_recent(
+                since=since,
+                metrics_scope=(
+                    context.metrics_scope if self._history_scope is HistoryScope.CURRENT else None
+                ),
+            )
         except Exception:
             logger.log(
                 logging.DEBUG if self._metrics_warning_emitted else logging.WARNING,
@@ -77,15 +90,16 @@ class ScoreBasedPolicy:
 
         stats = aggregate_stats(
             events,
-            [provider.name for provider in rotated],
+            rotated,
+            context.call_type,
             weight_fn=weight_fn,
         )
         scores = {
-            provider.name: calculate_provider_score(
-                stats[provider.name],
+            provider.provider_id: calculate_provider_score(
+                stats[provider.provider_id],
                 self._weights,
-                use_streaming=self._use_streaming,
+                call_type=context.call_type,
             ).total
             for provider in rotated
         }
-        return sorted(rotated, key=lambda provider: scores[provider.name], reverse=True)
+        return sorted(rotated, key=lambda provider: scores[provider.provider_id], reverse=True)

@@ -175,6 +175,8 @@ class ProviderHealthReport:
     than absolute deadlines, which are meaningless outside the router's clock.
     """
 
+    provider_id: str
+    provider_name: str
     auth_disabled: bool = False
     consecutive_failures: int = 0
     cooldown_remaining_seconds: float | None = None

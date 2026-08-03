@@ -19,6 +19,7 @@ class OpenAIResponsesAdapter(OpenAICompatibleAdapter):
     def _wrap_stream(self, stream: Any) -> NormalizedStream:
         return OpenAIResponsesStream(
             stream,
+            provider_id=self.config.provider_id,
             provider_name=self.config.name,
             model=self.config.model,
             timeout_seconds=self.config.timeout_seconds,
@@ -27,10 +28,16 @@ class OpenAIResponsesAdapter(OpenAICompatibleAdapter):
     def _handle_response(self, response: Any) -> Any:
         status = getattr(response, "status", None)
         if status == "incomplete":
-            _log_incomplete(response, provider_name=self.config.name, model=self.config.model)
+            _log_incomplete(
+                response,
+                provider_id=self.config.provider_id,
+                provider_name=self.config.name,
+                model=self.config.model,
+            )
         elif status == "failed":
             raise _failure_error(
                 response=response,
+                provider_id=self.config.provider_id,
                 provider_name=self.config.name,
                 model=self.config.model,
             )
@@ -44,11 +51,13 @@ class OpenAIResponsesStream(NormalizedStream):
         self,
         stream: Any,
         *,
+        provider_id: str,
         provider_name: str,
         model: str,
         timeout_seconds: float,
     ) -> None:
         self._stream = stream
+        self._provider_id = provider_id
         self._provider_name = provider_name
         self._model = model
         self._timeout_seconds = timeout_seconds
@@ -80,6 +89,7 @@ class OpenAIResponsesStream(NormalizedStream):
             if not self._incomplete_warning_emitted:
                 _log_incomplete(
                     response,
+                    provider_id=self._provider_id,
                     provider_name=self._provider_name,
                     model=self._model,
                 )
@@ -88,6 +98,7 @@ class OpenAIResponsesStream(NormalizedStream):
             raise _failure_error(
                 event=event,
                 response=getattr(event, "response", None),
+                provider_id=self._provider_id,
                 provider_name=self._provider_name,
                 model=self._model,
             )
@@ -117,20 +128,22 @@ class OpenAIResponsesStream(NormalizedStream):
     def _as_router_error(self, exc: Exception) -> ProviderError:
         return _map_stream_exception(
             exc,
+            provider_id=self._provider_id,
             provider_name=self._provider_name,
             model=self._model,
             timeout_seconds=self._timeout_seconds,
         )
 
 
-def _log_incomplete(response: Any, *, provider_name: str, model: str) -> None:
+def _log_incomplete(response: Any, *, provider_id: str, provider_name: str, model: str) -> None:
     response_id = getattr(response, "id", None)
     details = getattr(response, "incomplete_details", None)
     reason = getattr(details, "reason", None)
     logger.warning(
-        "Provider %r returned an incomplete response for model %r "
+        'Provider "%s" (id="%s") returned an incomplete response for model %r '
         "(response_id=%r, reason=%r); the result is served without fallback or benching.",
         provider_name,
+        provider_id,
         model,
         response_id,
         reason,
@@ -139,6 +152,7 @@ def _log_incomplete(response: Any, *, provider_name: str, model: str) -> None:
 
 def _failure_error(
     *,
+    provider_id: str,
     provider_name: str,
     model: str,
     event: Any = None,
@@ -159,6 +173,7 @@ def _failure_error(
         message = f"Responses API declared response {response_id!r} failed."
     param = event_param if isinstance(event_param, str) else getattr(embedded_error, "param", None)
     return ProviderResponsesError(
+        provider_id=provider_id,
         provider_name=provider_name,
         model=model,
         message=message,

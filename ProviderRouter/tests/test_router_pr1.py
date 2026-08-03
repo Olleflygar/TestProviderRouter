@@ -4,6 +4,7 @@ import pytest
 
 from nygen_router import (
     ApiProtocol,
+    CallType,
     CallVariant,
     ConfigError,
     DuplicateCallVariantProtocolError,
@@ -20,6 +21,7 @@ from nygen_router.errors import (
 
 def _openai_config(name: str = "provider_a", *, enabled: bool = True) -> ProviderConfig:
     return ProviderConfig(
+        provider_id=name,
         name=name,
         protocol=ApiProtocol.OPENAI_CHAT,
         model="model-a",
@@ -32,6 +34,7 @@ def _openai_config(name: str = "provider_a", *, enabled: bool = True) -> Provide
 def _calls() -> list[CallVariant]:
     return [
         CallVariant(
+            call_type=CallType.REGULAR,
             protocol=ApiProtocol.OPENAI_CHAT,
             operation="chat.completions.create",
             arguments={"messages": [{"role": "user", "content": "Hello"}]},
@@ -40,7 +43,7 @@ def _calls() -> list[CallVariant]:
 
 
 def test_router_raises_no_providers_configured_with_no_providers() -> None:
-    router = ProviderRouter(providers=[])
+    router = ProviderRouter(metrics_scope="test", providers=[])
 
     with pytest.raises(NoProvidersConfiguredError):
         router.invoke(_calls())
@@ -50,11 +53,12 @@ def test_duplicate_provider_names_are_rejected_at_construction() -> None:
     """Names key metrics and health history, so a duplicate would merge two providers into one."""
     with pytest.raises(ConfigError) as exc_info:
         ProviderRouter(
+            metrics_scope="test",
             providers=[
                 _openai_config("provider_a"),
                 _openai_config("provider_a"),
                 _openai_config("provider_b"),
-            ]
+            ],
         )
 
     message = str(exc_info.value)
@@ -65,12 +69,13 @@ def test_duplicate_provider_names_are_rejected_at_construction() -> None:
 def test_duplicate_provider_names_error_names_every_duplicate() -> None:
     with pytest.raises(ConfigError) as exc_info:
         ProviderRouter(
+            metrics_scope="test",
             providers=[
                 _openai_config("provider_a"),
                 _openai_config("provider_a"),
                 _openai_config("provider_b"),
                 _openai_config("provider_b"),
-            ]
+            ],
         )
 
     message = str(exc_info.value)
@@ -91,6 +96,7 @@ def test_router_invokes_first_enabled_openai_compatible_provider() -> None:
             return self.config.name
 
     router = ProviderRouter(
+        metrics_scope="test",
         providers=[
             _openai_config("provider_a", enabled=False),
             _openai_config("provider_b", enabled=True),
@@ -107,14 +113,16 @@ def test_router_invokes_first_enabled_openai_compatible_provider() -> None:
 def test_router_excludes_provider_with_unsupported_protocol() -> None:
     """An unsupported protocol is a hard filter, not a raised UnsupportedProtocolError."""
     router = ProviderRouter(
+        metrics_scope="test",
         providers=[
             ProviderConfig(
+                provider_id="anthropic",
                 name="anthropic",
                 protocol=ApiProtocol.ANTHROPIC_MESSAGES,
                 model="claude-model",
                 api_key="secret",
             )
-        ]
+        ],
     )
 
     with pytest.raises(NoEligibleProvidersError) as exc_info:
@@ -135,8 +143,10 @@ def test_router_supports_custom_protocol_via_supported_protocols_param() -> None
             return self.config.name
 
     router = ProviderRouter(
+        metrics_scope="test",
         providers=[
             ProviderConfig(
+                provider_id="anthropic",
                 name="anthropic",
                 protocol=ApiProtocol.ANTHROPIC_MESSAGES,
                 model="claude-model",
@@ -150,6 +160,7 @@ def test_router_supports_custom_protocol_via_supported_protocols_param() -> None
     response = router.invoke(
         [
             CallVariant(
+                call_type=CallType.REGULAR,
                 protocol=ApiProtocol.ANTHROPIC_MESSAGES,
                 operation="messages.create",
                 arguments={"messages": [{"role": "user", "content": "hi"}]},
@@ -168,12 +179,15 @@ def test_model_argument_conflict_raises_before_any_provider_is_contacted() -> No
         def invoke(self, operation: str, arguments: dict[str, object]) -> str:
             raise AssertionError("adapter should not be called")
 
-    router = ProviderRouter(providers=[_openai_config()], adapter_factory=FakeAdapter)
+    router = ProviderRouter(
+        metrics_scope="test", providers=[_openai_config()], adapter_factory=FakeAdapter
+    )
 
     with pytest.raises(ModelArgumentConflictError):
         router.invoke(
             [
                 CallVariant(
+                    call_type=CallType.REGULAR,
                     protocol=ApiProtocol.OPENAI_CHAT,
                     operation="chat.completions.create",
                     arguments={"model": "sneaky", "messages": []},
@@ -190,17 +204,21 @@ def test_duplicate_call_variant_protocol_raises_before_any_provider_is_contacted
         def invoke(self, operation: str, arguments: dict[str, object]) -> str:
             raise AssertionError("adapter should not be called")
 
-    router = ProviderRouter(providers=[_openai_config()], adapter_factory=FakeAdapter)
+    router = ProviderRouter(
+        metrics_scope="test", providers=[_openai_config()], adapter_factory=FakeAdapter
+    )
 
     with pytest.raises(DuplicateCallVariantProtocolError):
         router.invoke(
             [
                 CallVariant(
+                    call_type=CallType.REGULAR,
                     protocol=ApiProtocol.OPENAI_CHAT,
                     operation="chat.completions.create",
                     arguments={"messages": []},
                 ),
                 CallVariant(
+                    call_type=CallType.REGULAR,
                     protocol=ApiProtocol.OPENAI_CHAT,
                     operation="chat.completions.create",
                     arguments={"messages": []},

@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from nygen_router import (
+    CallType,
     ProviderScore,
     ProviderStats,
     ScoreWeights,
@@ -15,6 +16,7 @@ from nygen_router import (
 
 def test_higher_regular_success_rate_produces_a_higher_total() -> None:
     lower = ProviderStats(
+        provider_id="provider",
         provider_name="provider",
         regular_attempt_count=10.0,
         regular_success_count=5.0,
@@ -29,6 +31,7 @@ def test_higher_regular_success_rate_produces_a_higher_total() -> None:
         timeout_count=0,
     )
     higher = ProviderStats(
+        provider_id="provider",
         provider_name="provider",
         regular_attempt_count=10.0,
         regular_success_count=5.0,
@@ -52,6 +55,7 @@ def test_higher_regular_success_rate_produces_a_higher_total() -> None:
 
 def test_lower_regular_latency_produces_a_higher_total() -> None:
     faster = ProviderStats(
+        provider_id="provider",
         provider_name="provider",
         regular_attempt_count=10.0,
         regular_success_count=10.0,
@@ -66,6 +70,7 @@ def test_lower_regular_latency_produces_a_higher_total() -> None:
         timeout_count=0,
     )
     slower = ProviderStats(
+        provider_id="provider",
         provider_name="provider",
         regular_attempt_count=10.0,
         regular_success_count=10.0,
@@ -87,11 +92,14 @@ def test_lower_regular_latency_produces_a_higher_total() -> None:
     )
 
 
-@pytest.mark.parametrize("use_streaming", [False, True], ids=["regular", "streaming"])
+@pytest.mark.parametrize(
+    "call_type", [CallType.REGULAR, CallType.STREAMING], ids=["regular", "streaming"]
+)
 def test_zero_relevant_attempts_score_exactly_at_the_optimistic_start(
-    use_streaming: bool,
+    call_type: CallType,
 ) -> None:
     stats = ProviderStats(
+        provider_id="new",
         provider_name="new",
         regular_attempt_count=0.0,
         regular_success_count=0.0,
@@ -107,7 +115,7 @@ def test_zero_relevant_attempts_score_exactly_at_the_optimistic_start(
     )
     weights = ScoreWeights(optimistic_start=0.63)
 
-    score = calculate_provider_score(stats, weights, use_streaming=use_streaming)
+    score = calculate_provider_score(stats, weights, call_type=call_type)
 
     assert score.success_quality == 0.63
     assert score.speed_quality == 0.63
@@ -116,6 +124,7 @@ def test_zero_relevant_attempts_score_exactly_at_the_optimistic_start(
 
 def test_thin_history_stays_near_the_prior_while_deep_history_nears_observed_rate() -> None:
     thin = ProviderStats(
+        provider_id="thin",
         provider_name="thin",
         regular_attempt_count=1.0,
         regular_success_count=0.0,
@@ -130,6 +139,7 @@ def test_thin_history_stays_near_the_prior_while_deep_history_nears_observed_rat
         timeout_count=0,
     )
     deep = ProviderStats(
+        provider_id="deep",
         provider_name="deep",
         regular_attempt_count=100.0,
         regular_success_count=0.0,
@@ -154,6 +164,7 @@ def test_thin_history_stays_near_the_prior_while_deep_history_nears_observed_rat
 
 def test_zero_speed_weight_removes_all_speed_influence() -> None:
     faster = ProviderStats(
+        provider_id="provider",
         provider_name="provider",
         regular_attempt_count=10.0,
         regular_success_count=8.0,
@@ -168,6 +179,7 @@ def test_zero_speed_weight_removes_all_speed_influence() -> None:
         timeout_count=0,
     )
     slower = ProviderStats(
+        provider_id="provider",
         provider_name="provider",
         regular_attempt_count=10.0,
         regular_success_count=8.0,
@@ -193,6 +205,7 @@ def test_zero_speed_weight_removes_all_speed_influence() -> None:
 
 def test_zero_success_weight_removes_all_success_influence() -> None:
     reliable = ProviderStats(
+        provider_id="provider",
         provider_name="provider",
         regular_attempt_count=5.0,
         regular_success_count=5.0,
@@ -207,6 +220,7 @@ def test_zero_success_weight_removes_all_success_influence() -> None:
         timeout_count=0,
     )
     unreliable = ProviderStats(
+        provider_id="provider",
         provider_name="provider",
         regular_attempt_count=10.0,
         regular_success_count=5.0,
@@ -237,6 +251,7 @@ def test_both_factor_weights_cannot_be_zero() -> None:
 
 def test_diagnostic_error_tallies_do_not_influence_the_score() -> None:
     no_diagnostics = ProviderStats(
+        provider_id="provider",
         provider_name="provider",
         regular_attempt_count=10.0,
         regular_success_count=5.0,
@@ -251,6 +266,7 @@ def test_diagnostic_error_tallies_do_not_influence_the_score() -> None:
         timeout_count=0,
     )
     many_diagnostics = ProviderStats(
+        provider_id="provider",
         provider_name="provider",
         regular_attempt_count=10.0,
         regular_success_count=5.0,
@@ -273,6 +289,7 @@ def test_diagnostic_error_tallies_do_not_influence_the_score() -> None:
 
 def test_streaming_switch_reads_only_the_selected_call_type_fields() -> None:
     stats = ProviderStats(
+        provider_id="split",
         provider_name="split",
         regular_attempt_count=100.0,
         regular_success_count=100.0,
@@ -288,8 +305,8 @@ def test_streaming_switch_reads_only_the_selected_call_type_fields() -> None:
     )
     weights = ScoreWeights()
 
-    regular = calculate_provider_score(stats, weights, use_streaming=False)
-    streaming = calculate_provider_score(stats, weights, use_streaming=True)
+    regular = calculate_provider_score(stats, weights, call_type=CallType.REGULAR)
+    streaming = calculate_provider_score(stats, weights, call_type=CallType.STREAMING)
 
     assert regular.success_quality == pytest.approx((5 * 0.75 + 100 * 1.0) / 105)
     assert regular.speed_quality == pytest.approx((5 * 0.75 + 100 * (2000 / 2050)) / 105)
@@ -299,10 +316,11 @@ def test_streaming_switch_reads_only_the_selected_call_type_fields() -> None:
 
 
 @pytest.mark.parametrize(
-    ("stats", "weights", "use_streaming"),
+    ("stats", "weights", "call_type"),
     [
         pytest.param(
             ProviderStats(
+                provider_id="new",
                 provider_name="new",
                 regular_attempt_count=0.0,
                 regular_success_count=0.0,
@@ -317,11 +335,12 @@ def test_streaming_switch_reads_only_the_selected_call_type_fields() -> None:
                 timeout_count=0,
             ),
             ScoreWeights(),
-            False,
+            CallType.REGULAR,
             id="zero-attempts",
         ),
         pytest.param(
             ProviderStats(
+                provider_id="slow",
                 provider_name="slow",
                 regular_attempt_count=100.0,
                 regular_success_count=100.0,
@@ -336,11 +355,12 @@ def test_streaming_switch_reads_only_the_selected_call_type_fields() -> None:
                 timeout_count=0,
             ),
             ScoreWeights(success_weight=0.0, speed_weight=100.0),
-            False,
+            CallType.REGULAR,
             id="very-high-latency",
         ),
         pytest.param(
             ProviderStats(
+                provider_id="excellent",
                 provider_name="excellent",
                 regular_attempt_count=1_000.0,
                 regular_success_count=1_000.0,
@@ -355,11 +375,12 @@ def test_streaming_switch_reads_only_the_selected_call_type_fields() -> None:
                 timeout_count=0,
             ),
             ScoreWeights(success_weight=10.0, speed_weight=0.1, optimistic_start=1.0),
-            False,
+            CallType.REGULAR,
             id="perfect-low-latency",
         ),
         pytest.param(
             ProviderStats(
+                provider_id="stream",
                 provider_name="stream",
                 regular_attempt_count=10.0,
                 regular_success_count=0.0,
@@ -374,7 +395,7 @@ def test_streaming_switch_reads_only_the_selected_call_type_fields() -> None:
                 timeout_count=0,
             ),
             ScoreWeights(success_weight=0.3, speed_weight=7.0, optimistic_start=0.0),
-            True,
+            CallType.STREAMING,
             id="streaming",
         ),
     ],
@@ -382,9 +403,9 @@ def test_streaming_switch_reads_only_the_selected_call_type_fields() -> None:
 def test_total_is_always_a_quality_between_zero_and_one(
     stats: ProviderStats,
     weights: ScoreWeights,
-    use_streaming: bool,
+    call_type: CallType,
 ) -> None:
-    total = calculate_provider_score(stats, weights, use_streaming=use_streaming).total
+    total = calculate_provider_score(stats, weights, call_type=call_type).total
 
     assert 0 <= total <= 1
 
@@ -425,6 +446,7 @@ def test_score_weights_forbid_unknown_fields() -> None:
 
 def test_provider_score_is_frozen() -> None:
     score = ProviderScore(
+        provider_id="provider",
         provider_name="provider",
         total=0.5,
         success_quality=0.5,

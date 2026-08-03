@@ -9,6 +9,7 @@ import pytest
 
 from nygen_router import (
     ApiProtocol,
+    CallType,
     CallVariant,
     MetricsEvent,
     ProviderConfig,
@@ -33,8 +34,11 @@ class _FakeStore:
         self,
         *,
         since: datetime,
-        provider_name: str | None = None,
+        metrics_scope: str | None = None,
+        provider_id: str | None = None,
         model: str | None = None,
+        protocol: ApiProtocol | None = None,
+        call_type: CallType | None = None,
     ) -> list[MetricsEvent]:
         return list(self.events)
 
@@ -52,8 +56,11 @@ class _RaisingStore:
         self,
         *,
         since: datetime,
-        provider_name: str | None = None,
+        metrics_scope: str | None = None,
+        provider_id: str | None = None,
         model: str | None = None,
+        protocol: ApiProtocol | None = None,
+        call_type: CallType | None = None,
     ) -> list[MetricsEvent]:
         return []
 
@@ -97,6 +104,7 @@ class _StaticPolicy:
 
 def _config(name: str, *, enabled: bool = True) -> ProviderConfig:
     return ProviderConfig(
+        provider_id=name,
         name=name,
         protocol=ApiProtocol.OPENAI_CHAT,
         model="model-a",
@@ -109,6 +117,7 @@ def _config(name: str, *, enabled: bool = True) -> ProviderConfig:
 def _calls() -> list[CallVariant]:
     return [
         CallVariant(
+            call_type=CallType.REGULAR,
             protocol=ApiProtocol.OPENAI_CHAT,
             operation="chat.completions.create",
             arguments={"messages": [{"role": "user", "content": "hi"}]},
@@ -126,6 +135,7 @@ def _router(
         return _ScriptedAdapter(config, behaviors)
 
     return ProviderRouter(
+        metrics_scope="test",
         providers=providers,
         adapter_factory=factory,
         policy=_StaticPolicy(),
@@ -153,7 +163,9 @@ def test_successful_call_records_exactly_one_success_event() -> None:
 
 def test_fallback_records_two_events_in_attempt_order() -> None:
     store = _FakeStore()
-    timeout = ProviderTimeoutError("timed out", provider_name="provider_a", model="model-a")
+    timeout = ProviderTimeoutError(
+        "timed out", provider_id="provider_a", provider_name="provider_a", model="model-a"
+    )
     router = _router(
         [_config("provider_a"), _config("provider_b")],
         {"provider_a": timeout},
@@ -245,7 +257,11 @@ def test_metrics_store_none_records_nothing_and_creates_no_file(tmp_path: Path) 
 def test_failure_events_recorded_before_router_exhausted_error_is_raised() -> None:
     store = _FakeStore()
     http_error = ProviderHTTPError(
-        provider_name="provider_a", model="model-a", status_code=429, message="rate limited"
+        provider_id="provider_a",
+        provider_name="provider_a",
+        model="model-a",
+        status_code=429,
+        message="rate limited",
     )
     router = _router([_config("provider_a")], {"provider_a": http_error}, metrics_store=store)
 

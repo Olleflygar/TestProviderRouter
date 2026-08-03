@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from nygen_router import ApiProtocol, MetricsEvent, MetricsStore, SQLiteMetricsStore
+from nygen_router import ApiProtocol, CallType, MetricsEvent, MetricsStore, SQLiteMetricsStore
 
 _DUCKDB_AVAILABLE = importlib.util.find_spec("duckdb") is not None
 
@@ -50,25 +50,33 @@ def store(request: pytest.FixtureRequest, tmp_path: Path) -> MetricsStore:
 
 def _event(
     *,
+    metrics_scope: str = "test",
+    provider_id: str = "provider_a",
     provider_name: str = "provider_a",
     model: str = "model-a",
     protocol: ApiProtocol = ApiProtocol.OPENAI_CHAT,
     success: bool = True,
     latency_ms: float | None = 12.5,
     error_type: str | None = None,
-    stream: bool = False,
+    call_type: CallType = CallType.REGULAR,
+    stream_opened: bool | None = None,
     total_duration_ms: float | None = None,
+    request_size_bucket: str | None = None,
     timestamp: datetime | None = None,
 ) -> MetricsEvent:
     return MetricsEvent(
+        provider_id=provider_id,
+        metrics_scope=metrics_scope,
+        call_type=call_type,
         provider_name=provider_name,
         model=model,
         protocol=protocol,
         success=success,
         latency_ms=latency_ms,
         error_type=error_type,
-        stream=stream,
+        stream_opened=stream_opened,
         total_duration_ms=total_duration_ms,
+        request_size_bucket=request_size_bucket,
         timestamp=timestamp if timestamp is not None else datetime.now(UTC),
     )
 
@@ -83,7 +91,11 @@ def test_schema_created_on_first_use(store: MetricsStore) -> None:
 
 def test_records_and_reads_back_success_event_field_for_field(store: MetricsStore) -> None:
     event = _event(
-        provider_name="provider_a", model="model-a", protocol=ApiProtocol.OPENAI_CHAT, success=True
+        provider_id="provider_a",
+        provider_name="provider_a",
+        model="model-a",
+        protocol=ApiProtocol.OPENAI_CHAT,
+        success=True,
     )
 
     store.record_attempt(event)
@@ -91,28 +103,39 @@ def test_records_and_reads_back_success_event_field_for_field(store: MetricsStor
     (read_back,) = store.query_recent(since=since)
 
     assert read_back.id == event.id
+    assert read_back.metrics_scope == event.metrics_scope
+    assert read_back.provider_id == event.provider_id
     assert read_back.provider_name == event.provider_name
     assert read_back.model == event.model
     assert read_back.protocol == event.protocol
+    assert read_back.call_type == event.call_type
     assert read_back.success is True
     assert read_back.latency_ms == pytest.approx(event.latency_ms)
     assert read_back.error_type is None
     assert read_back.timestamp == event.timestamp
 
 
-def test_records_and_reads_back_a_stream_event(store: MetricsStore) -> None:
+def test_records_and_reads_back_a_streaming_event(store: MetricsStore) -> None:
     """On a stream row latency_ms is time-to-first-chunk and total_duration_ms is open-to-end."""
-    event = _event(stream=True, latency_ms=8.0, total_duration_ms=1200.0)
+    event = _event(
+        call_type=CallType.STREAMING,
+        stream_opened=True,
+        latency_ms=8.0,
+        total_duration_ms=1200.0,
+        request_size_bucket="large",
+    )
 
     store.record_attempt(event)
     (read_back,) = store.query_recent(since=event.timestamp - timedelta(seconds=1))
 
-    assert read_back.stream is True
+    assert read_back.call_type is CallType.STREAMING
+    assert read_back.stream_opened is True
     assert read_back.latency_ms == pytest.approx(8.0)
     assert read_back.total_duration_ms == pytest.approx(1200.0)
+    assert read_back.request_size_bucket == "large"
 
 
-def test_non_stream_event_reads_back_with_stream_false_and_no_total_duration(
+def test_regular_event_reads_back_with_stream_opened_none_and_no_total_duration(
     store: MetricsStore,
 ) -> None:
     event = _event()
@@ -120,7 +143,8 @@ def test_non_stream_event_reads_back_with_stream_false_and_no_total_duration(
     store.record_attempt(event)
     (read_back,) = store.query_recent(since=event.timestamp - timedelta(seconds=1))
 
-    assert read_back.stream is False
+    assert read_back.call_type is CallType.REGULAR
+    assert read_back.stream_opened is None
     assert read_back.total_duration_ms is None
 
 
@@ -129,7 +153,8 @@ def test_stream_event_with_no_first_chunk_round_trips_a_null_latency(store: Metr
     event = _event(
         success=False,
         error_type="stream_interrupted",
-        stream=True,
+        call_type=CallType.STREAMING,
+        stream_opened=True,
         latency_ms=None,
         total_duration_ms=45.0,
     )
@@ -158,9 +183,13 @@ def test_query_recent_returns_events_in_chronological_ascending_order(
     store: MetricsStore,
 ) -> None:
     base = datetime.now(UTC) - timedelta(minutes=10)
-    first = _event(provider_name="first", timestamp=base)
-    second = _event(provider_name="second", timestamp=base + timedelta(seconds=1))
-    third = _event(provider_name="third", timestamp=base + timedelta(seconds=2))
+    first = _event(provider_id="first", provider_name="first", timestamp=base)
+    second = _event(
+        provider_id="second", provider_name="second", timestamp=base + timedelta(seconds=1)
+    )
+    third = _event(
+        provider_id="third", provider_name="third", timestamp=base + timedelta(seconds=2)
+    )
 
     # Record out of order to prove the store sorts, not just preserves insertion order.
     store.record_attempt(third)
@@ -174,8 +203,8 @@ def test_query_recent_returns_events_in_chronological_ascending_order(
 
 def test_query_recent_excludes_events_older_than_since(store: MetricsStore) -> None:
     now = datetime.now(UTC)
-    old_event = _event(provider_name="old", timestamp=now - timedelta(hours=2))
-    recent_event = _event(provider_name="recent", timestamp=now)
+    old_event = _event(provider_id="old", provider_name="old", timestamp=now - timedelta(hours=2))
+    recent_event = _event(provider_id="recent", provider_name="recent", timestamp=now)
 
     store.record_attempt(old_event)
     store.record_attempt(recent_event)
@@ -185,14 +214,14 @@ def test_query_recent_excludes_events_older_than_since(store: MetricsStore) -> N
     assert [event.provider_name for event in events] == ["recent"]
 
 
-def test_query_recent_filters_by_provider_name(store: MetricsStore) -> None:
+def test_query_recent_filters_by_provider_id_not_display_name(store: MetricsStore) -> None:
     since = datetime.now(UTC) - timedelta(minutes=1)
-    store.record_attempt(_event(provider_name="provider_a"))
-    store.record_attempt(_event(provider_name="provider_b"))
+    store.record_attempt(_event(provider_id="provider_a", provider_name="shared"))
+    store.record_attempt(_event(provider_id="provider_b", provider_name="shared"))
 
-    events = store.query_recent(since=since, provider_name="provider_a")
+    events = store.query_recent(provider_id="provider_a", since=since)
 
-    assert [event.provider_name for event in events] == ["provider_a"]
+    assert [event.provider_id for event in events] == ["provider_a"]
 
 
 def test_query_recent_filters_by_model(store: MetricsStore) -> None:

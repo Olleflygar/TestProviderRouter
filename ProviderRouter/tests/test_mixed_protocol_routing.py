@@ -9,6 +9,7 @@ import pytest
 
 from nygen_router import (
     ApiProtocol,
+    CallType,
     CallVariant,
     InvalidOperationArgumentsError,
     MetricsEvent,
@@ -48,8 +49,11 @@ class _Store:
         self,
         *,
         since: datetime,
-        provider_name: str | None = None,
+        metrics_scope: str | None = None,
+        provider_id: str | None = None,
         model: str | None = None,
+        protocol: ApiProtocol | None = None,
+        call_type: CallType | None = None,
     ) -> list[MetricsEvent]:
         return list(self.events)
 
@@ -125,6 +129,7 @@ class _Adapter:
 
 def _config(name: str, protocol: ApiProtocol, model: str) -> ProviderConfig:
     return ProviderConfig(
+        provider_id=name,
         name=name,
         protocol=protocol,
         model=model,
@@ -136,6 +141,7 @@ def _config(name: str, protocol: ApiProtocol, model: str) -> ProviderConfig:
 def _calls(*, stream: bool = False) -> list[CallVariant]:
     return [
         CallVariant(
+            call_type=CallType.STREAMING if stream else CallType.REGULAR,
             protocol=ApiProtocol.OPENAI_CHAT,
             operation="chat.completions.create",
             arguments={
@@ -144,6 +150,7 @@ def _calls(*, stream: bool = False) -> list[CallVariant]:
             },
         ),
         CallVariant(
+            call_type=CallType.STREAMING if stream else CallType.REGULAR,
             protocol=ApiProtocol.OPENAI_RESPONSES,
             operation="responses.create",
             arguments={
@@ -168,6 +175,7 @@ def _router(
     return (
         ProviderRouter(
             providers,
+            metrics_scope="test",
             adapter_factory=factory,
             policy=_StaticPolicy(),
             metrics_store=store,  # type: ignore[arg-type]
@@ -180,6 +188,7 @@ def _router(
 def _timeout(provider: ProviderConfig) -> ProviderTimeoutError:
     return ProviderTimeoutError(
         f"{provider.name} timed out",
+        provider_id=provider.name,
         provider_name=provider.name,
         model=provider.model,
     )
@@ -188,6 +197,7 @@ def _timeout(provider: ProviderConfig) -> ProviderTimeoutError:
 def _bad_request(provider: ProviderConfig) -> Exception:
     if provider.protocol is ApiProtocol.OPENAI_RESPONSES:
         return ProviderResponsesError(
+            provider_id=provider.name,
             provider_name=provider.name,
             model=provider.model,
             message="invalid native input",
@@ -195,6 +205,7 @@ def _bad_request(provider: ProviderConfig) -> Exception:
             param="input",
         )
     return ProviderHTTPError(
+        provider_id=provider.name,
         provider_name=provider.name,
         model=provider.model,
         status_code=400,
@@ -205,6 +216,7 @@ def _bad_request(provider: ProviderConfig) -> Exception:
 def _invalid_operation(provider: ProviderConfig) -> UnsupportedOperationError:
     return UnsupportedOperationError(
         "invalid operation",
+        provider_id=provider.name,
         provider_name=provider.name,
         model=provider.model,
     )
@@ -212,8 +224,9 @@ def _invalid_operation(provider: ProviderConfig) -> UnsupportedOperationError:
 
 def test_responses_is_supported_by_the_default_registry_and_adapter() -> None:
     provider = _config("responses", ApiProtocol.OPENAI_RESPONSES, "responses-model")
-    router = ProviderRouter([provider], metrics_store=None)
+    router = ProviderRouter([provider], metrics_scope="test", metrics_store=None)
     invalid_call = CallVariant(
+        call_type=CallType.REGULAR,
         protocol=ApiProtocol.OPENAI_RESPONSES,
         operation="responses.creat",
         arguments={"input": "never sent"},
@@ -228,10 +241,11 @@ def test_responses_is_supported_by_the_default_registry_and_adapter() -> None:
 
 
 def test_unsupported_protocol_error_names_both_builtin_protocols() -> None:
-    error = UnsupportedProtocolError("custom", ApiProtocol.ANTHROPIC_MESSAGES)
+    error = UnsupportedProtocolError("custom-id", "custom", ApiProtocol.ANTHROPIC_MESSAGES)
 
     assert "'openai_chat'" in str(error)
     assert "'openai_responses'" in str(error)
+    assert 'id="custom-id"' in str(error)
 
 
 def test_responses_variant_receives_model_copy_without_mutating_original() -> None:
@@ -303,11 +317,13 @@ def test_every_retryable_category_continues_across_protocols(
     if failure_kind == "connection":
         failure: Exception = ProviderConnectionError(
             "connection failed",
+            provider_id=first.name,
             provider_name=first.name,
             model=first.model,
         )
     elif failure_kind == "rate_limit":
         failure = ProviderHTTPError(
+            provider_id=first.name,
             provider_name=first.name,
             model=first.model,
             status_code=429,
@@ -315,6 +331,7 @@ def test_every_retryable_category_continues_across_protocols(
         )
     elif failure_kind == "auth":
         failure = ProviderHTTPError(
+            provider_id=first.name,
             provider_name=first.name,
             model=first.model,
             status_code=401,
@@ -322,6 +339,7 @@ def test_every_retryable_category_continues_across_protocols(
         )
     elif failure_kind == "server":
         failure = ProviderHTTPError(
+            provider_id=first.name,
             provider_name=first.name,
             model=first.model,
             status_code=503,
@@ -330,6 +348,7 @@ def test_every_retryable_category_continues_across_protocols(
     else:
         failure = ProviderError(
             "future provider failure",
+            provider_id=first.name,
             provider_name=first.name,
             model=first.model,
         )
@@ -346,6 +365,7 @@ def test_declared_responses_rate_limit_falls_back_and_benches_provider() -> None
     first = _config("first", ApiProtocol.OPENAI_RESPONSES, "responses-model")
     second = _config("second", ApiProtocol.OPENAI_CHAT, "chat-model")
     failure = ProviderResponsesError(
+        provider_id=first.name,
         provider_name=first.name,
         model=first.model,
         message="provider flow control",
@@ -414,7 +434,7 @@ def test_active_stream_stop_category_does_not_restart_across_protocols(
 
     assert exc_info.value is failure
     assert [call[0] for call in script.calls] == ["first"]
-    assert store.events[0].stream is True
+    assert store.events[0].stream_opened is True
     assert store.events[0].success is False
     assert router.health_report()["first"].consecutive_failures == 0
 
@@ -426,6 +446,7 @@ def test_stop_category_while_opening_replacement_aborts_remaining_protocols() ->
     first_failure = _timeout(first)
     replacement_failure = InvalidOperationArgumentsError(
         "bad replacement arguments",
+        provider_id=second.name,
         provider_name=second.name,
         model=second.model,
     )
@@ -448,7 +469,7 @@ def test_stop_category_while_opening_replacement_aborts_remaining_protocols() ->
         first_failure,
         replacement_failure,
     ]
-    assert [event.stream for event in store.events] == [True, False]
+    assert [event.stream_opened for event in store.events] == [True, False]
     assert router.health_report()["first"].consecutive_failures == 1
     assert router.health_report()["second"].consecutive_failures == 0
 
@@ -497,7 +518,7 @@ def test_retryable_stream_failure_restarts_across_protocols() -> None:
         "chat.completions.create",
     ]
     assert [event.success for event in store.events] == [False, True]
-    assert all(event.stream for event in store.events)
+    assert all(event.stream_opened for event in store.events)
 
 
 def _responses_stream_body(*events: dict[str, object]) -> bytes:
@@ -561,6 +582,7 @@ def test_real_incomplete_responses_stream_is_served_without_fallback_or_bench(
     store = _Store()
     router = ProviderRouter(
         [provider],
+        metrics_scope="test",
         adapter_factory=lambda config: OpenAIResponsesAdapter(config, http_client=client),
         metrics_store=store,  # type: ignore[arg-type]
     )
@@ -576,7 +598,7 @@ def test_real_incomplete_responses_stream_is_served_without_fallback_or_bench(
     assert stream.usage.total_tokens == 4
     assert len(store.events) == 1
     assert store.events[0].success is True
-    assert store.events[0].stream is True
+    assert store.events[0].stream_opened is True
     assert store.events[0].latency_ms is not None
     assert store.events[0].total_duration_ms is not None
     assert router.health_report()["responses"].consecutive_failures == 0
@@ -618,6 +640,7 @@ def test_real_responses_stream_without_usable_terminal_result_is_interrupted(
     store = _Store()
     router = ProviderRouter(
         [provider],
+        metrics_scope="test",
         adapter_factory=lambda config: OpenAIResponsesAdapter(config, http_client=client),
         metrics_store=store,  # type: ignore[arg-type]
         stream_failure_policy=StreamFailurePolicy.RAISE,
@@ -631,4 +654,4 @@ def test_real_responses_stream_without_usable_terminal_result_is_interrupted(
 
     assert len(store.events) == 1
     assert store.events[0].success is False
-    assert store.events[0].stream is True
+    assert store.events[0].stream_opened is True

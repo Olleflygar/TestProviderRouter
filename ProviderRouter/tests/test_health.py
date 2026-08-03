@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from nygen_router import (
     ApiProtocol,
+    CallType,
     CallVariant,
     ConfigError,
     FilterReason,
@@ -59,8 +60,11 @@ class _FakeStore:
         self,
         *,
         since: datetime,
-        provider_name: str | None = None,
+        metrics_scope: str | None = None,
+        provider_id: str | None = None,
         model: str | None = None,
+        protocol: ApiProtocol | None = None,
+        call_type: CallType | None = None,
     ) -> list[MetricsEvent]:
         return list(self.events)
 
@@ -109,6 +113,7 @@ class _StaticPolicy:
 
 def _config(name: str, *, enabled: bool = True) -> ProviderConfig:
     return ProviderConfig(
+        provider_id=name,
         name=name,
         protocol=ApiProtocol.OPENAI_CHAT,
         model="model-a",
@@ -121,6 +126,7 @@ def _config(name: str, *, enabled: bool = True) -> ProviderConfig:
 def _calls() -> list[CallVariant]:
     return [
         CallVariant(
+            call_type=CallType.REGULAR,
             protocol=ApiProtocol.OPENAI_CHAT,
             operation="chat.completions.create",
             arguments={"messages": [{"role": "user", "content": "hi"}]},
@@ -129,16 +135,16 @@ def _calls() -> list[CallVariant]:
 
 
 def _timeout(name: str, message: str = "gateway timed out") -> ProviderTimeoutError:
-    return ProviderTimeoutError(message, provider_name=name, model="model-a")
+    return ProviderTimeoutError(message, provider_id=name, provider_name=name, model="model-a")
 
 
 def _connection(name: str, message: str = "could not connect") -> ProviderConnectionError:
-    return ProviderConnectionError(message, provider_name=name, model="model-a")
+    return ProviderConnectionError(message, provider_id=name, provider_name=name, model="model-a")
 
 
 def _http(name: str, status: int, message: str = "provider said no") -> ProviderHTTPError:
     return ProviderHTTPError(
-        provider_name=name, model="model-a", status_code=status, message=message
+        provider_id=name, provider_name=name, model="model-a", status_code=status, message=message
     )
 
 
@@ -155,6 +161,7 @@ def _router(
         return _ScriptedAdapter(config, script)
 
     return ProviderRouter(
+        metrics_scope="test",
         providers=providers,
         adapter_factory=factory,
         policy=_StaticPolicy(),
@@ -511,6 +518,8 @@ def test_health_report_has_an_entry_per_configured_provider_and_healthy_ones_rea
 
     assert set(report) == {"provider_a", "provider_b"}
     assert report["provider_a"] == ProviderHealthReport(
+        provider_id="provider_a",
+        provider_name="provider_a",
         auth_disabled=False,
         consecutive_failures=0,
         cooldown_remaining_seconds=None,
@@ -552,7 +561,9 @@ def test_mutating_the_health_report_does_not_change_router_state() -> None:
 
     report = router.health_report()
     report.pop("provider_a")
-    report["provider_c"] = ProviderHealthReport()
+    report["provider_c"] = ProviderHealthReport(
+        provider_id="provider_c", provider_name="provider_c"
+    )
 
     fresh = router.health_report()
     assert set(fresh) == {"provider_a"}
@@ -582,8 +593,12 @@ def test_reset_health_without_a_name_clears_every_provider() -> None:
     router.reset_health()
 
     report = router.health_report()
-    assert report["provider_a"] == ProviderHealthReport()
-    assert report["provider_b"] == ProviderHealthReport()
+    assert report["provider_a"] == ProviderHealthReport(
+        provider_id="provider_a", provider_name="provider_a"
+    )
+    assert report["provider_b"] == ProviderHealthReport(
+        provider_id="provider_b", provider_name="provider_b"
+    )
 
 
 def test_reset_health_with_a_name_clears_only_that_provider_and_restores_eligibility() -> None:
@@ -600,7 +615,9 @@ def test_reset_health_with_a_name_clears_only_that_provider_and_restores_eligibi
 
     router.reset_health("provider_a")
 
-    assert router.health_report()["provider_a"] == ProviderHealthReport()
+    assert router.health_report()["provider_a"] == ProviderHealthReport(
+        provider_id="provider_a", provider_name="provider_a"
+    )
     assert router.health_report()["provider_b"].cooldown_remaining_seconds == 60.0
     # provider_a is immediately eligible again -- no waiting out the cooldown.
     assert router.invoke(_calls()) == "provider_a"
@@ -720,6 +737,7 @@ def test_router_rejects_an_invalid_health_dict_at_construction() -> None:
     """A typo must raise at the boundary, not flow past the constructor unnoticed."""
     with pytest.raises(ValidationError):
         ProviderRouter(
+            metrics_scope="test",
             providers=[_config("provider_a")],
             metrics_store=None,
             health={"failure_treshold": 3},
@@ -754,7 +772,12 @@ def test_stop_category_mid_call_leaves_health_untouched() -> None:
     script = _Script(
         {
             "provider_a": [
-                UnsupportedOperationError("no such op", provider_name="provider_a", model="model-a")
+                UnsupportedOperationError(
+                    "no such op",
+                    provider_id="provider_a",
+                    provider_name="provider_a",
+                    model="model-a",
+                )
             ]
         }
     )
@@ -768,4 +791,6 @@ def test_stop_category_mid_call_leaves_health_untouched() -> None:
 
     _fail(router)
 
-    assert router.health_report()["provider_a"] == ProviderHealthReport()
+    assert router.health_report()["provider_a"] == ProviderHealthReport(
+        provider_id="provider_a", provider_name="provider_a"
+    )

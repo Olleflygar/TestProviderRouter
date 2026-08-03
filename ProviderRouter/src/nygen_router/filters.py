@@ -45,7 +45,12 @@ def filter_eligible_providers(
         else:
             reason, detail = exclusion
             excluded.append(
-                EligibilityResult(provider_name=provider.name, reason=reason, detail=detail)
+                EligibilityResult(
+                    provider_id=provider.provider_id,
+                    provider_name=provider.name,
+                    reason=reason,
+                    detail=detail,
+                )
             )
     return eligible, excluded
 
@@ -60,7 +65,7 @@ def _first_failing_reason(
     """Return the first essential filter this provider fails, or None if eligible."""
     if not provider.enabled:
         return FilterReason.DISABLED, "provider is disabled"
-    state = health.get(provider.name)
+    state = health.get(provider.provider_id)
     if state is not None and state.auth_disabled:
         return FilterReason.AUTH_DISABLED_THIS_RUN, _auth_disabled_detail(state)
     if state is not None:
