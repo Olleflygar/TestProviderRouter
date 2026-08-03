@@ -1,0 +1,831 @@
+# Execution prompt: PR26 — Configurable sticky routing
+
+You are implementing **PR26 — Configurable sticky routing** in the existing
+`nygen-router` repository.
+
+This is an implementation task, not a design task. The specification below is
+the approved result of a requirements interview. It deliberately resolves the
+brief roadmap description as an opt-in, ordered fixed-provider preference
+policy. Do not redesign it into learned, session, conversation, or per-request
+affinity.
+
+Work in the existing repository and package at `ProviderRouter/`. Do not create
+a sibling project. Treat the current source and tests as the primary description
+of shipped behavior. Where older planning material conflicts with this approved
+PR26 specification, this prompt and the revised PR26 scope in the current
+roadmap take precedence.
+
+The policy is named `StickyRoutingPolicy` because it consistently tries one or
+more user-selected providers first. Its behavior is fixed preference, not a
+claim that the router has learned which provider served a prior call.
+
+## Required preliminary inspection
+
+Before changing anything, inspect the repository rather than assuming exact
+paths, commands, or current behavior.
+
+Read in full:
+
+- root `AGENTS.md`;
+- `ProviderRouter/AGENTS.md`;
+- the PR26 section, assumptions, and related PR16/PR19/PR20/PR27 passages in
+  the current roadmap. At prompt-construction time the file is actually named
+  `Projectplan/Newprojectplan.md`; use the path and casing present in the
+  checkout rather than inventing a second roadmap file;
+- relevant historical rationale in `Projectplan/OldProjectPlan.md`, including
+  deliberately deferred async support, per-call streaming-policy overrides,
+  and durable health persistence;
+- the existing per-PR execution prompts, including this file, to preserve
+  repository conventions;
+- `ProviderRouter/pyproject.toml` and `requirements-dev.txt` before choosing
+  validation commands;
+- both READMEs and the routing examples in `UsageTest.py`,
+  `UsageTestRoundRobin.py`, and `WorkflowTests/`.
+
+Inspect these implementation areas and their tests:
+
+- `ProviderRouter/src/nygen_router/router.py`;
+- `ProviderRouter/src/nygen_router/filters.py`;
+- `ProviderRouter/src/nygen_router/health.py`;
+- `ProviderRouter/src/nygen_router/config.py`;
+- `ProviderRouter/src/nygen_router/types.py`;
+- `ProviderRouter/src/nygen_router/errors.py`;
+- `ProviderRouter/src/nygen_router/__init__.py`;
+- `ProviderRouter/src/nygen_router/policies/base.py`;
+- `ProviderRouter/src/nygen_router/policies/round_robin.py`;
+- `ProviderRouter/src/nygen_router/policies/score_based.py`;
+- `ProviderRouter/src/nygen_router/policies/__init__.py`;
+- `ProviderRouter/src/nygen_router/scoring.py` and `stats.py`;
+- `ProviderRouter/src/nygen_router/adapters/base.py`;
+- `ProviderRouter/src/nygen_router/adapters/openai_compatible.py`;
+- `ProviderRouter/src/nygen_router/adapters/openai_responses.py`;
+- `ProviderRouter/src/nygen_router/metrics.py`;
+- `ProviderRouter/src/nygen_router/storage/base.py`, `duckdb.py`, and
+  `sqlite.py`;
+- relevant tests under `ProviderRouter/tests/`, especially `conftest.py`,
+  `test_filters.py`, `test_fallback.py`, `test_round_robin.py`,
+  `test_score_based_policy.py`, `test_router_stream.py`, `test_health.py`, and
+  the `test_pr29_*.py` files.
+
+Confirm the following shipped architecture before implementing:
+
+- `ProviderRouter.invoke()` first creates and validates its `CallVariant`
+  mapping, then applies hard eligibility filters, then passes only eligible
+  providers to `Policy.order(eligible, context)`, and finally follows the
+  returned attempt order through the existing fallback loop.
+- Hard eligibility currently means enabled, not auth-benched, not in an active
+  cooldown, resolvable API key, registered protocol adapter, and a matching
+  `CallVariant` protocol. PR21 owns future pre-flight capability inference; do
+  not implement it here.
+- `ProviderConfig.provider_id` is canonical and unique within a router.
+  `ProviderConfig.name` is display metadata and must never become an identity
+  or filter key.
+- `RoutingContext` is freshly built and frozen per invocation and currently
+  carries the metrics store, metrics scope, and declared `CallType`.
+- `RoundRobinPolicy` and `ScoreBasedPolicy` already implement the public
+  two-argument `Policy.order` protocol. Custom policy implementations are a
+  supported extension point.
+- The router owns retry/fail-fast behavior. Retryable provider failures move to
+  the next item in the already-computed order. Bad request, invalid or
+  unresolvable operation/arguments, and missing SDK categories stop the entire
+  run immediately.
+- Health filtering and transitions remain router-owned. The injected
+  monotonic `clock` controls health cooldowns.
+- A regular attempt succeeds when `adapter.invoke()` returns. A normalized
+  stream succeeds only when its outcome is recorded at stream end. Stream open
+  is not success, and a fully consumed zero-chunk stream is a
+  `ProviderStreamInterruptedError` failure.
+- `router.py` stays entirely SDK-free. Adapter modules lazily import provider
+  SDKs inside the method bodies that need them.
+- `CallVariant.arguments` is opaque native provider input. Router code must
+  not inspect or transform it except for the existing fresh-copy model
+  injection.
+- Successful non-streaming calls return the provider SDK's exact raw object.
+  Streaming chunks likewise pass through unchanged. Do not wrap, mutate, or
+  attach sticky metadata to provider results.
+- `MetricsStore` remains frozen at `record_attempt` and `query_recent`.
+  `MetricsEvent` and all storage schemas remain unchanged in PR26.
+
+## Approved PR26 behavior
+
+PR26 adds an optional `StickyRoutingPolicy` wrapper that gives an explicitly
+configured ordered list of provider IDs fixed priority over the providers
+ordered by another policy.
+
+This is the intended composition:
+
+```text
+hard eligibility and health filtering
+    -> eligible sticky providers in configured sticky-ID order
+    -> remaining eligible providers in wrapped-policy order
+    -> existing router fallback/fail-fast loop
+```
+
+For example, if the eligible providers are `a`, `b`, `c`, and `d`, the sticky
+IDs are `["a", "b"]`, and the wrapped policy orders the non-sticky remainder
+as `[d, c]`, the final attempt order is `[a, b, d, c]`.
+
+If `a` is filtered out, the prefix starts with `b`. If no sticky provider is
+eligible for a call, the wrapped policy entirely determines the order among
+the eligible remainder. If every eligible provider is sticky, the sticky
+configuration order is the complete attempt order.
+
+The policy must never receive or resurrect a hard-filtered provider as a valid
+attempt. Health and eligibility always override fixed preference.
+
+### What “sticky” does and does not mean
+
+The policy does not record that a prior call or scope succeeded on a provider.
+It does not observe attempt outcomes and does not store mappings such as
+`conversation-123 -> provider-a`. Each invocation computes its preferred prefix
+from the same fixed configuration.
+
+Consequently, PR26 has:
+
+- no affinity key;
+- no user, session, conversation, workflow, or request identity abstraction;
+- no learned affinity state;
+- no per-model, protocol, operation, `CallType`, or `metrics_scope` preference
+  records;
+- no TTL, idle timeout, absolute age, successful-use budget, or refresh rule;
+- no use of the router's clock for sticky behavior;
+- no affinity store, persistence, process-restart recovery, distributed state,
+  cleanup, eviction, maximum-entry setting, reset, clear, or manual-replacement
+  API;
+- no post-success or post-failure policy-notification protocol.
+
+Those omissions are deliberate consequences of the approved fixed-preference
+design, not unfinished pieces of PR26. Do not add them.
+
+The configured preference applies to every invocation made through the router
+using that policy. Different calls still see different eligible sets. For
+example, a preferred `OPENAI_CHAT` provider is absent when a call supplies only
+an `OPENAI_RESPONSES` variant, and a disabled, keyless, auth-benched, or
+cooling-down preferred provider is likewise absent.
+
+Applications that require different preferred-provider lists for different
+users, conversations, workflows, or logical models should create separate
+router/policy instances or supply their own custom policy. Do not introduce a
+framework-specific identity abstraction into the core.
+
+### Purpose and guarantees
+
+Consistently trying a chosen provider first may improve the chance of reusing
+provider-local prompt caches or concentrate traffic toward provider/account
+usage tiers and quotas. The router does not inspect prompts, detect cache
+support, determine account-tier boundaries, or guarantee any provider-side
+cache hit, token top-up, quota, or tier benefit.
+
+Health filtering and fallback can intentionally send a call elsewhere. The
+documentation must not present fixed preference as a correctness guarantee for
+provider-owned response IDs, conversations, stored responses, or other state
+that requires the exact originating endpoint/account. Explain that callers
+still own strict provider affinity when correctness—not merely preference—is
+required.
+
+## Public API
+
+Implement the policy in:
+
+`ProviderRouter/src/nygen_router/policies/sticky.py`
+
+Use this exact public construction shape as the primary documentation example:
+
+```python
+router = ProviderRouter(
+    providers=providers,
+    metrics_scope="my-app",
+    policy=StickyRoutingPolicy(
+        sticky_provider_ids=["provider-a", "provider-b"],
+        fallback_policy=ScoreBasedPolicy(),
+    ),
+)
+```
+
+The compact default-remainder form is:
+
+```python
+router = ProviderRouter(
+    providers=providers,
+    metrics_scope="my-app",
+    policy=StickyRoutingPolicy(
+        sticky_provider_ids=["provider-a"],
+    ),
+)
+```
+
+The constructor contract is:
+
+```python
+StickyRoutingPolicy(
+    *,
+    sticky_provider_ids: list[str],
+    fallback_policy: Policy | None = None,
+)
+```
+
+- Selecting `StickyRoutingPolicy` through the existing `policy=` seam is the
+  only enablement mechanism.
+- Stickiness remains disabled when another policy, or no explicit policy, is
+  supplied to `ProviderRouter`.
+- `fallback_policy=None` creates a fresh `RoundRobinPolicy` for that sticky
+  policy instance. Never use a shared mutable default policy object.
+- Accept the ordered IDs as a typed list, not a raw configuration dictionary.
+- Make and retain a defensive list copy so later mutation of the caller's list
+  cannot silently change routing behavior. Do not require a tuple or expose
+  internal mutable state.
+- Do not add `StickyRoutingConfig`, a `sticky=` router option, an enum toggle,
+  factory auto-enablement, or a per-call override.
+- Export `StickyRoutingPolicy` from
+  `ProviderRouter/src/nygen_router/policies/__init__.py` and
+  `ProviderRouter/src/nygen_router/__init__.py` without adding optional imports
+  or new dependencies.
+
+Keep `Policy` itself as the existing `order(eligible, context)` protocol. Do
+not add success/failure notification methods to it, change `RoutingContext`, or
+modify `RoundRobinPolicy` and `ScoreBasedPolicy` behavior merely for PR26.
+
+## Configuration validation
+
+Use the existing `ConfigError`/`NygenRouterError` hierarchy for every new
+sticky-policy configuration failure.
+
+At `StickyRoutingPolicy` construction:
+
+- require `sticky_provider_ids` to be a list;
+- require at least one entry;
+- require every entry to be a string;
+- for a non-string entry, raise a clear `ConfigError` explicitly stating that
+  sticky provider IDs must be strings. Do not coerce it, let `.strip()` fail,
+  or misreport it merely as an unknown provider;
+- strip surrounding whitespace from each string before storing and comparing
+  it;
+- reject empty or whitespace-only IDs;
+- reject duplicate IDs after trimming and name the duplicates;
+- never accept or compare provider display names as substitutes for IDs.
+
+At `ProviderRouter` construction, after the router has copied and validated its
+provider list and rejected duplicate configured provider IDs:
+
+- validate a selected `StickyRoutingPolicy` against the router's complete
+  configured provider-ID set;
+- reject every sticky ID that is not configured on that router;
+- raise `ConfigError` at construction time and name all unknown IDs so typos do
+  not silently disable the intended preference;
+- never expose API keys or secrets in the error;
+- allow a known sticky provider to be disabled or currently unhealthy. Those
+  are valid configurations whose runtime usability remains the filters' job.
+
+Use a narrow validation method owned by `StickyRoutingPolicy` and invoked by
+`ProviderRouter` when that policy is selected. Do not broaden the base
+`Policy` protocol or redesign the entire policy system to validate PR26.
+
+The current public `router.providers` list may be changed by callers after
+construction. Runtime ordering must therefore derive the sticky prefix only
+from providers present in that invocation's eligible list. If a preferred
+provider is later removed or disabled, skip it. If the same canonical ID is
+later restored and becomes eligible, its configured preference naturally
+returns. Do not add mutation watchers or sticky state cleanup.
+
+## Ordering algorithm and wrapped-policy contract
+
+`StickyRoutingPolicy.order(eligible, context)` must:
+
+1. Work only from the already-filtered `eligible` list it receives.
+2. Build a canonical lookup by `ProviderConfig.provider_id` from that list.
+3. Build the sticky prefix in exact `sticky_provider_ids` configuration order,
+   including only IDs present in that eligible lookup.
+4. Build the eligible non-sticky remainder while preserving its incoming order
+   for the wrapped policy to inspect.
+5. Call `fallback_policy.order()` exactly once with a fresh list of that
+   non-sticky eligible remainder and the unchanged `RoutingContext`, including
+   when the remainder is empty.
+6. Preserve the wrapped policy's returned ordering, deliberate omissions, and
+   duplicates.
+7. Verify that every returned provider ID belonged to the eligible non-sticky
+   remainder supplied to the wrapped policy. If it introduces a sticky,
+   unknown, disabled, unhealthy, or otherwise non-input provider, raise a clear
+   `ConfigError` before any adapter is invoked.
+8. Use the canonical provider object from the eligible remainder for each
+   validated returned ID rather than trusting a foreign `ProviderConfig`
+   object with the same ID. This keeps hard-filter bypass structurally
+   impossible.
+9. Return the sticky prefix followed by the validated wrapped-policy result.
+
+Do not require the wrapped policy to return an exact permutation. A custom
+policy may intentionally omit providers to cap its attempt set, and PR26 must
+preserve that supported trust-based behavior. Likewise, preserve duplicates
+returned by a custom policy rather than using PR26 to impose a new global
+policy contract. PR26 itself must never add a duplicate or implement a retry
+budget; explicit same-provider retry policy remains PR27's concern.
+
+If the wrapped policy itself raises, preserve current policy error behavior.
+Do not swallow or translate arbitrary custom-policy exceptions as an
+observability convenience.
+
+## Retry, health, and fallback semantics
+
+Do not modify the router's global rules.
+
+- The complete order is computed before the first attempt, exactly as today.
+- A retryable failure from preferred provider `a` proceeds to preferred
+  provider `b`, if present and eligible, then through the wrapped-policy tail.
+- A 429 or auth failure applies the existing immediate bench behavior.
+- Timeout, connection, server, stream-interruption, and unknown failures keep
+  using the existing counted-failure threshold and cooldown behavior.
+- A preferred provider below the failure threshold remains eligible and is
+  tried first again on the next invocation. PR26 adds no separate suppression
+  or cooldown.
+- STOP categories retain the existing global fail-fast rule even when another
+  preferred or remainder provider is available. STOP failures continue to
+  leave health untouched.
+- A successful fallback provider does not replace, refresh, clear, or otherwise
+  affect fixed preference. The next invocation again starts with the first
+  configured sticky provider that is then eligible.
+- If every provider returned in the composed order fails, retain the existing
+  `RouterExhaustedError` and its real per-attempt failures.
+- Providers omitted by a custom wrapped policy are not attempted; do not add
+  them back after exhaustion.
+- Same-provider retry budgets remain wholly out of scope for PR26.
+
+## Regular and streaming calls
+
+No regular or streaming outcome changes sticky configuration because there is
+no learned state.
+
+Regular calls:
+
+- Use the composed provider order.
+- A successful `adapter.invoke()` returns the exact raw response and changes no
+  sticky state.
+- A failed preferred attempt follows the existing category and fallback rules.
+
+Streaming calls:
+
+- Use the same composed order computed before the first attempt.
+- Returning a `NormalizedStream` still records neither success nor failure at
+  stream open.
+- Successful completion at stream end continues to record metrics and health
+  success, but changes no sticky state.
+- Empty, interrupted, failed, or silently truncated streams retain the existing
+  error classification and health behavior.
+- Under `StreamFailurePolicy.RESTART`, `RouterStream` continues through the
+  remaining composed order already carried by the stream wrapper.
+- Under `StreamFailurePolicy.RAISE`, it records the existing failure and raises
+  without fallback.
+- STOP categories stop under either streaming policy.
+- A RESTART that lands on another provider and later succeeds does not alter
+  the next invocation's fixed preference.
+- `close()` and bare-break semantics remain unchanged: no outcome invented, no
+  restart on close, and no sticky state to update.
+- Raw chunks, usage objects, and provider SDK response identity remain
+  unchanged.
+
+Do not inspect `CallVariant.arguments` to detect streaming, prompts, cache
+keys, conversations, models, tools, or any other sticky dimension.
+
+## State, lifetime, and concurrency
+
+`StickyRoutingPolicy` stores only validated configuration and its wrapped
+policy. It has no learned or expiring routing state.
+
+- No affinity data lives on `ProviderRouter`, in health state, in the policy,
+  in metrics storage, or in a new store.
+- No process-restart or multi-process behavior needs implementing.
+- No external service or database is required.
+- The sticky-ID defensive copy is not mutated after construction.
+- Sticky-prefix computation is read-only and requires no lock.
+- Concurrent calls independently compute the same configured prefix from their
+  own already-filtered eligible lists.
+- Thread safety and mutable state inside the wrapped policy remain that
+  policy's responsibility. Do not add locks to `RoundRobinPolicy`,
+  `ScoreBasedPolicy`, or arbitrary custom policies as part of PR26.
+- Reusing one `StickyRoutingPolicy` instance across routers shares its fixed ID
+  configuration and its wrapped policy instance, but no sticky history.
+  Document that separate policy instances per router are recommended because a
+  wrapped policy such as round robin may itself be stateful.
+
+Async support remains out of scope because the router core is synchronous.
+
+## Required behavior matrix
+
+Implement and document these scenarios explicitly. Items from earlier PR26
+brainstorming that depended on learned affinity are marked not applicable so
+they are not accidentally reintroduced.
+
+1. **Sticky policy not selected:** current default or explicitly supplied
+   policy behavior is byte-for-byte/semantically unchanged.
+2. **No prior affinity:** prior affinity is not a concept. Eligible configured
+   sticky IDs lead immediately, followed by wrapped-policy order.
+3. **Preferred provider succeeds:** return its raw response; store no sticky
+   state. It leads later calls because configuration is fixed.
+4. **Later call through the same router:** prefer the same first configured ID
+   if eligible, without consulting prior outcomes.
+5. **Different application/user/conversation/workflow:** the same router-wide
+   policy configuration applies. Use a separate router/policy or custom policy
+   when different preferences are required.
+6. **Preferred provider remains healthy and eligible:** keep it in the sticky
+   prefix.
+7. **Preferred provider becomes unhealthy:** existing auth bench, 429 cooldown,
+   or threshold cooldown filters it out; continue with the next eligible item.
+8. **Preferred provider fails another hard filter:** it is absent and cannot be
+   reintroduced by either the sticky wrapper or wrapped policy.
+9. **Preferred provider is disabled or removed:** skip it. Restoring it with
+   the same `provider_id` restores its fixed priority when eligible.
+10. **Expiration:** not applicable; no TTL or stored affinity exists.
+11. **Preferred provider fails and fallback succeeds:** return the fallback
+    result; future fixed preference is unchanged.
+12. **Fallback fails:** continue through the remaining composed order or raise
+    the existing exhausted error.
+13. **Retryable versus STOP failure:** existing cross-provider fallback versus
+    global fail-fast rules remain authoritative.
+14. **Concurrent calls:** each computes the same fixed prefix safely; there is
+    no last-writer, refresh, or affinity race.
+15. **Different models, protocols, operations, or call types:** no separate
+    preference records exist. Existing hard filtering determines whether each
+    configured preferred provider can serve that invocation.
+16. **Regular success:** raw response identity preserved; no policy state
+    transition.
+17. **Streaming open and successful end:** no outcome at open; existing success
+    at stream end; no policy state transition.
+18. **Streaming failure and RESTART:** continue through the already-composed
+    remaining order; a later success does not rewrite preference. Preserve
+    zero-chunk and partial-stream rules.
+19. **Affinity key missing/empty/invalid:** no affinity-key API exists, so this
+    is not a supported input or validation surface.
+20. **Cleanup or eviction:** not applicable because there are no affinity
+    entries.
+
+PR26 emits no new observability signal for any row in this matrix.
+
+## Observability boundaries
+
+Add no dedicated sticky-routing logs, metrics, callbacks, tracing events, or
+response annotations in PR26.
+
+- Existing attempted-provider `MetricsEvent` records remain the only metrics
+  consequence of actual calls.
+- Do not add a `MetricsEvent` field or change the `MetricsStore` protocol or
+  database schemas.
+- Existing health warnings, recovery logs, stream warnings, and
+  `on_restart` callbacks remain unchanged.
+- Do not expose “selected because sticky” on a raw response or stream chunk.
+- PR19 explicitly owns sticky-provider logging; PR20 owns optional
+  observability hooks. Document that deferral.
+
+## Compatibility and explicit non-goals
+
+PR26 must not:
+
+- change behavior when `StickyRoutingPolicy` is unused;
+- weaken or duplicate eligibility and health logic;
+- inspect or transform prompts or `CallVariant.arguments`;
+- guarantee provider-side prompt caching, usage tiers, quotas, token top-ups,
+  account affinity, or stored-response continuity;
+- introduce learned/session/conversation affinity;
+- add TTL or expiration behavior;
+- add an affinity key or per-call override;
+- add state persistence, an affinity store, distributed coordination, or a
+  mandatory database;
+- add locks to unrelated policies;
+- change retry budgets or implement PR27;
+- implement PR21 capability inference;
+- add PR19 logging hooks or PR20 observability hooks;
+- add metrics fields, store methods, schema changes, reporting queries, or
+  storage migrations;
+- change scoring, aggregation, cost, usage, request-size, adapter, or health
+  semantics;
+- introduce async support;
+- import provider SDKs or `httpx` in `router.py`;
+- mutate or wrap provider SDK responses for sticky purposes;
+- silently enable stickiness in current or future factories;
+- redesign the broader policy system or perform unrelated refactoring.
+
+Keep the implementation compatible with future factories and policy
+composition where reasonably possible, but do not pull those roadmap items
+into PR26.
+
+## Focused tests
+
+Add new focused files named `ProviderRouter/tests/test_pr26_*.py`. Do not delete
+existing tests. Update an existing test only if PR26 deliberately changes the
+exact behavior it asserts; because the feature is opt-in, existing tests should
+normally continue unchanged.
+
+Follow both `AGENTS.md` testing rules:
+
+- never monkeypatch an internal collaborator with `monkeypatch.setattr` or
+  `unittest.mock.patch`;
+- use public seams such as `policy`, `adapter_factory`, `metrics_store`, health
+  configuration, and the injected clock;
+- environment-variable monkeypatching remains allowed;
+- make no real network calls and require no real API keys.
+
+Cover at least:
+
+### Construction and validation
+
+- importing `StickyRoutingPolicy` from `nygen_router` remains lightweight;
+- an empty sticky-ID list raises `ConfigError`;
+- a non-list sticky-ID container is rejected clearly if supplied at runtime;
+- each non-string value, including representative integer/`None` inputs,
+  raises a message explicitly saying sticky provider IDs must be strings;
+- empty and whitespace-only strings are rejected;
+- surrounding whitespace is trimmed;
+- duplicates, including duplicates created by trimming, are rejected;
+- unknown sticky provider IDs are rejected during `ProviderRouter`
+  construction and all unknown IDs are named;
+- display names are not accepted as identity when they do not equal a real
+  provider ID;
+- duplicate display names remain valid because provider IDs are canonical;
+- `fallback_policy=None` creates an independent round-robin instance for each
+  sticky policy.
+
+### Ordering and composition
+
+- one eligible sticky provider is first;
+- several eligible sticky providers follow exact configured ID order;
+- input provider configuration order does not override sticky-ID order;
+- a disabled or otherwise filtered sticky provider is skipped;
+- with no eligible sticky provider, the wrapped policy orders the entire
+  eligible list;
+- the wrapped policy receives only the non-sticky eligible remainder, a fresh
+  list, and the same `RoutingContext`;
+- the wrapped policy is called once, including for an empty remainder;
+- `RoundRobinPolicy` rotates only the non-sticky tail while the sticky prefix
+  stays fixed;
+- `ScoreBasedPolicy` ranks only the non-sticky tail using the router's normal
+  metrics context;
+- a custom wrapped policy may deliberately omit remainder providers;
+- a custom wrapped policy's duplicates remain in its tail unchanged;
+- a custom wrapped policy cannot introduce an ID it was not given, including a
+  sticky or hard-filtered provider; `ConfigError` occurs before any adapter
+  call;
+- canonical eligible provider objects are used even if a custom policy returns
+  another object carrying an allowed ID;
+- the wrapper itself never creates duplicates.
+
+### Eligibility and health precedence
+
+- preferred providers cannot bypass enabled state, missing API keys,
+  unsupported adapters, auth benches, active cooldowns, or missing matching
+  `CallVariant` protocols;
+- threshold-benching, 429 cooldown, and auth bench each remove a preferred
+  provider from later calls exactly as existing health code specifies;
+- a counted failure below the threshold leaves the preferred provider first on
+  the next call;
+- an expired health cooldown makes a preferred provider eligible and first
+  again without any sticky reset;
+- removing or disabling a preferred provider skips it; restoring the same ID
+  restores its priority.
+
+### Fallback and errors
+
+- a retryable preferred-provider failure falls back to the next preferred
+  provider and then to the wrapped-policy remainder;
+- a successful fallback does not change later fixed preference;
+- repeated failures preserve existing attempt order and exhaustion details;
+- bad request, invalid operation/arguments, and missing SDK STOP paths remain
+  globally fail-fast even when other preferred providers remain;
+- STOP failures do not change health;
+- existing real error objects and messages remain transparent.
+
+### Return identity and streaming
+
+- a non-streaming success returns the exact adapter-produced object;
+- a successful normalized stream uses the preferred order, passes chunks
+  unchanged, and records success only at stream end;
+- a partial/interrupted preferred stream follows existing RESTART behavior
+  through the remaining composed order;
+- a zero-chunk preferred stream remains a failure and can restart;
+- `StreamFailurePolicy.RAISE` still prevents restart;
+- STOP-category streaming failure remains fail-fast;
+- a successful restarted provider does not change the next invocation's fixed
+  preference;
+- early close and bare break keep their existing recording semantics.
+
+### Concurrency and regressions
+
+- concurrent invocations using a thread-safe fake wrapped policy independently
+  produce the same sticky prefix without state corruption;
+- concurrent calls with different eligible protocol sets do not reintroduce
+  filtered preferred providers;
+- no TTL, affinity-key, persistence, or cleanup machinery is introduced;
+- default `ProviderRouter` behavior and direct `RoundRobinPolicy`,
+  `ScoreBasedPolicy`, and custom-policy behavior remain unchanged when the
+  sticky wrapper is unused;
+- the existing complete test suite continues to pass.
+
+Avoid tests that assert provider-side caching actually occurs. The router can
+control only attempt order.
+
+## Implementation sequence
+
+1. Complete the preliminary inspection and Git checks below.
+2. Add focused failing tests for the approved public API, validation, ordering,
+   filtering, fallback, streaming, and concurrency behavior.
+3. Implement `policies/sticky.py` with validated defensive configuration and
+   fixed-prefix composition.
+4. Add the narrow router-construction validation for configured sticky IDs.
+5. Add package exports without changing lightweight import behavior.
+6. Run focused PR26 and directly affected policy/router tests.
+7. Run the broader existing tests and quality commands configured by the
+   repository.
+8. Only after runtime behavior and tests are complete, perform the repository
+   documentation synchronization below.
+9. Re-run the complete validation suite after documentation/example changes.
+10. Inspect the final diff and Git state, commit the completed scoped work, and
+    create the completion tag only after every completion criterion is met.
+
+Do not treat this sequence as permission for unrelated cleanup.
+
+## Documentation and repository synchronization
+
+After implementation and focused tests are complete, review and update every
+affected explanatory source, including where applicable:
+
+- root `README.md`;
+- `ProviderRouter/README.md`;
+- root `AGENTS.md`;
+- `ProviderRouter/AGENTS.md`;
+- the actual current roadmap file under `Projectplan/`;
+- `Projectplan/OldProjectPlan.md` only where a corrective note is necessary to
+  prevent historical guidance from being mistaken for current behavior;
+- routing-policy documentation;
+- `UsageTest.py` and `UsageTestRoundRobin.py`;
+- relevant `WorkflowTests/` examples or guidance;
+- setup/configuration guidance;
+- metrics and observability descriptions;
+- inline comments and docstrings;
+- any other text that claims PR26 is unimplemented or that the router has no
+  optional provider-preference mechanism.
+
+Use compact inline router configuration in public examples:
+
+```python
+router = ProviderRouter(
+    providers=providers,
+    metrics_scope="my-app",
+    policy=StickyRoutingPolicy(
+        sticky_provider_ids=["provider-a"],
+        fallback_policy=ScoreBasedPolicy(),
+    ),
+)
+```
+
+The synchronization must:
+
+- mark PR26 as shipped in the current roadmap;
+- revise its brief description to accurately say ordered, fixed provider
+  preference rather than learned or session affinity;
+- state that the feature is optional and disabled unless
+  `StickyRoutingPolicy` is selected;
+- document the exact constructor, sticky-ID validation, default round-robin
+  remainder, and compatibility with score-based/custom policies;
+- explain that sticky IDs are canonical `provider_id` values and names are
+  never identity;
+- explain that health and eligibility always take precedence;
+- explain failure, fallback, and streaming behavior;
+- explain that successful fallback does not rewrite future preference;
+- explain router-wide scope and the lack of an affinity key, TTL, learned
+  state, persistence, cleanup, or reset;
+- explain concurrency and wrapped-policy responsibility;
+- explain that fixed preference may improve cache reuse or usage concentration
+  but cannot guarantee provider-side behavior;
+- update the existing “preserve provider affinity yourself” passages
+  accurately: mention `StickyRoutingPolicy` as a best-effort fixed preference,
+  but retain the warning that callers still own strict affinity for
+  provider-owned IDs/state because health filtering and fallback may select
+  another provider;
+- state that PR19/PR20 own dedicated sticky-selection logging/observability;
+- state that PR27 still owns explicit same-provider retries;
+- ensure future PR16 factories may expose this policy but never silently enable
+  it;
+- search the repository for stale claims that configurable sticky routing is
+  wholly unimplemented;
+- keep `Projectplan/prompt_pr26.txt` as the planning-history copy of this
+  approved execution specification.
+
+During synchronization, introduce no new runtime behavior or unrelated code
+changes. Only explanatory material, comments, docstrings, examples, and plans
+should change at that stage.
+
+## Validation
+
+Inspect `ProviderRouter/pyproject.toml`, `requirements-dev.txt`, existing CI or
+repository guidance, and available environments before choosing exact command
+lines. Do not assume tool paths or silently install/upgrade dependencies.
+
+Run, at minimum, the repository's configured equivalents of:
+
+- focused PR26 tests;
+- directly affected policy, filter, fallback, health, and streaming tests;
+- the full pytest suite;
+- Ruff formatting/checking as configured;
+- strict mypy over the configured source tree;
+- coverage collection/reporting if it is part of current repository quality
+  guidance;
+- the lightweight-import regression test.
+
+Report exact commands and results. If a check cannot run because of a genuine
+environmental limitation, report it precisely and do not claim it passed.
+
+## Git workflow and tags
+
+Work on the current branch in place. Do not push commits or tags.
+
+Before the first implementation, test, or documentation change made by the
+executing session:
+
+1. Inspect `git status`, the current branch/HEAD, recent repository conventions,
+   and the diff of any pre-existing changes.
+2. The approved `Projectplan/prompt_pr26.txt` may already be present as the
+   planning input to this session. Treat it as understood PR26 planning
+   material and preserve it.
+3. Understand and preserve every other pre-existing change. Do not overwrite,
+   absorb, reformat, or commit unrelated user work. If an existing change
+   overlaps PR26 so that safe separation is impossible, stop and report it.
+4. Check whether local tags `pr26-start` or `pr26-complete` already exist.
+5. If either exists, stop and report the conflict. Never move, replace, force,
+   or delete either tag.
+6. Create local tag `pr26-start` at the current starting commit immediately
+   before the first PR26 execution change.
+7. If creating a tag requires an approval prompt, first explain in plain
+   language that permission is needed to write the local Git tag marking the
+   pre-implementation state and why it is required.
+
+During implementation:
+
+- keep changes scoped to PR26;
+- preserve unrelated work;
+- make commits that contain the completed PR26 implementation, tests, prompt,
+  and documentation without including unrelated changes;
+- do not push.
+
+At completion:
+
+1. Run every required validation command.
+2. Inspect the final diff against `pr26-start` and the working tree for
+   unrelated changes.
+3. Confirm the commit intended for `pr26-complete` contains all PR26 source,
+   tests, prompt, and documentation changes.
+4. Confirm every completion criterion below is satisfied.
+5. Create local tag `pr26-complete` only then.
+6. Leave both tags ready to push, but do not push them or any commit unless
+   explicitly instructed.
+
+## Completion criteria
+
+PR26 is complete only when all of the following are true:
+
+- `StickyRoutingPolicy` is public and opt-in through the existing `policy=`
+  parameter;
+- the canonical documented example constructs it inline inside
+  `ProviderRouter`;
+- users not selecting it experience no routing behavior change;
+- configured sticky IDs are attempted first in exact configured order when
+  eligible;
+- the wrapped policy orders only the non-sticky eligible remainder;
+- the default wrapped policy is a fresh `RoundRobinPolicy`;
+- configuration validation clearly covers container shape, empty input,
+  non-string values, blanks, trimming, duplicates, and unknown router provider
+  IDs using `ConfigError`;
+- a wrapped policy cannot introduce any provider outside its already-filtered
+  remainder;
+- wrapped-policy ordering, omissions, and duplicates are otherwise preserved;
+- hard eligibility and health always override fixed preference;
+- fallback, STOP, exhaustion, health, metrics, scoring, and policy behavior
+  remain compatible with current rules;
+- successful fallback does not change future preference;
+- regular and streaming behavior is implemented and tested without outcome
+  state;
+- raw response and chunk identity remain unchanged;
+- no affinity key, TTL, clock-based expiration, learned state, persistence,
+  cleanup, eviction, reset, or distributed coordination has been introduced;
+- concurrent sticky-prefix computation has no mutable PR26 state or leakage;
+- no metrics/store/schema/logging/observability expansion has been introduced;
+- no provider SDK becomes a core or module-level import and `router.py` remains
+  SDK-free;
+- new focused `test_pr26_*.py` tests cover validation, ordering, policy
+  composition, eligibility, health, fallback, STOP failures, streaming,
+  response identity, concurrency, removal/disablement, and unused-feature
+  regressions;
+- all existing tests still pass without deletions;
+- Ruff, strict mypy, pytest, coverage, and lightweight-import checks required by
+  current repository configuration pass;
+- documentation accurately describes fixed preference and does not claim
+  learned/session affinity or guaranteed provider-side caching;
+- strict provider-owned state limitations remain accurately documented;
+- the current roadmap marks PR26 shipped and remains consistent with PR16,
+  PR19, PR20, PR21, and PR27 boundaries;
+- the final diff contains no unrelated changes;
+- `pr26-start` points to the pre-execution starting commit;
+- the committed completed work includes source, tests, this prompt, and
+  synchronized documentation;
+- `pr26-complete` is created only after every criterion above is satisfied;
+- nothing has been pushed.
+
+At handoff, summarize the implemented public API and semantics, files changed,
+tests and quality commands run with exact results, documentation synchronized,
+tag locations, and any remaining limitations. Do not describe fixed preference
+as guaranteed provider affinity or guaranteed prompt caching.
