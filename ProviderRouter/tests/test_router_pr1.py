@@ -49,8 +49,8 @@ def test_router_raises_no_providers_configured_with_no_providers() -> None:
         router.invoke(_calls())
 
 
-def test_duplicate_provider_names_are_rejected_at_construction() -> None:
-    """Names key metrics and health history, so a duplicate would merge two providers into one."""
+def test_duplicate_provider_ids_are_rejected_at_construction() -> None:
+    """Stable IDs key runtime state, so a duplicate would merge providers."""
     with pytest.raises(ConfigError) as exc_info:
         ProviderRouter(
             metrics_scope="test",
@@ -63,10 +63,10 @@ def test_duplicate_provider_names_are_rejected_at_construction() -> None:
 
     message = str(exc_info.value)
     assert "provider_a" in message
-    assert "provider_b" not in message  # only the name that is actually duplicated
+    assert "provider_b" not in message  # only the ID that is actually duplicated
 
 
-def test_duplicate_provider_names_error_names_every_duplicate() -> None:
+def test_duplicate_provider_ids_error_names_every_duplicate() -> None:
     with pytest.raises(ConfigError) as exc_info:
         ProviderRouter(
             metrics_scope="test",

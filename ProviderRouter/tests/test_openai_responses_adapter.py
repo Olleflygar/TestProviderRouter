@@ -202,6 +202,7 @@ def test_nonstreaming_failed_response_preserves_native_details() -> None:
         _adapter(handler).invoke("responses.create", _arguments())
 
     error = exc_info.value
+    assert error.provider_id == "responses_provider"
     assert error.message == "generation backend failed"
     assert error.error_code == "server_error"
     assert error.event is None
@@ -239,6 +240,7 @@ def test_missing_optional_sdk_uses_existing_transparent_error(
     with pytest.raises(ProviderSDKNotInstalledError) as exc_info:
         OpenAIResponsesAdapter(_config()).invoke("responses.create", _arguments())
 
+    assert exc_info.value.provider_id == "responses_provider"
     assert exc_info.value.provider_name == "responses_provider"
     assert isinstance(exc_info.value.original, ModuleNotFoundError)
 
@@ -258,6 +260,7 @@ def test_http_status_mapping_preserves_verbatim_structured_error(status_code: in
         _adapter(handler).invoke("responses.create", _arguments())
 
     error = exc_info.value
+    assert error.provider_id == "responses_provider"
     assert error.status_code == status_code
     assert error.message == f"provider message {status_code}"
     assert error.error_type == "invalid_request_error"
@@ -427,6 +430,7 @@ def test_stream_error_event_preserves_typed_event_and_categorizes_known_codes(
         next(stream)
 
     error = exc_info.value
+    assert error.provider_id == "responses_provider"
     assert error.event.type == "error"
     assert error.error_code == code
     assert error.message == "native event message"
@@ -447,6 +451,7 @@ def test_response_failed_event_preserves_embedded_response() -> None:
     with pytest.raises(ProviderResponsesError) as exc_info:
         next(stream)
 
+    assert exc_info.value.provider_id == "responses_provider"
     assert exc_info.value.event.type == "response.failed"
     assert exc_info.value.response.id == "resp_123"
     assert exc_info.value.message == "embedded failure"
@@ -534,6 +539,7 @@ def test_malformed_sse_payload_leaves_as_router_error() -> None:
     with pytest.raises(ProviderError) as exc_info:
         next(stream)
 
+    assert exc_info.value.provider_id == "responses_provider"
     assert type(exc_info.value).__module__.startswith("nygen_router.")
     assert isinstance(exc_info.value.__cause__, ValueError)
 

@@ -38,6 +38,7 @@ response = router.invoke(
         CallVariant(
             protocol=ApiProtocol.OPENAI_CHAT,
             operation="chat.completions.create",
+            call_type=CallType.REGULAR,
             arguments={
                 "messages": [
                     {"role": "user", "content": "Write a short product description."}
@@ -64,6 +65,7 @@ each provider a chance to collect observations.
 ```python
 from nygen_router import (
     ApiProtocol,
+    CallType,
     CallVariant,
     DuckDBMetricsStore,
     ProviderConfig,
@@ -76,6 +78,7 @@ metrics = DuckDBMetricsStore("router_metrics.duckdb")
 router = ProviderRouter(
     providers=[
         ProviderConfig(
+            provider_id="provider-a-production",
             name="provider_a",
             protocol=ApiProtocol.OPENAI_CHAT,
             model="provider-a/model-name",
@@ -83,6 +86,7 @@ router = ProviderRouter(
             api_key_env="PROVIDER_A_API_KEY",
         ),
         ProviderConfig(
+            provider_id="provider-b-production",
             name="provider_b",
             protocol=ApiProtocol.OPENAI_CHAT,
             model="provider-b/model-name",
@@ -90,7 +94,8 @@ router = ProviderRouter(
             api_key_env="PROVIDER_B_API_KEY",
         ),
     ],
-    policy=ScoreBasedPolicy(use_streaming=False),
+    metrics_scope="product-copy:production",
+    policy=ScoreBasedPolicy(),
     metrics_store=metrics,
 )
 
@@ -100,6 +105,7 @@ def call_router(prompt: str) -> str:
             CallVariant(
                 protocol=ApiProtocol.OPENAI_CHAT,
                 operation="chat.completions.create",
+                call_type=CallType.REGULAR,
                 arguments={
                     "messages": [{"role": "user", "content": prompt}],
                     "stream": False,
@@ -118,6 +124,12 @@ the model configured for whichever provider it selects. API keys can also be
 passed directly to `ProviderConfig`, but environment-variable names keep secrets
 out of source code.
 
+`provider_id` is the stable identity used for metrics, health, attempts, and
+diagnostics; `name` is display metadata and may be duplicated. `metrics_scope`
+partitions the shared history file by application/environment. Changing only a
+display name preserves history, while changing model, protocol, call type, or
+provider ID selects a different scoring partition.
+
 ## OpenAI Responses API
 
 `OPENAI_RESPONSES` is also built in. Use the native Responses `input` field and
@@ -127,6 +139,7 @@ read the real SDK response, including conveniences such as `output_text`:
 responses_router = ProviderRouter(
     providers=[
         ProviderConfig(
+            provider_id="provider-a-responses-production",
             name="provider_a_responses",
             protocol=ApiProtocol.OPENAI_RESPONSES,
             model="provider-a/model-name",
@@ -134,6 +147,7 @@ responses_router = ProviderRouter(
             api_key_env="PROVIDER_A_API_KEY",
         )
     ],
+    metrics_scope="product-copy:production",
     metrics_store=None,
 )
 
@@ -142,6 +156,7 @@ response = responses_router.invoke(
         CallVariant(
             protocol=ApiProtocol.OPENAI_RESPONSES,
             operation="responses.create",
+            call_type=CallType.REGULAR,
             arguments={"input": "Write a short product description."},
         )
     ]
@@ -149,7 +164,8 @@ response = responses_router.invoke(
 print(response.output_text)
 ```
 
-For streaming, pass `stream=True` and iterate native typed Responses events:
+For streaming, declare `CallType.STREAMING`, pass the provider's native
+`stream=True` argument, and iterate native typed Responses events:
 
 ```python
 stream = responses_router.invoke(
@@ -157,6 +173,7 @@ stream = responses_router.invoke(
         CallVariant(
             protocol=ApiProtocol.OPENAI_RESPONSES,
             operation="responses.create",
+            call_type=CallType.STREAMING,
             arguments={"input": "Write a short product description.", "stream": True},
         )
     ]
@@ -238,7 +255,7 @@ For each call, Nygen Router:
 2. Orders eligible providers using the configured policy.
 3. Sends the matching native CallVariant with the selected provider's model.
 4. Falls back on retryable provider failures while eligible alternatives remain.
-5. Records success, latency, errors, and stream timing in the configured metrics store.
+5. Records scoped provider-ID/model/protocol/call-type observations and stream timing.
 6. Uses that recent history to improve later choices when ScoreBasedPolicy is enabled.
 ```
 

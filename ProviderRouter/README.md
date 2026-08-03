@@ -58,18 +58,20 @@ using the wrong Python (for example conda's `provider-router` instead of
 ## Minimal Usage
 
 ```python
-from nygen_router import ApiProtocol, CallVariant, ProviderConfig, ProviderRouter
+from nygen_router import ApiProtocol, CallType, CallVariant, ProviderConfig, ProviderRouter
 
 router = ProviderRouter(
     providers=[
         ProviderConfig(
+            provider_id="provider-a-production",
             name="provider_a",
             protocol=ApiProtocol.OPENAI_CHAT,
             model="my-model",
             base_url="https://api.provider-a.com/v1",
             api_key_env="PROVIDER_A_API_KEY",
         )
-    ]
+    ],
+    metrics_scope="my-application:production",
 )
 
 response = router.invoke(
@@ -77,6 +79,7 @@ response = router.invoke(
         CallVariant(
             protocol=ApiProtocol.OPENAI_CHAT,
             operation="chat.completions.create",
+            call_type=CallType.REGULAR,
             arguments={"messages": [{"role": "user", "content": "Hello"}]},
         )
     ]
@@ -99,13 +102,15 @@ supported model-execution operation, `responses.create`:
 router = ProviderRouter(
     providers=[
         ProviderConfig(
+            provider_id="provider-a-responses-production",
             name="provider_a",
             protocol=ApiProtocol.OPENAI_RESPONSES,
             model="my-model",
             base_url="https://api.provider-a.com/v1",
             api_key_env="PROVIDER_A_API_KEY",
         )
-    ]
+    ],
+    metrics_scope="my-application:production",
 )
 
 response = router.invoke(
@@ -113,6 +118,7 @@ response = router.invoke(
         CallVariant(
             protocol=ApiProtocol.OPENAI_RESPONSES,
             operation="responses.create",
+            call_type=CallType.REGULAR,
             arguments={
                 "input": "Explain why the sky appears blue.",
                 "instructions": "Answer in two sentences.",
@@ -137,6 +143,7 @@ stream = router.invoke(
         CallVariant(
             protocol=ApiProtocol.OPENAI_RESPONSES,
             operation="responses.create",
+            call_type=CallType.STREAMING,
             arguments={"input": "Count from one to three.", "stream": True},
         )
     ]
@@ -242,7 +249,7 @@ its own specific reason rather than a single blended summary.
 try:
     response = router.invoke([...])
 except NoEligibleProvidersError as error:
-    print([(e.provider_name, e.reason) for e in error.exclusions])  # who was filtered, and why
+    print([(e.provider_id, e.provider_name, e.reason) for e in error.exclusions])
 ```
 
 A successful call returns only the provider's raw response -- there is no
@@ -296,7 +303,9 @@ selection order, pass a `policy` to the constructor:
 ```python
 from nygen_router import ProviderRouter, RoundRobinPolicy
 
-router = ProviderRouter(providers=[...], policy=RoundRobinPolicy())
+router = ProviderRouter(
+    providers=[...], metrics_scope="my-application:production", policy=RoundRobinPolicy()
+)
 ```
 
 ## Provider health and cooldowns
@@ -329,8 +338,9 @@ provider is benched, `invoke()` raises `NoEligibleProvidersError` before making
 any network call, and the message enumerates each provider's real root cause:
 
 ```
-No eligible providers for this request: provider_a: in cooldown (47.9s remaining)
-after 3 consecutive failures; last error: Provider 'provider_a' returned HTTP 404
+No eligible providers for this request: provider_a (id="provider-a-production"):
+in cooldown (47.9s remaining) after 3 consecutive failures; last error:
+Provider "provider_a" (id="provider-a-production") returned HTTP 404
 Not Found for model 'gpt-4o-mini': The model does not exist; provider_b: in
 cooldown (12.4s remaining) after rate limiting; last error: ...
 ```
@@ -345,10 +355,11 @@ from nygen_router import HealthConfig, ProviderRouter
 
 router = ProviderRouter(
     providers=[...],
+    metrics_scope="my-application:production",
     health=HealthConfig(
         rate_limit_cooldown_seconds=120.0,  # back off longer when rate limited
         failure_cooldown_seconds=30.0,
-        failure_threshold=5,                # more tolerant of flaky providers
+        failure_threshold=5,  # more tolerant of flaky providers
     ),
 )
 ```
@@ -357,7 +368,11 @@ A plain dict works too, if you'd rather not import anything. It is validated
 immediately, so a typo raises at construction instead of silently doing nothing:
 
 ```python
-router = ProviderRouter(providers=[...], health={"failure_threshold": 5})
+router = ProviderRouter(
+    providers=[...],
+    metrics_scope="my-application:production",
+    health={"failure_threshold": 5},
+)
 ```
 
 ### Inspecting health
@@ -367,8 +382,8 @@ is benched and why before deciding to intervene. Healthy providers report clean
 rather than going missing:
 
 ```python
-for name, health in router.health_report().items():
-    print(name, health.cooldown_remaining_seconds, health.last_error)
+for provider_id, health in router.health_report().items():
+    print(provider_id, health.provider_name, health.cooldown_remaining_seconds)
 ```
 
 Each entry is a frozen `ProviderHealthReport` with `auth_disabled`,
@@ -383,11 +398,11 @@ waiting out the cooldown serves no purpose. `reset_health()` treats a provider a
 brand new, clearing its cooldown, failure count, auth bench, and last error:
 
 ```python
-router.reset_health("provider_a")  # one provider, eligible again on the next call
-router.reset_health()              # all providers
+router.reset_health("provider-a-production")  # one provider ID
+router.reset_health()  # all providers
 ```
 
-An unknown provider name raises `ConfigError` rather than quietly doing nothing,
+An unknown provider ID raises `ConfigError` rather than quietly doing nothing,
 since a reset that silently no-ops is exactly the kind of failure this is meant
 to prevent.
 
@@ -444,11 +459,13 @@ response = router.invoke(
         CallVariant(
             protocol=ApiProtocol.OPENAI_CHAT,
             operation="chat.completions.create",
+            call_type=CallType.REGULAR,
             arguments={"messages": [{"role": "user", "content": "Hello"}]},
         ),
         CallVariant(
             protocol=ApiProtocol.OPENAI_RESPONSES,
             operation="responses.create",
+            call_type=CallType.REGULAR,
             arguments={"input": "Hello"},
         ),
     ]
@@ -457,10 +474,14 @@ response = router.invoke(
 
 Each protocol may appear at most once per call -- a second `CallVariant` for a
 protocol already supplied raises `DuplicateCallVariantProtocolError`.
+Every variant in one invocation must also declare the same `call_type`; mixed
+regular and streaming response contracts raise `MixedCallTypeError` before any
+provider is contacted.
 
 ## Streaming
 
-Pass `stream=True` and iterate. Nothing else changes: the chunks are the
+Declare `CallType.STREAMING`, pass the provider's native `stream=True`
+argument, and iterate. The chunks are the
 provider SDK's own objects, in order, unbuffered. Chat yields
 `ChatCompletionChunk` objects; Responses yields typed events such as
 `response.output_text.delta`, as shown in the Responses section above.
@@ -471,6 +492,7 @@ response = router.invoke(
         CallVariant(
             protocol=ApiProtocol.OPENAI_CHAT,
             operation="chat.completions.create",
+            call_type=CallType.STREAMING,
             arguments={"messages": [{"role": "user", "content": "Hello"}], "stream": True},
         )
     ]
@@ -505,12 +527,19 @@ That is never allowed to happen silently:
 ```python
 from nygen_router import ProviderRouter, StreamRestart
 
+
 def on_restart(restart: StreamRestart) -> None:
-    print(f"discard {restart.chunks_yielded} chunk(s) from {restart.failed_provider}")
-    print(f"{restart.next_provider} is regenerating; cause: {restart.error}")
+    print(
+        f"discard {restart.chunks_yielded} chunk(s) from "
+        f"{restart.failed_provider} ({restart.failed_provider_id})"
+    )
+    print(f"{restart.next_provider} ({restart.next_provider_id}) is regenerating")
     buffer.clear()
 
-router = ProviderRouter(providers=[...], on_restart=on_restart)
+
+router = ProviderRouter(
+    providers=[...], metrics_scope="my-application:production", on_restart=on_restart
+)
 ```
 
 If no callback is registered and chunks had already been yielded, the router
@@ -523,13 +552,23 @@ To stop on any mid-stream failure rather than regenerate, set the policy:
 ```python
 from nygen_router import ProviderRouter, StreamFailurePolicy
 
-router = ProviderRouter(providers=[...], stream_failure_policy=StreamFailurePolicy.RAISE)
+router = ProviderRouter(
+    providers=[...],
+    metrics_scope="my-application:production",
+    stream_failure_policy=StreamFailurePolicy.RAISE,
+)
 ```
 
 `RAISE` re-raises the provider's own error, unchanged, after recording the
 failed attempt. Both policies stop immediately on a malformed call (a 400, a
 bad `operation`), across protocol variants, since hiding a broken preferred
 path behind another variant would make configuration defects harder to find.
+
+`call_type` is router metadata, not request-shaping configuration. The router
+never inspects, inserts, or reconciles native `arguments["stream"]`; callers
+must keep their declaration and native SDK arguments consistent. Deliberately
+inconsistent calls remain caller-owned and fall outside the guaranteed
+telemetry classification table.
 
 ### Stopping early
 
@@ -575,24 +614,31 @@ raise only router errors from it, and report `completed` and `usage`.
 
 ## Metrics persistence
 
-Every provider attempt (success or failure) is recorded as one observational
-`MetricsEvent` -- provider name, model, protocol, success, latency, and error
-type -- so the implemented score-based policy has real history to work from.
-Excluded providers are not recorded.
+Every provider attempt is recorded as one scoped `MetricsEvent`. Its scoring
+identity is `metrics_scope + provider_id + model + protocol + call_type`;
+`provider_name` is display metadata only. Excluded providers are not recorded.
+The router always writes its required `metrics_scope`.
 
-Streams are recorded once, when the stream ends, never when it opens -- headers
-arriving is not a served call. A stream row is marked `stream=True`, and its
-`latency_ms` means **time to first chunk**, not the full duration (which mostly
-tracks how long the answer was). `total_duration_ms` carries that full span,
-for a completed stream and for one that died mid-generation alike. A streaming
-call that fails before a stream ever opens is recorded like any other failed
-attempt, with `stream=False`.
+`call_type` records what the caller declared. `stream_opened` records what the
+router observed: `None` for regular calls, `False` for a streaming attempt that
+failed before returning a `NormalizedStream`, and `True` after one opened.
+Streaming outcomes are written when completion or failure is known.
+`latency_ms` is full-response latency for regular successes and TTFT for
+streaming attempts; it remains `NULL` when no first chunk arrived. Failed
+attempts never enter latency averages. `total_duration_ms` spans streaming
+completion or failure, including a failure before opening.
 
-Adding those two columns is the first schema change to reach existing metrics
-files. Both bundled backends check their table on connect and add whatever
-columns are missing, so an older file keeps its rows and its history: rows
-written before this change simply read back as the non-streaming attempts they
-were.
+PR29 intentionally has no legacy-schema migration. A newly absent table is
+created with the complete schema. If `provider_attempts` already exists with
+any incompatible shape, it is inspected read-only and left untouched—no
+`ALTER`, backfill, rename, delete, or replacement. Direct store calls raise an
+actionable schema-mismatch error; router calls degrade safely and keep serving
+provider responses. The database owner must move or replace obsolete local
+history manually. Runtime code never deletes a user database.
+
+`request_size_bucket` is already present and nullable, but router-written PR29
+events leave it `NULL`. PR11 owns estimation, bucket definitions, filtering,
+aggregation, and bucket-aware scoring.
 
 `metrics_store` is a `ProviderRouter` constructor parameter with three forms:
 
@@ -600,13 +646,19 @@ were.
 from nygen_router import DuckDBMetricsStore, ProviderRouter, SQLiteMetricsStore
 
 # 1. Default: not passed at all -- a DuckDBMetricsStore at ~/.nygen_router/metrics.duckdb
-router = ProviderRouter(providers=[...])
+router = ProviderRouter(providers=[...], metrics_scope="my-application:production")
 
 # 2. Any MetricsStore implementation, e.g. the bundled SQLite backend
-router = ProviderRouter(providers=[...], metrics_store=SQLiteMetricsStore("metrics.sqlite"))
+router = ProviderRouter(
+    providers=[...],
+    metrics_scope="my-application:production",
+    metrics_store=SQLiteMetricsStore("metrics.sqlite"),
+)
 
 # 3. Disable persistence entirely
-router = ProviderRouter(providers=[...], metrics_store=None)
+router = ProviderRouter(
+    providers=[...], metrics_scope="my-application:production", metrics_store=None
+)
 ```
 
 `DuckDBMetricsStore` is the default: an embedded, no-server-to-run database,
@@ -637,7 +689,14 @@ persistence and produces no warning.
 class MetricsStore(Protocol):
     def record_attempt(self, event: MetricsEvent) -> None: ...
     def query_recent(
-        self, *, since: datetime, provider_name: str | None = None, model: str | None = None
+        self,
+        *,
+        since: datetime,
+        metrics_scope: str | None = None,
+        provider_id: str | None = None,
+        model: str | None = None,
+        protocol: ApiProtocol | None = None,
+        call_type: CallType | None = None,
     ) -> list[MetricsEvent]: ...
 ```
 
@@ -656,19 +715,22 @@ what each provider has actually been doing:
 ```python
 from datetime import UTC, datetime, timedelta
 
-from nygen_router import aggregate_stats
+from nygen_router import CallType, aggregate_stats
 
 store = SQLiteMetricsStore("metrics.sqlite")
-events = store.query_recent(since=datetime.now(UTC) - timedelta(hours=1))
+events = store.query_recent(
+    since=datetime.now(UTC) - timedelta(hours=1),
+    metrics_scope=router.metrics_scope,
+)
 
-stats = aggregate_stats(events, [provider.name for provider in router.providers])
-print(stats["provider_a"].regular_success_rate)     # e.g. 0.95
-print(stats["provider_a"].streaming_avg_ttft_ms)    # e.g. 210.4
+stats = aggregate_stats(events, router.providers, CallType.REGULAR)
+print(stats["provider-a-production"].regular_success_rate)  # e.g. 0.95
 ```
 
-It is query-only: you choose the window, and any model or provider filtering,
-by what you pass to `query_recent` first. Every name you ask about gets an
-entry, including a provider with no history at all -- its counts are `0` and
+It is query-only: the store chooses the time/scope window, then aggregation
+requires exact provider ID, model, protocol, and invocation call type matches.
+Every configured provider gets an entry keyed by `provider_id`, including one
+with no history at all -- its counts are `0` and
 its rates and averages are `None`, so a brand-new provider is "no evidence",
 never a missing key.
 
@@ -682,15 +744,14 @@ figures and empty streaming ones (or the reverse) is normal.
 
 Averages are computed over successful attempts only, so a provider that fails
 in 5ms never looks faster than one that answers in 500ms. `recent_error_count`,
-`rate_limit_count`, and `timeout_count` are exact tallies across both call
-types, for diagnostics.
+`rate_limit_count`, and `timeout_count` are exact tallies for the selected
+partition, for diagnostics.
 
 ## Score calculation
 
-`calculate_provider_score(stats, weights, use_streaming=False)` turns one
-provider's aggregated observations into a comparable score between 0 and 1.
-Pass `use_streaming=True` to score streaming success and time-to-first-chunk
-instead of regular success and full-response latency. The returned
+`calculate_provider_score(stats, weights, call_type=CallType.REGULAR)` turns
+one provider's aggregated observations into a comparable score between 0 and
+1. Pass `CallType.STREAMING` to select streaming success and TTFT. The returned
 `ProviderScore` keeps `success_quality` and `speed_quality` alongside `total`,
 so the result remains explainable.
 
@@ -728,14 +789,14 @@ followed by PR6).
 hands the full best-first list to the router's existing fallback loop:
 
 ```python
-from nygen_router import ProviderRouter, ScoreBasedPolicy, ScoreWeights
+from nygen_router import HistoryScope, ProviderRouter, ScoreBasedPolicy, ScoreWeights
 
 policy = ScoreBasedPolicy(
     weights=ScoreWeights(success_weight=2.0, speed_weight=1.0),
     lookback_hours=336.0,
-    use_streaming=False,
+    history_scope=HistoryScope.CURRENT,
 )
-router = ProviderRouter(providers=[...], policy=policy)
+router = ProviderRouter(providers=[...], metrics_scope="my-application:production", policy=policy)
 ```
 
 Its constructor settings are:
@@ -745,8 +806,9 @@ Its constructor settings are:
   count every event in that window equally.
 - `half_life_hours=None`: keep flat weighting over `lookback_hours`; a positive
   value replaces that window with the recency behavior described below.
-- `use_streaming=False`: score regular-call history. Set it to `True` to score
-  streaming success and TTFT instead.
+- `history_scope=HistoryScope.CURRENT`: read only the router's configured
+  scope. `HistoryScope.ALL` explicitly combines otherwise matching provider
+  partitions across scopes; writes still use the router's current scope.
 - `tie_break_policy=None`: use an internal `RoundRobinPolicy`.
 - `now=...`: wall-clock seam for deterministic testing; normal applications
   use its UTC default.
@@ -759,13 +821,9 @@ cannot be queried, or history produces equal scores. A metrics failure logs a
 warning and routing continues through round robin; it never breaks an LLM
 call.
 
-`use_streaming` is chosen once when the policy is constructed. The router does
-not inspect a call's provider-specific arguments to guess its type before
-routing, so one policy instance always scores either regular history or
-streaming history regardless of the individual call. A workload that mixes
-both call types needs two policy instances selected by the caller, or must
-accept that whichever type is not configured will be ranked using the other
-type's history.
+The router puts the invocation's declared `CallType` in `RoutingContext`, and
+`ScoreBasedPolicy` automatically scores that matching partition. There is no
+independent `use_streaming` policy setting that can contradict the call.
 
 ### Recency weighting
 
@@ -786,21 +844,21 @@ ignored after their influence has already fallen below about 1.6%.
 policy = ScoreBasedPolicy(half_life_hours=72.0)
 ```
 
-### Provider names must be unique
+### Stable provider identity and display names
 
-`ProviderRouter` rejects two configured providers sharing a `name`, raising
-`ConfigError` naming every duplicate before any call is made. Names are how
-both metrics history and health state identify a provider, so a duplicate
-would silently merge two providers into one and route on the blend.
+Every `ProviderConfig` requires a nonblank, stable `provider_id`. IDs must be
+unique within one router and are the canonical key for metrics, health,
+attempts, exclusions, resets, scores, and provider-specific errors. `name`
+remains required display metadata; duplicate names are valid, though distinct
+names are easier to read. Diagnostics expose both whenever duplicates could be
+ambiguous.
 
-Two entries pointing at the same `base_url` and model through different API
-keys -- separate rate-limit quotas -- are a supported and useful setup. They
-just need distinct names, which is also what keeps their histories separate.
-
-**Renaming a provider starts its recorded history over.** The old name's
-events are still on disk but no longer match, so the provider looks brand new
-until it accumulates history again. That is a deliberate trade: identity you
-can read straight off the config, self-healing within one lookback window.
+Use separate IDs for separate accounts, API-key quota domains, deployments,
+gateways, or endpoints that should learn independently. API keys are never
+stored, hashed, compared, or exposed. Changing only `name` preserves history;
+changing ID, model, protocol, or declared call type selects a fresh partition.
+Changing `base_url` alone does not—assign a new ID when it represents a
+different failure domain.
 
 ## Errors
 
@@ -842,11 +900,11 @@ from nygen_router import ProviderHTTPError, ProviderRouter
 try:
     router.invoke([...])
 except ProviderHTTPError as error:
-    print(error)             # Provider 'provider_a' returned HTTP 429 Too Many Requests ...
-    print(error.status_code) # 429
+    print(error)  # Provider 'provider_a' returned HTTP 429 Too Many Requests ...
+    print(error.status_code)  # 429
     print(error.error_type)  # e.g. "rate_limit_exceeded"
-    print(error.body)        # the provider's error payload
-    raise error.__cause__    # the underlying openai SDK exception, if you want it
+    print(error.body)  # the provider's error payload
+    raise error.__cause__  # the underlying openai SDK exception, if you want it
 ```
 
 ## Quality Checks

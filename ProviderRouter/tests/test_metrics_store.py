@@ -116,7 +116,7 @@ def test_records_and_reads_back_success_event_field_for_field(store: MetricsStor
 
 
 def test_records_and_reads_back_a_streaming_event(store: MetricsStore) -> None:
-    """On a stream row latency_ms is time-to-first-chunk and total_duration_ms is open-to-end."""
+    """Streaming latency is TTFT and total duration spans open to end."""
     event = _event(
         call_type=CallType.STREAMING,
         stream_opened=True,

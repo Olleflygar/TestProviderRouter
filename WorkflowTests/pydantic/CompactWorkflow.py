@@ -11,10 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 WORKFLOW_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = WORKFLOW_ROOT.parent
-sys.path.insert(0, str(PROJECT_ROOT / "ProviderRouterPR1" / "src"))
+sys.path.insert(0, str(PROJECT_ROOT / "ProviderRouter" / "src"))
 
 from nygen_router import (  # noqa: E402
     ApiProtocol,
+    CallType,
     CallVariant,
     DuckDBMetricsStore,
     ProviderConfig,
@@ -45,6 +46,7 @@ def invoke(router: ProviderRouter, prompt: str, result_type: type[ModelT]) -> Mo
             CallVariant(
                 protocol=ApiProtocol.OPENAI_CHAT,
                 operation="chat.completions.create",
+                call_type=CallType.REGULAR,
                 arguments={
                     "messages": [
                         {
@@ -77,13 +79,16 @@ def _strip_json_fence(text: str) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a compact two-step router workflow.")
+    parser = argparse.ArgumentParser(
+        description="Run a compact two-step router workflow."
+    )
     parser.add_argument("--topic", default=DEFAULT_TOPIC)
     topic = parser.parse_args().topic
 
     load_dotenv(PROJECT_ROOT / ".env", override=False)
     providers = [
         ProviderConfig(
+            provider_id="fireworks:gpt-oss-20b",
             name="Fireworks",
             protocol=ApiProtocol.OPENAI_CHAT,
             model="accounts/fireworks/models/gpt-oss-20b",
@@ -91,6 +96,7 @@ def main() -> None:
             api_key_env="Fireworks_API_KEY",
         ),
         ProviderConfig(
+            provider_id="together:gpt-oss-20b",
             name="TogetherAI",
             protocol=ApiProtocol.OPENAI_CHAT,
             model="OpenAI/gpt-oss-20B",
@@ -103,12 +109,15 @@ def main() -> None:
 
     store = DuckDBMetricsStore(WORKFLOW_ROOT / "workflow_history.duckdb")
     if not store.available:
-        raise RuntimeError("DuckDB is required. Install WorkflowTests/requirements.txt.")
+        raise RuntimeError(
+            "DuckDB is required. Install WorkflowTests/requirements.txt."
+        )
 
     try:
         router = ProviderRouter(
             providers=providers,
-            policy=ScoreBasedPolicy(use_streaming=False),
+            metrics_scope="workflow-tests:local",
+            policy=ScoreBasedPolicy(),
             metrics_store=store,
         )
         plan = invoke(

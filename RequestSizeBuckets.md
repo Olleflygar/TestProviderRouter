@@ -5,6 +5,11 @@ router/gateway repos (Bifrost, CARROT, LiteLLM, RouteLLM, WeaveRouter, AvengersP
 OmniRoute). Relates to PR11 in `Projectplan/` and the `request_size_bucket` column
 already reserved in `storage/base.py`.
 
+PR29 correction (shipped 2026-08-03): the nullable event field and exact-schema
+database column are now present, and router-produced events leave them NULL.
+PR11 must populate and use the existing field; it must not add the column or
+revive the removed `_ADDED_COLUMNS`/implicit `ALTER TABLE` migration pattern.
+
 ## Why size buckets
 
 Provider latency varies with prompt size: a provider that is fast on a 2k-token
@@ -221,10 +226,9 @@ to round-robin. Bucketing can make routing *worse* before it makes it better.
 
 ### Recommended path: record first, route later
 
-Phase 1 — additive only. Compute the estimate per call, store the bucket on each
-metrics event (the `_ADDED_COLUMNS` migration pattern already covers the schema
-change), and change no routing behavior. Cost is near zero, risk is zero, and it
-is trivially reversible.
+Phase 1 — producer only. Compute the estimate per call and store it in PR29's
+existing nullable event field/column, changing no routing behavior. Cost is
+near zero, risk is zero, and it is trivially reversible.
 
 Phase 2 — decided by the data phase 1 produces. After real traffic, check whether
 per-provider latency actually varies by bucket and where natural boundaries fall.

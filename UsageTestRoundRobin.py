@@ -6,12 +6,19 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-ROUTER_SRC = PROJECT_ROOT / "ProviderRouterPR1" / "src"
+ROUTER_SRC = PROJECT_ROOT / "ProviderRouter" / "src"
 
 # Makes this script runnable from the IDE play button without installing the package first.
 sys.path.insert(0, str(ROUTER_SRC))
 
-from nygen_router import ApiProtocol, CallVariant, ProviderConfig, ProviderRouter, RoundRobinPolicy
+from nygen_router import (
+    ApiProtocol,
+    CallType,
+    CallVariant,
+    ProviderConfig,
+    ProviderRouter,
+    RoundRobinPolicy,
+)
 
 
 def main() -> None:
@@ -20,6 +27,7 @@ def main() -> None:
     router = ProviderRouter(
         providers=[
             ProviderConfig(
+                provider_id="fireworks:gpt-oss-20b",
                 name="Fireworks",
                 protocol=ApiProtocol.OPENAI_CHAT,
                 model="accounts/fireworks/models/gpt-oss-20b",
@@ -27,6 +35,7 @@ def main() -> None:
                 api_key_env="Fireworks_API_KEY",
             ),
             ProviderConfig(
+                provider_id="together:gpt-oss-20b",
                 name="TogetherAI",
                 protocol=ApiProtocol.OPENAI_CHAT,
                 model="OpenAI/gpt-oss-20B",
@@ -34,6 +43,7 @@ def main() -> None:
                 api_key_env="Together_API_KEY",
             ),
         ],
+        metrics_scope="usage-test-round-robin:local",
         policy=RoundRobinPolicy(),
     )
 
@@ -45,13 +55,12 @@ def main() -> None:
                 CallVariant(
                     protocol=ApiProtocol.OPENAI_CHAT,
                     operation="chat.completions.create",
+                    call_type=CallType.REGULAR,
                     arguments={
                         "messages": [
                             {
                                 "role": "user",
-                                "content": (
-                                    "Tell me something short."
-                                ),
+                                "content": ("Tell me something short."),
                             }
                         ],
                     },

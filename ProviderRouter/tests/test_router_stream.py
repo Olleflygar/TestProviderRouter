@@ -498,7 +498,7 @@ def test_pre_stream_failures_are_carried_into_the_exhausted_error() -> None:
         "provider_a",
         "provider_b",
     ]
-    # The attempt that never opened a stream is not recorded as a stream row.
+    # Both attempts remain declared streaming; only the second opened a stream.
     assert [event.stream_opened for event in store.events] == [False, True]
 
 

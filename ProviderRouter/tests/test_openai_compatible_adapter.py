@@ -123,6 +123,7 @@ def test_unsupported_operation_raises_for_bad_operation_path() -> None:
     with pytest.raises(UnsupportedOperationError) as exc_info:
         adapter.invoke("chat.completions.creat", _arguments())
 
+    assert exc_info.value.provider_id == "provider_a"
     assert exc_info.value.provider_name == "provider_a"
     assert isinstance(exc_info.value.__cause__, AttributeError)
     assert exc_info.value.original is exc_info.value.__cause__
@@ -137,6 +138,7 @@ def test_invalid_operation_arguments_raises_for_bad_kwargs() -> None:
     with pytest.raises(InvalidOperationArgumentsError) as exc_info:
         adapter.invoke("chat.completions.create", {"bogus_kwarg": 1})
 
+    assert exc_info.value.provider_id == "provider_a"
     assert exc_info.value.provider_name == "provider_a"
     assert isinstance(exc_info.value.__cause__, TypeError)
     assert exc_info.value.original is exc_info.value.__cause__
@@ -151,6 +153,7 @@ def test_sdk_not_installed_raises_provider_sdk_not_installed_error(
     with pytest.raises(ProviderSDKNotInstalledError) as exc_info:
         adapter.invoke("chat.completions.create", _arguments())
 
+    assert exc_info.value.provider_id == "provider_a"
     assert exc_info.value.provider_name == "provider_a"
     assert exc_info.value.package == "openai"
     assert isinstance(exc_info.value.original, ModuleNotFoundError)
@@ -171,6 +174,7 @@ def test_http_errors_raise_provider_http_error(status_code: int) -> None:
     with pytest.raises(ProviderHTTPError) as exc_info:
         adapter.invoke("chat.completions.create", _arguments())
 
+    assert exc_info.value.provider_id == "provider_a"
     assert exc_info.value.provider_name == "provider_a"
     assert exc_info.value.status_code == status_code
 
@@ -191,6 +195,7 @@ def test_http_error_preserves_verbatim_message_and_structured_fields() -> None:
         adapter.invoke("chat.completions.create", _arguments())
 
     error = exc_info.value
+    assert error.provider_id == "provider_a"
     # The provider's exact message is front-and-center, no unwrapping needed.
     assert error.message == "model gpt-4o-mini does not exist"
     assert "model gpt-4o-mini does not exist" in str(error)
@@ -246,6 +251,7 @@ def test_timeout_raises_provider_timeout_error() -> None:
         adapter.invoke("chat.completions.create", _arguments())
 
     error = exc_info.value
+    assert error.provider_id == "provider_a"
     assert error.provider_name == "provider_a"
     assert error.model == "model-a"
     assert type(error.__cause__).__name__ == "APITimeoutError"
@@ -261,6 +267,7 @@ def test_connection_failure_raises_provider_connection_error() -> None:
     with pytest.raises(ProviderConnectionError) as exc_info:
         adapter.invoke("chat.completions.create", _arguments())
 
+    assert exc_info.value.provider_id == "provider_a"
     assert type(exc_info.value.__cause__).__name__ == "APIConnectionError"
 
 
@@ -399,6 +406,7 @@ def test_mid_stream_timeout_raises_provider_timeout_error() -> None:
     with pytest.raises(ProviderTimeoutError) as exc_info:
         next(stream)
 
+    assert exc_info.value.provider_id == "provider_a"
     assert isinstance(exc_info.value.__cause__, httpx.ReadTimeout)
     assert exc_info.value.original is exc_info.value.__cause__
 
@@ -410,6 +418,7 @@ def test_mid_stream_transport_error_raises_provider_connection_error() -> None:
     with pytest.raises(ProviderConnectionError) as exc_info:
         next(stream)
 
+    assert exc_info.value.provider_id == "provider_a"
     assert not isinstance(exc_info.value, ProviderTimeoutError)
     assert isinstance(exc_info.value.__cause__, httpx.RemoteProtocolError)
 
@@ -425,6 +434,7 @@ def test_mid_stream_sse_error_event_raises_provider_error() -> None:
     with pytest.raises(ProviderError) as exc_info:
         next(stream)
 
+    assert exc_info.value.provider_id == "provider_a"
     assert "upstream exploded" in str(exc_info.value)
 
 

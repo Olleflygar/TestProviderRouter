@@ -14,7 +14,15 @@ import sys
 
 class OptionalDependencyBlocker(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.partition(".")[0] in {{"duckdb", "httpx", "openai"}}:
+        if fullname.partition(".")[0] in {{
+            "duckdb",
+            "httpx",
+            "langchain",
+            "langchain_core",
+            "openai",
+            "opentelemetry",
+            "prometheus_client",
+        }}:
             raise ModuleNotFoundError(fullname)
         return None
 
@@ -22,7 +30,15 @@ sys.meta_path.insert(0, OptionalDependencyBlocker())
 sys.path.insert(0, {str(source_root)!r})
 from nygen_router import ProviderRouter
 assert ProviderRouter.__name__ == "ProviderRouter"
-assert not ({{"duckdb", "httpx", "openai"}} & sys.modules.keys())
+assert not ({{
+    "duckdb",
+    "httpx",
+    "langchain",
+    "langchain_core",
+    "openai",
+    "opentelemetry",
+    "prometheus_client",
+}} & sys.modules.keys())
 """
 
     result = subprocess.run(

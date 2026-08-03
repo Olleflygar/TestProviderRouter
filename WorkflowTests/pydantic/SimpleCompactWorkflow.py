@@ -9,9 +9,15 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(PROJECT_ROOT / "ProviderRouterPR1" / "src"))
+sys.path.insert(0, str(PROJECT_ROOT / "ProviderRouter" / "src"))
 
-from nygen_router import ApiProtocol, CallVariant, ProviderConfig, ProviderRouter  # noqa: E402
+from nygen_router import (  # noqa: E402
+    ApiProtocol,
+    CallType,
+    CallVariant,
+    ProviderConfig,
+    ProviderRouter,
+)
 
 
 class Answer(BaseModel):
@@ -19,7 +25,9 @@ class Answer(BaseModel):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a minimal one-step router workflow.")
+    parser = argparse.ArgumentParser(
+        description="Run a minimal one-step router workflow."
+    )
     parser.add_argument(
         "--topic",
         default="Why short breaks can help people stay focused",
@@ -30,6 +38,7 @@ def main() -> None:
     router = ProviderRouter(
         providers=[
             ProviderConfig(
+                provider_id="fireworks:gpt-oss-20b",
                 name="Fireworks",
                 protocol=ApiProtocol.OPENAI_CHAT,
                 model="accounts/fireworks/models/gpt-oss-20b",
@@ -37,13 +46,15 @@ def main() -> None:
                 api_key_env="Fireworks_API_KEY",
             ),
             ProviderConfig(
+                provider_id="together:gpt-oss-20b",
                 name="TogetherAI",
                 protocol=ApiProtocol.OPENAI_CHAT,
                 model="OpenAI/gpt-oss-20B",
                 base_url="https://api.together.ai/v1",
                 api_key_env="Together_API_KEY",
             ),
-        ]
+        ],
+        metrics_scope="workflow-tests:local",
     )
 
     prompt = (
@@ -56,6 +67,7 @@ def main() -> None:
             CallVariant(
                 protocol=ApiProtocol.OPENAI_CHAT,
                 operation="chat.completions.create",
+                call_type=CallType.REGULAR,
                 arguments={
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 512,

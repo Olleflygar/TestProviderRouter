@@ -45,18 +45,24 @@ python WorkflowTests/pydantic/workflow.py --reset-history
 
 History is preserved by default. Because DuckDB permits only one process to
 write a database file, do not run the two scripts concurrently.
+PR29 does not migrate legacy schemas: if this file predates PR29, its owner
+must pass `--reset-history` (or move it aside manually) before using these
+development-only workflows. Router runtime code never deletes it automatically.
 
 ## What each run does
 
 1. Make two round-robin calibration rounds: four tiny regular calls, giving
    each provider two opportunities to lead.
 2. Build a new router over the same metrics store with
-   `ScoreBasedPolicy(use_streaming=False)`.
+   `ScoreBasedPolicy()`. The regular `CallType` comes from each invocation's
+   `RoutingContext` automatically.
 3. Run four short model steps: plan, draft, critique, and revision.
 4. Print every provider attempt plus regular success, latency, and score
    components after each scored step.
 
-All calls set `stream=False` and use low reasoning effort. Calibration calls
+All calls declare `CallType.REGULAR`, set the native `stream=False` argument,
+and use low reasoning effort. Providers use stable IDs and the shared
+`workflow-tests:local` metrics scope. Calibration calls
 are capped at 128 total generated tokens and workflow calls at 512. These are
 ceilings that include reasoning tokens; the model can stop earlier. They avoid
 the empty responses that GPT-OSS can produce when reasoning consumes an

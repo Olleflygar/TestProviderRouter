@@ -77,8 +77,8 @@ Implementation rules for this package:
   than when it opens -- see "Streaming" below.
 - Recorded attempts are summarized into per-provider `ProviderStats` by
   `aggregate_stats` (`stats.py`), split by call type -- see "Metrics
-  aggregation" below. Two providers may not share a `name`: `__init__` rejects
-  that with a `ConfigError` naming every duplicate.
+  aggregation" below. `provider_id` is canonical; IDs must be unique within a
+  router, while duplicate display names are valid.
 
 ## Design principle (native pass-through, non-negotiable)
 
@@ -89,6 +89,9 @@ the provider API with a generalized LLM interface:
   basic shape checks (it's a mapping; it doesn't already contain `"model"`).
   Whatever the caller puts in `arguments` goes to the provider's SDK call
   unchanged except for the injected `model` key.
+- Every `CallVariant` explicitly declares `CallType`. All variants in one
+  invocation must agree. The declaration is router metadata: callers own its
+  consistency with opaque native arguments.
 - Adapters stay lightweight and make no request-shaping decisions of their
   own: the router resolves which `CallVariant` applies and injects `model`
   before calling into the adapter; the adapter's only job is dynamic dispatch
@@ -127,7 +130,8 @@ score-based routing has real history to work from:
 
 - `MetricsStore` (`storage/base.py`) is a `typing.Protocol` with exactly two
   methods -- `record_attempt` and `query_recent`. Do not add aggregation,
-  delete, or migration methods to it in unrelated work; aggregation happens
+  delete, or migration methods to it in unrelated work; identity filters are
+  scope, provider ID, model, protocol, and call type. Aggregation happens
   in Python over `query_recent`'s output, never in per-backend SQL. The planned
   storage-foundation work in PR13 may deliberately evolve the storage
   interfaces and migration design.
@@ -144,26 +148,31 @@ score-based routing has real history to work from:
   the default".
 - Every `record_attempt` call from the router is wrapped in its own
   `try/except Exception` -- a storage failure (including `duckdb` not being
-  installed) must never disturb a successful LLM response. Latency is one
-  `time.perf_counter()` window around `adapter.invoke()`, recorded exactly as
-  measured, on both success and failure.
+  installed) must never disturb a successful LLM response. Regular-call
+  latency is measured around `adapter.invoke()`. Streaming latency is TTFT and
+  stays `None` when no first chunk arrives; total duration still covers the
+  complete streaming attempt, including pre-open failure.
+- Every event carries the router's required nonblank `metrics_scope`, required
+  `provider_id`, model, protocol, and declared call type. `provider_name` is
+  display metadata and never an identity/filter key.
 - Do not add cross-process coordination for DuckDB, async/batched writes,
   schema versioning, or queries beyond `query_recent` as unrelated work.
   Schema migrations, remote connection handling, and reporting queries belong
   to the explicitly scoped PR13 storage-foundation work in the current
   roadmap.
-- New columns are added to `_ADDED_COLUMNS` in `storage/base.py`, which every
-  backend replays against its table on connect (check `PRAGMA table_info`, then
-  `ALTER TABLE ADD COLUMN` whatever is missing). Until PR13 deliberately
-  replaces this mechanism, new columns use it rather than inventing another
-  migration path; this includes the earlier PR24 token-usage work in the
-  current roadmap. Added-column DDL must carry no constraints -- DuckDB rejects
-  them in `ALTER TABLE ADD COLUMN`, even though it accepts them in
-  `CREATE TABLE`.
+- PR29 deliberately removed automatic additive migration. A missing table is
+  created with the exact current schema. An existing incompatible table is
+  inspected read-only and left completely untouched; direct store users get an
+  actionable mismatch error and router calls degrade safely. Runtime code must
+  never alter, backfill, rename, delete, or replace a legacy database. PR13
+  owns future explicit schema-versioning and migration design.
+- `request_size_bucket` is reserved and nullable in the PR29 schema. Router
+  events leave it `NULL`; PR11 owns its producer, values, filtering,
+  aggregation, and scoring.
 
 ## Metrics aggregation
 
-`aggregate_stats(events, provider_names, *, weight_fn=None)` in `stats.py`
+`aggregate_stats(events, providers, call_type, *, weight_fn=None)` in `stats.py`
 turns recorded events into one `ProviderStats` per provider for scoring:
 
 - Pure and query-only: a function over a list of `MetricsEvent`, with no store,
@@ -176,7 +185,7 @@ turns recorded events into one `ProviderStats` per provider for scoring:
 - Averages cover successful attempts only -- a fast failure must never look
   fast -- and a success carrying no latency at all contributes nothing rather
   than a 0.0.
-- Every requested name gets an entry, including one with no events (counts `0`,
+- Every requested provider ID gets an entry, including one with no events (counts `0`,
   rates and averages `None`), matching `health_report()`'s precedent: the
   optimistic-start blend needs a real entry to fall back on.
 - The four count fields are typed `float` because recency weighting can make
@@ -187,22 +196,19 @@ turns recorded events into one `ProviderStats` per provider for scoring:
   `ScoreBasedPolicy` for exponential recency decay. It defaults to a flat 1.0
   per event. Write every count, rate, and average through it; never create
   separate weighted and unweighted aggregation paths.
-- No per-model grouping: a `ProviderConfig` fixes one model, so provider
-  identity already implies model identity. Cost statistics remain optional
-  future work dependent on usage instrumentation and user-supplied prices
-  (PR24 and PR6 in the current roadmap).
-- Provider names are the identity key for both metrics and health, which is why
-  `__init__` rejects duplicates. Renaming a provider therefore restarts its
-  recorded history; that is accepted and documented in the README, not a bug to
-  fix with fuzzy matching.
+- Match every event exactly on provider ID, model, protocol, and invocation
+  call type. A former display name does not prevent a stable ID from matching.
+  Wrong-partition events affect no count, tally, average, or score.
+- Cost statistics remain optional future work dependent on usage
+  instrumentation and user-supplied prices (PR24 and PR6).
 
 ## Score calculation
 
-`calculate_provider_score(stats, weights, *, use_streaming=False)` in
+`calculate_provider_score(stats, weights, *, call_type=CallType.REGULAR)` in
 `scoring.py` is a pure function from one `ProviderStats` record to one frozen,
 explainable `ProviderScore`:
 
-- Select only the regular or streaming bucket requested by `use_streaming`;
+- Select only the regular or streaming bucket requested by `call_type`;
   never blend the two call types.
 - Blend success rate toward `ScoreWeights.optimistic_start` using attempt count
   as evidence. Blend latency-derived speed quality toward the same prior using
@@ -217,9 +223,10 @@ explainable `ProviderScore`:
 
 ## Score-based routing
 
-The `Policy` protocol is now
+The `Policy` protocol is
 `order(eligible: list[ProviderConfig], context: RoutingContext)`. The router
-builds a fresh frozen context per `invoke()` from its own metrics store; custom
+builds a fresh frozen context carrying the metrics store, scope, and declared
+call type per `invoke()`; custom
 policies must accept that second argument. `RoundRobinPolicy` accepts and
 ignores it.
 
@@ -235,9 +242,11 @@ ignores it.
 - If metrics are disabled, the eligible list is empty, or the history query
   fails, return the tie-break order unchanged. Query failures warn once per
   policy instance and log repeats at DEBUG.
-- `use_streaming` is fixed at policy construction and never inferred from
-  `CallVariant.arguments`. A policy instance scores one call type for its
-  entire lifetime.
+- `ScoreBasedPolicy` reads the call type from `RoutingContext`; there is no
+  independently configurable `use_streaming` setting.
+- `HistoryScope.CURRENT` (default) queries only the router's scope;
+  `HistoryScope.ALL` deliberately omits only the scope filter. Both make one
+  query and still match ID, model, protocol, and call type in Python.
 - `half_life_hours=None` preserves flat `lookback_hours` behavior exactly. A
   positive half-life replaces that window entirely: query the
   latest six half-lives and pass exponential event weights
@@ -287,7 +296,7 @@ whole point of the feature:
 - `reset_health()` must never touch the metrics store -- `MetricsStore` has no
   delete path and recorded history survives every reset. Reset means "may be
   tried again now" (hard filter), not "forget what happened" (scoring).
-  An unknown provider name raises `ConfigError`; a typo'd reset that silently
+  An unknown provider ID raises `ConfigError`; a typo'd reset that silently
   no-ops is the exact failure this feature exists to prevent.
 - Health is in-memory and lives and dies with the router instance. Do not
   persist it as unrelated work, and do not add per-provider `HealthConfig`
@@ -336,10 +345,11 @@ still act:
   recognized-shape state: it produced no usable response. Record it as a
   streaming failure with NULL TTFT, apply the normal health transition, and
   obey `stream_failure_policy` (`RESTART` by default, `RAISE` when configured).
-- On a stream row `latency_ms` always means time-to-first-chunk and is NULL
-  when no chunk arrived; do not repurpose it. `total_duration_ms` is recorded
-  for dead streams too. `stream` means a stream actually opened, so a streaming
-  call that fails before that is recorded `stream=False`.
+- For declared streaming calls, `latency_ms` always means time-to-first-chunk
+  and is NULL when no chunk arrived; do not repurpose it. `total_duration_ms`
+  is recorded for completion or failure, including pre-open failure.
+  `stream_opened` is false before a `NormalizedStream` return and true after;
+  regular calls use `None`.
 - A truncation verdict needs evidence: only a stream whose chunk shape the
   wrapper recognized can be called silently truncated. An unrecognized shape
   logs one WARNING per operation per router and counts as completed.

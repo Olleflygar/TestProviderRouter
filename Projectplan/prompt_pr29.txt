@@ -2,7 +2,7 @@
 
 You are implementing **PR29 — Corrective metrics identity and history partitioning** in the existing `nygen-router` repository.
 
-This is an implementation task, not a design task. The specification below is the approved result of a requirements interview concerning a recently discovered correctness flaw. The corrective PR was not previously specified in `Projectplan/Newprojectplan.md`, `Projectplan/OldProjectPlan.md`, or the other planning files.
+This is an implementation task, not a design task. The specification below is the approved result of a requirements interview concerning a recently discovered correctness flaw. The corrective PR was not previously specified in `Projectplan/NewProjectPlan.md`, `Projectplan/OldProjectPlan.md`, or the other planning files.
 
 If the earlier metrics-partitioning conversation is available, read it as the primary rationale. This prompt is its complete, authoritative implementation specification. Use the current repository to identify exact integration points and established patterns. Do not redesign or expand the agreed behavior. If this specification genuinely conflicts with an unchangeable repository constraint, stop and report the conflict rather than inventing a resolution.
 
@@ -15,7 +15,7 @@ Before making changes, read in full:
 - root `AGENTS.md`;
 - `ProviderRouter/AGENTS.md`;
 - `ProviderRouter/README.md`;
-- `Projectplan/Newprojectplan.md`;
+- `Projectplan/NewProjectPlan.md`;
 - the relevant historical sections of `Projectplan/OldProjectPlan.md`;
 - current metrics, storage, configuration, routing, policy, aggregation, scoring, health, error, adapter, and streaming source;
 - all tests touching those areas;
@@ -55,7 +55,7 @@ Before the first PR29-related repository change:
 4. Create local tag `pr29-start` on the current commit immediately before the first PR29 change.
 5. If creating the tag requires an approval prompt, first explain plainly that permission is needed to write the local Git tag marking the pre-implementation state.
 
-Create `Projectplan/prompt_pr29.txt` as the planning-history copy of this execution specification, following the existing per-PR prompt convention.
+Keep `Projectplan/prompt_pr29.txt` as the planning-history copy of this execution specification, following the existing per-PR prompt convention.
 
 Commit logical milestones with clear messages. Do not push commits or tags. Create `pr29-complete` only after every implementation, validation, documentation, diff-review, commit, and clean-worktree requirement below is satisfied.
 
@@ -160,6 +160,12 @@ CallVariant(
 ```
 
 The router must never inspect native arguments to infer, validate, inject, or reconcile call type. In particular, do not read `arguments["stream"]`. The caller owns consistency between `CallVariant.call_type` and native provider arguments.
+
+Approved clarification: a mismatch between declared `call_type` and native
+arguments/adapter return shape is caller misconfiguration and is outside the
+guaranteed telemetry-classification contract. Preserve existing returned-object
+handling, do not inspect arguments, and do not synthesize new validation or
+fallback behavior for this edge case.
 
 Continue passing `CallVariant.arguments` through unchanged except for the existing model injection. Document `call_type` as router metadata, not request-shaping configuration.
 
@@ -290,7 +296,7 @@ Round-trip explicitly supplied values through DuckDB and SQLite conformance test
 
 All PR29 router-produced events record `NULL`.
 
-Update `Projectplan/Newprojectplan.md`, the PR11 section of `Projectplan/OldProjectPlan.md`, `ProviderRouter/AGENTS.md`, and other relevant planning guidance so future PR11 prompt construction and execution clearly understand:
+Update `Projectplan/NewProjectPlan.md`, the PR11 section of `Projectplan/OldProjectPlan.md`, `ProviderRouter/AGENTS.md`, and other relevant planning guidance so future PR11 prompt construction and execution clearly understand:
 
 - PR29 already added the event field and database column;
 - PR11 must populate it;
@@ -610,7 +616,7 @@ Review and update all affected explanatory material, including where relevant:
 - `ProviderRouter/README.md`;
 - root `AGENTS.md`;
 - `ProviderRouter/AGENTS.md`;
-- `Projectplan/Newprojectplan.md`;
+- `Projectplan/NewProjectPlan.md`;
 - narrow historical notes in `Projectplan/OldProjectPlan.md`;
 - `Projectplan/prompt_pr29.txt`;
 - metrics/storage/scoring/routing/streaming documentation;
@@ -647,7 +653,7 @@ Required documentation outcomes:
     - automatic additive migration of every old table;
     - PR11 needing to add the bucket column.
 18. Preserve `OldProjectPlan.md` as history. Add narrow correction notes; do not rewrite old PR specifications as though PR29 had existed then.
-19. Use the actual filename casing `Newprojectplan.md` in current references.
+19. Use the Git-tracked filename casing `NewProjectPlan.md` in current references.
 20. Do not manufacture unrelated documentation changes.
 
 ## Final quality gates

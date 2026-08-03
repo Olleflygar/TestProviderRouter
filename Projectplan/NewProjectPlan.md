@@ -13,7 +13,8 @@ optional layers and must not become core import dependencies.
 ## Current implementation status
 
 Repository history and source confirm that PR1–5, PR7–10, PR12, PR23, and the
-PR3R `CallVariant` redesign have shipped. The old project plan contains 13
+PR3R `CallVariant` redesign have shipped. PR29 was added later as an unplanned
+corrective prerequisite for the remaining metrics/storage roadmap. The old project plan contains 13
 unshipped PRs: PR6, PR11, PR13–22, and PR24.
 
 The roadmap below preserves those PR identifiers, revises overlapping scopes
@@ -33,6 +34,26 @@ implementation sequence rather than numerical PR order.
   integration explicitly translates them at its own boundary.
 
 ## Recently shipped
+
+### PR29 — Corrective metrics identity and history partitioning
+
+**Shipped:** Replaced display-name metrics and health identity with required,
+stable `provider_id`; allowed duplicate display names; required an explicit
+router `metrics_scope`; and partitioned scoring history by scope, provider ID,
+model, protocol, and caller-declared `CallType`.
+
+`HistoryScope.CURRENT` reads the router's scope by default, while explicit
+`HistoryScope.ALL` combines otherwise matching partitions across scopes.
+Streaming telemetry now separates declared `call_type` from observed
+`stream_opened`, preserving NULL TTFT when no first chunk arrives. The policy
+automatically selects the invocation call type instead of exposing a separate
+`use_streaming` setting.
+
+The complete PR29 `provider_attempts` schema is created only for an absent
+table. Incompatible existing tables are detected read-only and left untouched;
+there is no automatic migration, backfill, deletion, or replacement. The
+nullable `request_size_bucket` field is reserved now and remains NULL for
+router-produced events until PR11.
 
 ### PR12 — OpenAI Responses API adapter
 
@@ -72,6 +93,12 @@ before dispatch to classify requests into broad size buckets. Aggregation and
 score-based routing can then compare providers within the relevant bucket
 instead of blending small and large prompts.
 
+PR29 already added nullable `MetricsEvent.request_size_bucket` and the database
+column as a scoped exception to the former “columns arrive with their producer”
+rule. PR11 must populate that existing field and owns estimation, bucket
+values/boundaries, query filtering, aggregation, and bucket-aware scoring. It
+must not add or migrate the column again.
+
 ### 3. PR26 — Configurable sticky routing
 
 **Summary:** Allow users to opt into retaining a successful provider for future
@@ -100,6 +127,8 @@ databases.
 Add explicit schema migrations, remote connection handling, and reporting
 queries while preserving storage-neutral public protocols. Database engines,
 sessions, and raw SQL rows remain private implementation details.
+Start from PR29's exact-schema/no-modification behavior; any future migration
+must be explicitly versioned rather than reviving implicit check-and-ALTER.
 
 ### 6. PR22 — Pre-flight `CallVariant` validation
 
@@ -228,6 +257,8 @@ must import the router rather than the router importing LangChain.
   adapters are not required to collect token metrics.
 - PR11 follows PR24 so latency can be calibrated using observed token counts
   while still supporting pre-dispatch estimates.
+- PR29 is the shipped prerequisite for all remaining metrics/shared-storage
+  work; later PRs preserve its scope and provider-partition identity.
 - PR22 and PR21 follow PR13 in the implementation sequence.
 - PR13, PR25, and PR14 form a staged persistence path: storage foundation,
   durable local health, then true shared organizational state.

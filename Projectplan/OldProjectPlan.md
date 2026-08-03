@@ -37,6 +37,17 @@ not survive contact with PR 4 -- its schema has since been revised to match
 the redesign, adding backlog entries PR 23 and PR 24; see PR 4's second
 revision note.)
 
+Corrective note (PR29, shipped 2026-08-03): later implementation discovered
+that display-name-only metrics/history and health identity could blend
+unrelated providers in the shared default database. PR29 supersedes the old
+name-identity, unique-name, rename-cold-start, no-per-model-partition,
+`MetricsEvent.stream`, fixed-policy `use_streaming`, and automatic additive
+migration claims below. Current behavior requires stable `provider_id`, an
+explicit `metrics_scope`, and caller-declared `CallType`; score partitions
+also match model and protocol. Duplicate display names are valid. Existing
+incompatible tables are inspected read-only and left untouched. The older PR
+sections remain unchanged as historical descriptions of their own time.
+
 Verified: `ruff check .`, `mypy src` (strict mode), and `pytest` all pass;
 combined coverage across PR1-3 is 93% (branch coverage on), meeting the 90%+
 target set. 
@@ -1502,8 +1513,12 @@ Possible first definition:
 Why this matters:
 A provider may be excellent on small prompts but slow on large prompts. The router should eventually learn this.
 
-Schema: this PR adds the request_size_bucket column to provider_attempts
-(PR 4 ships without it -- additive schema change, per the PR 6 pattern).
+PR29 correction: the nullable `request_size_bucket` field and database column
+already exist and router-produced PR29 events leave them NULL. PR11 must
+populate the existing field and owns estimation, bucket values/boundaries,
+query filtering, aggregation, and bucket-aware scoring; it must not add or
+migrate the column again.
+
 Estimating request size means inspecting CallVariant.arguments -- the same
 kind of narrow, deliberate exception to the "router never interprets
 provider-shaped arguments" principle that PR 21 makes; reuse PR 21's

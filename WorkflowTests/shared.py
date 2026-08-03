@@ -10,16 +10,18 @@ from dotenv import load_dotenv
 
 WORKFLOW_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = WORKFLOW_ROOT.parent
-ROUTER_SRC = PROJECT_ROOT / "ProviderRouterPR1" / "src"
+ROUTER_SRC = PROJECT_ROOT / "ProviderRouter" / "src"
 DATABASE_PATH = WORKFLOW_ROOT / "workflow_history.duckdb"
 DEFAULT_TOPIC = "Why short breaks can help people stay focused"
 LOOKBACK_HOURS = 336.0
+METRICS_SCOPE = "workflow-tests:local"
 
 # Keep the scripts runnable from an IDE without installing the local package.
 sys.path.insert(0, str(ROUTER_SRC))
 
 from nygen_router import (  # noqa: E402
     ApiProtocol,
+    CallType,
     CallVariant,
     DuckDBMetricsStore,
     MetricsEvent,
@@ -45,6 +47,7 @@ class WorkflowOptions:
 @dataclass(frozen=True)
 class RouterResult:
     text: str
+    provider_id: str | None
     provider_name: str | None
     attempts: tuple[MetricsEvent, ...]
 
@@ -74,6 +77,7 @@ def provider_configs() -> list[ProviderConfig]:
     """Return the two provider/model pairs used by UsageTestRoundRobin.py."""
     return [
         ProviderConfig(
+            provider_id="fireworks:gpt-oss-20b",
             name="Fireworks",
             protocol=ApiProtocol.OPENAI_CHAT,
             model="accounts/fireworks/models/gpt-oss-20b",
@@ -81,6 +85,7 @@ def provider_configs() -> list[ProviderConfig]:
             api_key_env="Fireworks_API_KEY",
         ),
         ProviderConfig(
+            provider_id="together:gpt-oss-20b",
             name="TogetherAI",
             protocol=ApiProtocol.OPENAI_CHAT,
             model="OpenAI/gpt-oss-20B",
@@ -99,7 +104,9 @@ def require_api_keys(providers: list[ProviderConfig]) -> None:
         except MissingApiKeyError as exc:
             errors.append(str(exc))
     if errors:
-        raise RuntimeError("Provider API key configuration is incomplete:\n- " + "\n- ".join(errors))
+        raise RuntimeError(
+            "Provider API key configuration is incomplete:\n- " + "\n- ".join(errors)
+        )
 
 
 def open_metrics_store(*, reset_history: bool) -> DuckDBMetricsStore:
@@ -122,10 +129,10 @@ def score_based_router(
 ) -> ProviderRouter:
     return ProviderRouter(
         providers=providers,
+        metrics_scope=METRICS_SCOPE,
         policy=ScoreBasedPolicy(
             weights=SCORE_WEIGHTS,
             lookback_hours=LOOKBACK_HOURS,
-            use_streaming=False,
         ),
         metrics_store=store,
     )
@@ -140,10 +147,13 @@ def run_calibration(
     """Give each provider two chances to lead before score-based routing starts."""
     router = ProviderRouter(
         providers=providers,
+        metrics_scope=METRICS_SCOPE,
         policy=RoundRobinPolicy(),
         metrics_store=store,
     )
-    print(f"\nCalibration: {rounds} round-robin rounds ({rounds * len(providers)} calls)")
+    print(
+        f"\nCalibration: {rounds} round-robin rounds ({rounds * len(providers)} calls)"
+    )
     for round_number in range(1, rounds + 1):
         for call_number in range(1, len(providers) + 1):
             invoke_regular(
@@ -175,6 +185,7 @@ def invoke_regular(
                 CallVariant(
                     protocol=ApiProtocol.OPENAI_CHAT,
                     operation="chat.completions.create",
+                    call_type=CallType.REGULAR,
                     arguments={
                         "messages": [{"role": "user", "content": prompt}],
                         "max_tokens": max_tokens,
@@ -195,9 +206,11 @@ def invoke_regular(
         content = ""
 
     successful = [event for event in attempts if event.success]
+    provider_id = successful[-1].provider_id if successful else None
     provider_name = successful[-1].provider_name if successful else None
     return RouterResult(
         text=content.strip(),
+        provider_id=provider_id,
         provider_name=provider_name,
         attempts=tuple(attempts),
     )
@@ -210,8 +223,8 @@ def print_score_snapshot(
     heading: str,
 ) -> None:
     since = datetime.now(UTC) - timedelta(hours=LOOKBACK_HOURS)
-    events = store.query_recent(since=since)
-    stats_by_provider = aggregate_stats(events, [provider.name for provider in providers])
+    events = store.query_recent(since=since, metrics_scope=METRICS_SCOPE)
+    stats_by_provider = aggregate_stats(events, providers, CallType.REGULAR)
 
     print(f"\n{heading}")
     print(
@@ -219,10 +232,14 @@ def print_score_snapshot(
         "success score  speed score  total"
     )
     for provider in providers:
-        stats = stats_by_provider[provider.name]
-        score = calculate_provider_score(stats, SCORE_WEIGHTS, use_streaming=False)
+        stats = stats_by_provider[provider.provider_id]
+        score = calculate_provider_score(
+            stats, SCORE_WEIGHTS, call_type=CallType.REGULAR
+        )
         success_rate = (
-            "n/a" if stats.regular_success_rate is None else f"{stats.regular_success_rate:.1%}"
+            "n/a"
+            if stats.regular_success_rate is None
+            else f"{stats.regular_success_rate:.1%}"
         )
         latency = (
             "n/a"
@@ -239,7 +256,7 @@ def print_score_snapshot(
 
 def _events_since(store: DuckDBMetricsStore, since: datetime) -> list[MetricsEvent]:
     try:
-        return store.query_recent(since=since)
+        return store.query_recent(since=since, metrics_scope=METRICS_SCOPE)
     except Exception as exc:
         print(f"Could not read diagnostics from DuckDB: {exc}")
         return []
@@ -251,6 +268,12 @@ def _print_attempts(label: str, attempts: list[MetricsEvent]) -> None:
         print("  No persisted provider attempt was found.")
         return
     for event in attempts:
-        outcome = "success" if event.success else f"failed ({event.error_type or 'unknown'})"
+        outcome = (
+            "success" if event.success else f"failed ({event.error_type or 'unknown'})"
+        )
         latency = "n/a" if event.latency_ms is None else f"{event.latency_ms:.0f} ms"
-        print(f"  {event.provider_name}: {outcome}, latency={latency}, stream={event.stream}")
+        print(
+            f"  {event.provider_name} ({event.provider_id}): {outcome}, "
+            f"latency={latency}, call_type={event.call_type.value}, "
+            f"stream_opened={event.stream_opened}"
+        )
