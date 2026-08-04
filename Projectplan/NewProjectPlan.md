@@ -274,6 +274,42 @@ sessions, and raw SQL rows remain private implementation details.
 Start from PR29's exact-schema/no-modification behavior; any future migration
 must be explicitly versioned rather than reviving implicit check-and-ALTER.
 
+The storage foundation must preserve the router's lightweight and transparent
+runtime contract:
+
+- `MetricsStore` remains the boundary used by the router and routing policies;
+  database drivers, SQL toolkits/ORMs, connections, sessions, and row models do
+  not enter core APIs or the `MetricsEvent` domain model.
+- DuckDB remains the zero-configuration local default and the native SQLite
+  store remains the standard-library alternative. A database toolkit/ORM and
+  every remote database driver must be optional, backend-specific dependencies
+  that are imported only when that backend is selected.
+- One router uses the one store supplied at construction. The storage layer
+  does not silently switch backends, mirror or dual-write events, or copy
+  history between local and remote databases. Cross-backend data import/export
+  is a separate, explicitly requested feature.
+- A new local database may still create its current schema on first use. A
+  managed/remote database is provisioned and upgraded through explicit,
+  versioned deployment migrations; ordinary router startup must not acquire
+  schema-owner privileges or silently alter a production database.
+- A selected backend verifies schema compatibility and reports actionable
+  errors without deleting or rewriting user data. Router-owned storage reads
+  and writes remain best-effort: failures and bounded timeouts degrade to the
+  documented non-metrics routing behavior and never replace a provider result.
+- Remote stores define connection ownership, pooling, SSL, connect/statement
+  timeouts, and idempotent cleanup explicitly. Credentials and bound values
+  must not appear in logs or error messages.
+- Every bundled backend runs the shared `MetricsStore` conformance suite,
+  including field-for-field event round trips, query filters, UTC timestamps,
+  ordering, schema compatibility, cleanup, and safe failure behavior. A remote
+  backend additionally receives real-engine integration coverage in CI.
+
+Migration tooling may be an optional deployment/admin extra, but schema
+compatibility is not optional for a backend that is selected. SQLAlchemy Core,
+a full ORM, or another toolkit is an internal implementation choice rather
+than a public architectural requirement; choose the smallest abstraction that
+meets the concrete multi-database need and keep it out of lightweight installs.
+
 ### 2. PR22 — Pre-flight `CallVariant` validation
 
 **Summary:** Validate operations and arguments before attempting a provider.
@@ -302,15 +338,39 @@ implementation. This first stage promises durable state on one installation,
 not organization-wide coordination, and storage failures continue to degrade
 safely to in-memory health.
 
-### 5. PR14 — Postgres/Supabase organizational state
+### 5. PR14 — PostgreSQL organizational state (including Supabase)
 
 **Summary:** Share metrics and health across applications within an
 organization.
 
-Implement Postgres/Supabase backends for both metrics and provider-health state
-using the interfaces established by PR13 and PR25. DuckDB remains the local
-default; Postgres/Supabase provides the actual multi-application organizational
-store.
+Implement PostgreSQL backends for both metrics and provider-health state using
+the interfaces established by PR13 and PR25. DuckDB remains the local default;
+PostgreSQL provides the actual multi-application organizational store, with
+Supabase as the initial managed deployment target.
+
+Here, **Postgres** is the common short name for **PostgreSQL**, a specific
+client/server relational database system; it is not a generic name for SQL
+databases and is not middleware. **Supabase** is a managed platform whose
+database is PostgreSQL, so the initial global metrics backend is a public,
+optional `PostgresMetricsStore` that connects through the standard PostgreSQL
+protocol and works with Supabase as well as other conventional PostgreSQL
+deployments. It must not require the Supabase Data API or Supabase client SDK.
+
+`PostgresMetricsStore` preserves the existing `MetricsStore` event and query
+semantics, uses PR13's explicit schema versions, and keeps any SQL toolkit,
+PostgreSQL driver, engine, pool, and row representation private. PostgreSQL
+support is installed through an explicit extra and selected through
+`metrics_store=`; merely importing or using the local router must not load its
+dependencies. Direct and pooled connection modes, SSL, bounded timeouts,
+least-privilege runtime access, and the extra network latency of score-history
+reads and per-attempt writes must be documented and tested.
+
+Selecting the global store does not synchronize an existing DuckDB or SQLite
+file. It begins from the history already present in the selected PostgreSQL
+database, and missing/unavailable history continues to use the routing
+policy's documented tie-break behavior. Any future caching, background writes,
+rollups, retention, or local-to-global replication requires separate explicit
+semantics because each changes freshness, durability, or routing latency.
 
 ### 6. PR15 — Routing profiles
 
@@ -422,8 +482,9 @@ not obvious from the numbered roadmap alone.
 These statements capture the current roadmap's operating assumptions and should
 be revisited when evidence or a dedicated PR changes them.
 
-- DuckDB provides local durability only; Postgres/Supabase provides
-  organization-wide sharing.
+- DuckDB provides local durability only; PostgreSQL provides the shared
+  client/server database, while Supabase is one managed PostgreSQL deployment
+  option rather than a separate database abstraction layer.
 - Any future usage or cost input is explicit and preserves the raw-response
   identity contract.
 - `StickyRoutingPolicy` is configurable and opt-in. It supplies fixed provider
