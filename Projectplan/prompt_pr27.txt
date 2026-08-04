@@ -1,0 +1,951 @@
+# Execution prompt: PR27 — Configurable same-provider retry policy
+
+You are implementing **PR27 — Configurable same-provider retry policy** in the
+existing `nygen-router` repository.
+
+This is an implementation task, not a design task. The specification below is
+the approved result of a requirements interview. Implement it as written. Do
+not reopen settled choices such as making retries default-on, adding retry
+settings to sticky routing, making categories user-configurable, adding
+backoff, or retrying an already-open stream.
+
+Work in the existing repository and package at `ProviderRouter/`. Do not create
+a sibling project. Treat current source and tests as the primary description of
+shipped behavior. Use `Projectplan/NewProjectPlan.md` next and
+`Projectplan/OldProjectPlan.md` for historical rationale. Where older planning
+material conflicts with this approved PR27 prompt, this prompt takes
+precedence for PR27.
+
+PR27 adds an optional router execution policy. It does not replace or extend
+the existing provider-ordering `Policy` protocol. Keep the two concepts and
+their public constructor arguments separate:
+
+```python
+router = ProviderRouter(
+    providers=providers,
+    metrics_scope="my-app",
+    policy=StickyRoutingPolicy(
+        sticky_provider_ids=["provider-a"],
+        fallback_policy=ScoreBasedPolicy(),
+    ),
+    retry_policy=SameProviderRetryPolicy(),
+)
+```
+
+Omitting `retry_policy`, or passing `None`, must preserve the exact current
+behavior: no router-controlled same-provider retry. Provider SDK retries remain
+disabled.
+
+## Required preliminary inspection
+
+Before changing anything, inspect the repository rather than assuming paths,
+commands, tags, working-tree state, or implementation details.
+
+Read in full:
+
+- root `AGENTS.md`;
+- `ProviderRouter/AGENTS.md`;
+- this approved prompt;
+- the PR27 section, shipped PR26 section, boundary decisions, and assumptions
+  in `Projectplan/NewProjectPlan.md`;
+- relevant PR3, PR5, and PR23 rationale in
+  `Projectplan/OldProjectPlan.md`, especially one-attempt-per-ordered-provider,
+  health thresholds, cooldowns, fallback, stream restart, deferred
+  `Retry-After`, and per-call attempt-cap passages;
+- `Projectplan/prompt_pr26.txt`, because its shipped fixed-preference contract
+  is the direct composition boundary for PR27;
+- existing execution prompts to preserve repository conventions;
+- root and package READMEs plus routing examples; and
+- `ProviderRouter/pyproject.toml` and root `requirements-dev.txt` before
+  selecting validation commands.
+
+Inspect these implementation areas and their tests:
+
+- `ProviderRouter/src/nygen_router/router.py` in full, including
+  `ProviderRouter.__init__`, `invoke`, `_STOP_CATEGORIES`, attempt recording,
+  health helpers, metrics helpers, `RouterStream`, and the default adapter
+  factory;
+- `ProviderRouter/src/nygen_router/errors.py`, including every provider error,
+  `ErrorCategory`, `categorize_error`, Responses error-code classification, and
+  `RouterExhaustedError`;
+- `ProviderRouter/src/nygen_router/health.py` and `filters.py`;
+- `ProviderRouter/src/nygen_router/types.py` and `config.py`;
+- `ProviderRouter/src/nygen_router/policies/base.py`, `round_robin.py`,
+  `score_based.py`, and shipped `sticky.py`;
+- package exports in `ProviderRouter/src/nygen_router/__init__.py` and
+  `policies/__init__.py`;
+- `ProviderRouter/src/nygen_router/adapters/base.py`,
+  `openai_compatible.py`, and `openai_responses.py`;
+- metrics, aggregation, scoring, and all storage implementations;
+- fallback, health, metrics, score-based, mixed-protocol, streaming, adapter,
+  and PR26 tests under `ProviderRouter/tests/`; and
+- Git status, recent history, and existing `pr27-*` tags.
+
+Confirm the shipped architecture before implementing:
+
+- `invoke()` validates `CallVariant`s, applies hard filters, calls the selected
+  provider-ordering policy exactly once, and consumes its finite ordered result.
+- Normal `RoundRobinPolicy`, `ScoreBasedPolicy`, and `StickyRoutingPolicy`
+  output each eligible provider once. Supported custom policies may omit
+  providers or return duplicates.
+- A current "retryable" error means cross-provider fallback is allowed. It
+  does **not** mean the same provider is called again.
+- `HealthConfig.failure_threshold=3` is a circuit-breaker threshold across
+  physical provider attempts. It is not a retry budget.
+- Health is canonical by `provider_id`. A success resets that provider's
+  counted failures. A 429 immediately starts cooldown without incrementing the
+  count. Authentication benches for the run. STOP failures do not touch
+  health.
+- Every physical provider attempt is independently represented in health,
+  metrics, and exhaustion diagnostics.
+- `OpenAICompatibleAdapter` constructs the SDK client with `max_retries=0`.
+  Keep that setting. Router-controlled retry must remain observable to router
+  health, metrics, limits, and errors.
+- `CallVariant.arguments` is opaque. The router makes only the existing fresh
+  top-level copy and model injection; it never infers idempotency, tools,
+  side effects, stored/background work, or retry safety.
+- A regular attempt succeeds when `adapter.invoke()` returns. A streaming
+  attempt is not successful merely because `adapter.invoke()` returned a
+  `NormalizedStream`; its outcome is recorded during iteration.
+- Once a `NormalizedStream` exists, `RouterStream` exclusively owns existing
+  restart/raise behavior, metrics, health, callbacks, and raw chunk delivery.
+- `router.py` remains entirely SDK-free and core imports remain lightweight.
+- `MetricsStore`, schemas, aggregation, and scoring contracts are already
+  pinned and must not be expanded for retry metadata.
+
+## Approved public API
+
+### Separate retry module
+
+Implement the retry API in a new core module:
+
+`ProviderRouter/src/nygen_router/retry.py`
+
+Do not put it in `nygen_router.policies`: that package is for provider ordering.
+The new module must use only lightweight core/stdlib imports.
+
+Export these public names from `nygen_router`:
+
+- `RetryPolicy`;
+- `RetryContext`;
+- `RetryProviderScope`;
+- `SameProviderRetryPolicy`; and
+- `ErrorCategory`, because it becomes part of the public `RetryContext`
+  contract rather than remaining purely internal.
+
+Update `ErrorCategory`'s documentation accordingly. Do not change its values or
+existing classification behavior.
+
+### Router constructor
+
+Add this optional constructor parameter without renaming or moving the existing
+`policy` parameter:
+
+```python
+retry_policy: RetryPolicy | None = None
+```
+
+Place it where it preserves existing positional and keyword compatibility as
+far as the current signature permits. Omission and explicit `None` both mean
+no same-provider retry. Do not introduce a sentinel: unlike metrics storage,
+there is no semantic distinction between omitted and `None` here.
+
+Do not add:
+
+- `routing_policy=` as an alias or rename;
+- retry settings to `StickyRoutingPolicy`;
+- a per-call `invoke(..., retry_policy=...)` override;
+- a raw mapping form; or
+- implicit enablement through any current or future factory.
+
+Selecting a router-level retry policy is the caller's blanket acceptance of
+replay risk for every invocation made through that router. This must be
+prominent in public documentation.
+
+### RetryProviderScope
+
+Add a public `StrEnum`:
+
+```python
+class RetryProviderScope(StrEnum):
+    FIRST = "first"
+    ALL = "all"
+    SELECTED = "selected"
+```
+
+Meanings:
+
+- `FIRST`: only the first provider in the already-computed provider-ordering
+  result receives explicit PR27 retries. This is the default. With
+  `ScoreBasedPolicy`, only the highest-scoring provider gets extra attempts.
+  With `StickyRoutingPolicy`, only the first eligible configured sticky
+  provider gets them.
+- `ALL`: every distinct eligible provider ID actually reached in the ordered
+  result may receive one retry cycle.
+- `SELECTED`: only configured canonical provider IDs may receive a retry cycle
+  when they are actually reached.
+
+"All" never means bypassing filters or adding providers. A disabled, keyless,
+protocol-mismatched, unsupported, auth-benched, or cooling-down provider is
+absent before retry targeting. A provider omitted by a custom ordering policy
+is never introduced by PR27.
+
+### SameProviderRetryPolicy
+
+Use this public construction shape:
+
+```python
+SameProviderRetryPolicy(
+    *,
+    max_attempts: int = 3,
+    provider_scope: RetryProviderScope = RetryProviderScope.FIRST,
+    provider_ids: list[str] | None = None,
+)
+```
+
+The compact recommended form is simply:
+
+```python
+retry_policy=SameProviderRetryPolicy()
+```
+
+Configuration rules:
+
+- `max_attempts` means total physical attempts for one targeted provider's
+  retry cycle, including its initial ordered attempt. The default `3` therefore
+  means one initial attempt plus at most two retries. Never describe it as
+  "three retries".
+- Reject booleans and non-integers with `ConfigError`.
+- Reject values below `2` with `ConfigError`; callers wanting zero retry omit
+  the policy or pass `None`.
+- The supported maximum is `8` total attempts per targeted provider.
+- A value above `8` must **not** fail construction. Clamp the effective stored
+  value to `8`, emit exactly one standard Python `UserWarning` at the
+  configuration boundary naming both requested and effective values, and
+  proceed. Use an appropriate `stacklevel` so the warning points to caller
+  configuration.
+- The policy's public/read-only `max_attempts` exposes the effective value, so
+  a built-in policy constructed with `12` reports `8`.
+- Accept `RetryProviderScope` values and matching string values through a clear
+  normalization path; invalid values raise `ConfigError`, not a bare
+  `ValueError`.
+- `FIRST` and `ALL` require `provider_ids is None`; reject a supplied list as a
+  contradictory configuration rather than silently ignoring it.
+- `SELECTED` requires `provider_ids` to be an actual nonempty `list[str]`.
+- Trim selected IDs, reject non-strings, blanks, and duplicates after trimming,
+  and keep a defensive copy.
+- Selected identities are canonical `provider_id` values, never display names.
+- At `ProviderRouter` construction, validate every selected ID against the
+  complete configured provider-ID set and report all unknown IDs in one
+  `ConfigError`. A known but currently disabled or unhealthy ID remains valid
+  configuration; runtime filters decide whether it is attempted.
+
+The built-in object stores immutable/read-only normalized configuration and no
+attempt counters or learned outcome state.
+
+## Public RetryPolicy contract
+
+Define a runtime-checkable only if repository conventions genuinely require
+it; ordinary structural `Protocol` behavior is sufficient otherwise. The
+protocol must be public and usable by custom implementations without importing
+provider SDKs.
+
+Use this semantic contract:
+
+- every policy exposes a finite `max_attempts: int` ceiling;
+- after an eligible failed physical attempt, the router supplies an immutable
+  `RetryContext` and asks the policy whether the same provider should be tried
+  again;
+- the router, not the policy, owns counters, adapters, calls, health, metrics,
+  ordered fallback state, and enforcement of the effective ceiling; and
+- the policy decision is a strict boolean. A custom implementation returning a
+  non-boolean raises `ConfigError` rather than being interpreted by truthiness.
+
+The protocol should be equivalent to:
+
+```python
+class RetryPolicy(Protocol):
+    @property
+    def max_attempts(self) -> int: ...
+
+    def should_retry(self, context: RetryContext) -> bool: ...
+```
+
+The implementing session may use a read-only attribute rather than a property
+if strict typing and immutability remain clear, but do not broaden the protocol
+beyond these responsibilities.
+
+At `ProviderRouter` construction, validate a custom policy's `max_attempts`
+with the same rules:
+
+- bool/non-int or below `2` raises `ConfigError`;
+- above `8` emits one `UserWarning` and the router stores/enforces effective
+  ceiling `8` without trying to mutate the foreign policy object.
+
+Cache the validated effective ceiling on the router so a mutable custom policy
+cannot change the bound during an invocation. A custom policy may return
+`False` before the ceiling, but can never make the router exceed it.
+
+Custom policy exceptions propagate unchanged after the failed physical
+provider attempt has been honestly recorded. Do not disguise them as provider
+errors or add them to `RouterExhaustedError.attempts`.
+
+### RetryContext
+
+Implement `RetryContext` as a frozen dataclass carrying only the information a
+custom policy needs to make a decision, without exposing API keys or live
+router state. Include at least:
+
+```python
+provider_id: str
+provider_name: str
+model: str
+protocol: ApiProtocol
+error: Exception
+category: ErrorCategory
+attempt_number: int
+provider_order_index: int
+is_initial_provider: bool
+call_type: CallType
+stream_opened: bool
+newly_benched: bool
+```
+
+Semantics:
+
+- `attempt_number` is one-based within this provider's explicit retry cycle
+  and names the just-failed physical attempt.
+- `provider_order_index` is the zero-based position of the first occurrence of
+  that provider in the provider-ordering result.
+- `is_initial_provider` is true only for index zero.
+- PR27 consults retry policy only for failures before a `NormalizedStream` is
+  returned, so `stream_opened` is false in every PR27 consultation. Keep it
+  explicit to make the safety boundary visible to custom implementations.
+- `newly_benched` reports the real transition caused by the just-failed
+  attempt. The router never permits another retry when it is true.
+- `error` is the exact router/provider error already recorded for the attempt,
+  never a summary or rewrapped copy.
+
+Do not include `ProviderConfig` itself in the context because it may contain an
+API key. Do not include mutable health state, the adapter, native arguments,
+metrics stores, or the remaining provider list.
+
+## Built-in retry decision
+
+`SameProviderRetryPolicy` has a fixed category set:
+
+```python
+frozenset(
+    {
+        ErrorCategory.TIMEOUT,
+        ErrorCategory.CONNECTION,
+        ErrorCategory.SERVER_ERROR,
+    }
+)
+```
+
+There is no `retryable_categories` parameter. The fixed categories already
+cover:
+
+- SDK/transport timeouts plus HTTP 408 and typed Responses timeout codes;
+- SDK/transport connection failures; and
+- HTTP 5xx plus typed Responses server-error codes.
+
+The built-in returns true only when all of these hold:
+
+- the category is in its fixed set;
+- the provider is targeted by `FIRST`, `ALL`, or `SELECTED`;
+- the just-failed attempt number is below effective `max_attempts`;
+- no health bench was started; and
+- no stream was opened.
+
+The router independently enforces the same hard safety gates and ceiling so a
+custom policy cannot bypass them.
+
+## Router-owned hard retry gates
+
+Never consult or honor same-provider retry for:
+
+- `ErrorCategory.BAD_REQUEST`;
+- `ErrorCategory.INVALID_OPERATION`;
+- `ErrorCategory.AUTH`;
+- `ErrorCategory.RATE_LIMIT`;
+- a failure that started a provider bench;
+- an attempt that reached the effective `max_attempts` ceiling; or
+- any failure after a `NormalizedStream` was returned.
+
+BAD_REQUEST and INVALID_OPERATION retain the current global STOP rule. AUTH and
+RATE_LIMIT retain their immediate bench plus normal cross-provider fallback.
+The ordered fallback loop remains otherwise unchanged.
+
+A custom `RetryPolicy` may choose to retry a pre-open `UNKNOWN` failure if it
+explicitly returns true; selecting a custom policy is a trusted extension
+point and carries the same documented replay risks. It still cannot override
+the gates above. `STREAM_INTERRUPTED` occurs only after stream open and is
+therefore structurally outside PR27 retry consultation.
+
+## Targeting and custom provider-order results
+
+Apply explicit retry cycles by distinct canonical provider ID per invocation:
+
+- `FIRST` targets only the provider ID at ordered index zero.
+- `ALL` may target the first reached occurrence of every distinct provider ID.
+- `SELECTED` may target the first reached occurrence of each selected provider
+  ID.
+
+Preserve deliberate duplicate providers returned by a custom ordering policy
+as existing base attempts, but do not grant a fresh PR27 retry cycle to every
+duplicate occurrence. Once a provider ID has used or bypassed its explicit
+retry cycle, later deliberate occurrences remain single existing ordered
+attempts. PR27 must not remove, deduplicate, reorder, or add those occurrences.
+
+This rule keeps PR27's added work bounded per provider while preserving the
+current trust-based custom ordering-policy contract.
+
+The provider-ordering policy is called exactly once. Retry execution must not
+recompute scores, advance round-robin state, refresh sticky ordering, rewind
+the provider list, or introduce an omitted provider.
+
+## Regular invocation algorithm
+
+Extend the existing regular/pre-open fallback loop without replacing it with a
+provider SDK retry mechanism.
+
+For each ordered provider occurrence:
+
+1. Decide whether this is the provider ID's first reached occurrence and
+   whether its scope makes it eligible for one explicit retry cycle.
+2. Construct the provider adapter once for that ordered occurrence. Reuse that
+   adapter object for physical retries in the cycle. A later deliberate
+   duplicate occurrence receives the existing fresh factory call.
+3. Before every physical adapter invocation, build a fresh top-level arguments
+   dict from the original `CallVariant` and inject the current provider model.
+   Never reuse an arguments dict a custom adapter may have mutated.
+4. Measure each physical invocation independently.
+5. On failure, append one `ProviderAttempt`, record one `MetricsEvent`, and
+   apply one health transition before considering retry.
+6. Preserve the exact failure object and category.
+7. Stop the whole run for a STOP category.
+8. Otherwise, if a router-owned hard gate prevents retry, continue to the next
+   ordered provider occurrence.
+9. If the provider is not targeted or has already had its explicit retry
+   cycle, continue normally.
+10. Build the frozen `RetryContext`, call `should_retry`, validate the exact
+    bool result, and retry immediately only when true and below the effective
+    ceiling.
+11. On physical success, use the existing success helper once for that
+    physical attempt and return the exact raw response.
+
+Do not sleep between attempts. Do not add jitter, exponential/fixed backoff,
+`Retry-After`, a sleeper seam, total-duration retry budget, or cancellation
+logic.
+
+## Health behavior
+
+Every physical attempt is a real health observation:
+
+- each failed retry in TIMEOUT, CONNECTION, SERVER_ERROR, UNKNOWN, or another
+  existing counted category increments `consecutive_failures` normally;
+- a successful retry invokes the existing success transition and resets the
+  provider's counted failure/cooldown state exactly like any other success;
+- a failure that reaches `HealthConfig.failure_threshold` starts cooldown and
+  immediately ends that provider's remaining explicit retry cycle;
+- an existing count is respected, so a provider beginning at count two may be
+  benched by the first physical failure and receive no retry despite a larger
+  configured ceiling;
+- rate limit and authentication remain immediate benches and never receive
+  same-provider retry; and
+- STOP failures remain health-neutral.
+
+Update internal helper return values narrowly so the invocation loop can see
+both the category and whether the just-recorded failure started a bench. Keep
+classification, metrics recording, and health transition logic single-copy and
+shared with `RouterStream`; do not duplicate those rules inside retry policy.
+
+The existing rule that a bench taken mid-invocation does not rebuild or
+truncate the already-computed cross-provider list remains intact. PR27 adds the
+narrower rule that the newly benched provider receives no further explicit
+same-provider retries. Do not use PR27 to redesign deliberate duplicate entries
+later in a custom policy's already-computed list.
+
+## Metrics, scoring, and errors
+
+Every physical attempt remains independently observable under existing
+contracts:
+
+- a failed first attempt followed by successful retry records failure then
+  success;
+- two failed retries followed by cross-provider success record all physical
+  outcomes in order;
+- storage failure around any attempt remains isolated and cannot invalidate a
+  later successful native provider response;
+- `RouterExhaustedError.attempts` preserves repeated provider IDs and exact
+  unwrapped error objects in physical order; and
+- latency/duration fields retain their current per-attempt meanings.
+
+Do not add:
+
+- retry IDs, invocation IDs, attempt ordinals, or retry flags to
+  `MetricsEvent`;
+- any `MetricsStore` method or schema column;
+- retry-aware aggregation, deduplication, weighting, or scoring branches; or
+- attributes on successful provider responses.
+
+Repeated failures and a later success naturally affect existing aggregation
+and score history as multiple real observations. That consequence is approved.
+
+Preserve error transparency. Do not re-message or replace provider errors. If
+a STOP error occurs on a later physical retry, it stops globally like the same
+error on an initial attempt. Custom retry-policy errors propagate unchanged
+after the provider attempt itself has been recorded.
+
+## Streaming behavior
+
+PR27 supports same-provider retry for a declared streaming call only when
+`adapter.invoke()` raises before returning a `NormalizedStream`.
+
+Such a physical attempt records the existing streaming pre-open fields:
+
+- `stream_opened=False`;
+- `latency_ms=None`;
+- `total_duration_ms` covering that physical pre-open attempt; and
+- the existing categorized error.
+
+If the error is eligible and all gates permit it, retry the same provider using
+the regular/pre-open loop and a fresh arguments dict.
+
+The moment an adapter returns a `NormalizedStream`, PR27 retry responsibility
+ends for that provider and invocation. Return `RouterStream` with the same
+remaining ordered provider tail as today. Do not pass retry counters or retry
+policy into `RouterStream`.
+
+After stream open, including a zero-chunk stream:
+
+- perform no same-provider PR27 retry;
+- `StreamFailurePolicy.RESTART` continues to the next provider in the existing
+  remaining list;
+- `StreamFailurePolicy.RAISE` raises the real failure;
+- `STREAM_INTERRUPTED` retains existing health/fallback semantics;
+- restart callbacks and warnings retain their current meaning;
+- `RouterStream.restarts`, TTFT, total duration, usage, completion detection,
+  `close()`, early break, and chunk-discard behavior remain unchanged; and
+- raw native chunks are never buffered, altered, concatenated, or replaced.
+
+Do not add a third stream-failure mode or reinterpret `StreamRestart` so the
+next provider can equal the failed provider. Same-provider retry never occurs
+inside `RouterStream` in PR27.
+
+## Replay-safety disclosure
+
+The implementation and documentation must say plainly:
+
+- the router cannot determine whether a native request is safe to replay;
+- a timeout or connection failure does not prove the provider failed to
+  receive or process the request;
+- retries can duplicate provider work, tool side effects, stored/background
+  operations, charges, or other non-idempotent behavior;
+- `CallVariant.arguments` remains opaque and is never inspected for tools,
+  idempotency keys, response IDs, or safety;
+- caller-supplied provider-native idempotency mechanisms pass through unchanged
+  but are neither created nor verified by the router;
+- selecting `retry_policy` is explicit router-wide acceptance of those risks;
+  and
+- applications needing different retry safety for different calls should use
+  separate router instances or their own carefully scoped custom setup because
+  PR27 adds no per-call override.
+
+Do not claim that TIMEOUT, CONNECTION, or SERVER_ERROR is inherently safe to
+replay. They are the built-in transient candidates, not an idempotency
+guarantee.
+
+## State, concurrency, and lifecycle
+
+Retry counters are local variables/state owned by one `invoke()` execution.
+They never live on `SameProviderRetryPolicy`, in provider health, in metrics
+storage, or in a new persistent store.
+
+`SameProviderRetryPolicy` stores only normalized immutable/read-only
+configuration:
+
+- effective `max_attempts`;
+- provider scope; and
+- an immutable defensive representation of selected provider IDs.
+
+It is safe to reuse one built-in policy across concurrent synchronous calls and
+across routers. Each invocation computes its own provider targets, used IDs,
+attempt numbers, and effective decisions. Add no locks or global counters.
+
+A custom retry policy may hold state, but its thread safety is its author's
+responsibility. The router still owns and isolates attempt counters and the
+hard ceiling. Document this distinction.
+
+Async support, process-shared retry counters, distributed coordination,
+persistence, durable budgets, and background schedulers are out of scope.
+
+## Policy composition
+
+The approved composition is:
+
+```text
+CallVariant validation
+    -> hard eligibility and health filtering
+    -> provider-ordering Policy.order(...) exactly once
+       (RoundRobin / ScoreBased / Sticky / custom)
+    -> attempt current ordered provider
+    -> optional bounded same-provider RetryPolicy decisions
+    -> next provider in the already-computed order
+    -> existing exhaustion behavior
+```
+
+Verify explicitly:
+
+- default round robin with no retry policy is unchanged;
+- score-based `FIRST` retries only the highest-ranked eligible provider;
+- sticky `FIRST` retries only the first eligible fixed-preference provider;
+- sticky fallback success does not rewrite fixed preference;
+- `ALL` gives one cycle to every distinct reached provider ID;
+- `SELECTED` gives one cycle only to reached configured IDs;
+- custom ordering omissions remain omitted;
+- custom ordering duplicates remain as base attempts but do not multiply PR27
+  retry cycles; and
+- ordering policies receive no attempt notifications and are not called again.
+
+Do not alter `RoundRobinPolicy`, `ScoreBasedPolicy`, `StickyRoutingPolicy`,
+`RoutingContext`, or the provider-ordering `Policy` protocol to implement
+PR27.
+
+## Required behavior matrix
+
+Implement and document these scenarios explicitly:
+
+1. **Retry policy omitted:** current routing, metrics, health, streaming, and
+   fallback behavior is unchanged.
+2. **Explicit None:** identical to omission.
+3. **First-attempt success:** no retry-policy consultation; raw response
+   identity is preserved.
+4. **FIRST transient recovery:** first provider fails with an eligible category
+   and succeeds within three total default attempts; fallback is untouched.
+5. **FIRST exhaustion:** first provider uses its allowed cycle, then every
+   fallback provider receives one base attempt.
+6. **Score based:** only the highest-scoring reached provider receives retries
+   under FIRST.
+7. **Sticky:** only the first eligible sticky provider receives retries under
+   FIRST; fixed preference remains unchanged after retry or fallback.
+8. **ALL:** each distinct provider reached may receive its own bounded cycle.
+9. **SELECTED:** only reached selected IDs receive a cycle; unselected providers
+   get one base attempt.
+10. **Selected filtered/omitted:** no attempt and no resurrection.
+11. **Selected validation:** unknown, blank, non-string, or duplicate IDs fail
+    clearly without leaking secrets.
+12. **Default count:** max_attempts=3 means at most three total physical
+    attempts, never four.
+13. **Minimum validation:** below two, bool, and non-int values fail.
+14. **Upper normalization:** eight is accepted; a larger value is clamped to
+    eight with one caller-facing `UserWarning` and no construction failure.
+15. **Built-in categories:** TIMEOUT, CONNECTION, and SERVER_ERROR retry.
+16. **Built-in exclusions:** UNKNOWN and STREAM_INTERRUPTED do not.
+17. **Hard gates:** BAD_REQUEST and INVALID_OPERATION stop globally; AUTH and
+    RATE_LIMIT bench and fall back without same-provider retry.
+18. **Changing categories:** an eligible first failure followed by a hard-gate
+    failure stops retry according to the later real category.
+19. **Health accumulation:** every failed physical attempt increments existing
+    counted health normally.
+20. **Retry success:** the normal success transition resets that provider's
+    counted health state.
+21. **Pre-existing count:** a provider reaching the health threshold on its
+    first physical attempt is benched and receives no retry.
+22. **Threshold during cycle:** a newly started bench immediately ends the
+    remaining cycle and fallback continues.
+23. **Metrics:** one event per physical attempt in exact order, including a
+    successful call after earlier retry failures.
+24. **Storage degradation:** failed metrics writes never invalidate a later
+    successful raw response.
+25. **Exhaustion:** repeated provider IDs and exact errors appear in
+    `RouterExhaustedError.attempts` in physical order.
+26. **Cross protocol:** retries use the current provider's existing native
+    variant/model; fallback then uses the next protocol's own variant/model.
+27. **Arguments:** every physical attempt receives a fresh top-level dict and
+    original caller arguments remain unchanged.
+28. **Adapter factory:** one adapter object per ordered occurrence, reused for
+    that occurrence's physical retries.
+29. **Declared stream pre-open:** eligible adapter failure before returning a
+    stream can retry the same provider.
+30. **Opened stream:** no same-provider retry after `NormalizedStream` return,
+    including zero-chunk and partial streams under both RESTART and RAISE.
+31. **Close/early break:** never creates retry or invented outcome.
+32. **Custom retry policy:** receives accurate frozen context, cannot exceed
+    effective ceiling or hard gates, and invalid boolean decisions fail.
+33. **Custom policy exception:** propagates unchanged after honest recording of
+    the provider failure.
+34. **Custom max above eight:** router warns once and enforces eight without
+    mutating the custom object.
+35. **Custom provider-order duplicates:** existing occurrences remain but only
+    one explicit retry cycle is available per distinct provider ID.
+36. **Concurrency:** one built-in policy shared across simultaneous invocations
+    has isolated counters and deterministic configuration.
+
+For every applicable case, assert adapter call order, physical attempt count,
+health report, metrics event order/fields, returned object/error identity, and
+whether fallback occurred.
+
+## Implementation guidance
+
+Prefer a narrow extension rather than a general attempt-engine rewrite.
+`ProviderRouter.invoke()` and `RouterStream` intentionally have separate thin
+loops because stream outcomes happen during caller iteration. Keep
+`RouterStream` structurally unchanged except for any type-compatible internal
+helper return adjustment required by the shared health-recording code.
+
+Good implementation boundaries are:
+
+- retry configuration/context/protocol in `retry.py`;
+- constructor validation and cached effective bound on `ProviderRouter`;
+- one bounded inner loop around the current pre-open adapter call;
+- one internal failure outcome carrying existing category plus newly-benched
+  state; and
+- existing single-copy metrics/health/success helpers.
+
+Do not introduce provider-specific checks in `router.py`. It should consult
+`ErrorCategory` and the retry protocol only.
+
+Preserve public and internal error chaining. Never catch `BaseException`.
+Never log or render API keys. Avoid exposing the complete `ProviderConfig` to
+retry context.
+
+## Testing requirements
+
+Add new focused files under `ProviderRouter/tests/`, using names such as:
+
+- `test_pr27_retry_policy.py`;
+- `test_pr27_router_behavior.py`; and
+- `test_pr27_streaming.py` if separation improves clarity.
+
+Do not delete existing tests. Update an existing test only if PR27 deliberately
+changes the exact behavior it asserts; default-unused behavior should normally
+leave current tests untouched.
+
+Follow root testing rules strictly:
+
+- no `monkeypatch.setattr` or `unittest.mock.patch` of internal collaborators;
+- no real network calls or API keys;
+- no sleeps;
+- use injected adapter factories, scripted adapters, metrics stores, policies,
+  clocks, streams, and callbacks through public seams;
+- `monkeypatch.setenv` remains allowed only where existing environment behavior
+  is actually under test; and
+- preserve raw response/chunk object identity assertions.
+
+At minimum, tests must cover every behavior-matrix item that applies to runtime
+or public validation. Specifically include:
+
+- omission and explicit None regression tests;
+- root exports and lightweight imports;
+- enum/string normalization;
+- every scope and invalid scope/provider-ID combination;
+- max-attempt default, minimum, exact eight, clamp-and-warning, and custom
+  policy bounds;
+- fixed category matrix and router hard gates;
+- first/score/sticky/all/selected targeting;
+- eligible recovery, exhaustion, fallback, cross-protocol operation/model
+  selection, and changing error categories;
+- per-physical-attempt health and metrics;
+- immediate retry-cycle stop on a new bench;
+- successful retry health reset;
+- storage failure isolation;
+- fresh argument dicts and adapter reuse;
+- repeated attempts in `RouterExhaustedError`;
+- custom retry context, strict bool, exception propagation, and hard-bound
+  enforcement;
+- custom provider-order omissions and duplicates;
+- streaming pre-open retry and no post-open retry under RESTART/RAISE;
+- response and chunk identity;
+- thread-safe built-in policy reuse with per-invocation state isolation; and
+- all existing regression tests continuing to pass.
+
+Inspect `ProviderRouter/pyproject.toml`, root `requirements-dev.txt`, and current
+project practice before choosing commands. Run the repository's full required
+quality suite, including configured Ruff, strict mypy, pytest, branch coverage,
+and lightweight-import checks. Do not merely run focused PR27 tests.
+
+If coverage configuration sets a threshold in the current checkout, meet it.
+Do not weaken coverage, typing, or lint settings to make PR27 pass.
+
+## Documentation and repository synchronization
+
+After runtime code and tests are correct, perform a documentation-only
+synchronization pass. Do not introduce new runtime behavior during that pass.
+
+Review and update where affected:
+
+- root `README.md`;
+- `ProviderRouter/README.md`;
+- root `AGENTS.md` and `ProviderRouter/AGENTS.md`;
+- `Projectplan/NewProjectPlan.md`;
+- public examples and constructor documentation;
+- `UsageTest.py`, `UsageTestRoundRobin.py`, and `WorkflowTests/` only where
+  their guidance is affected;
+- package exports, docstrings, and inline comments; and
+- stale references found by searching for `retry`, `same-provider`,
+  `fallback`, `max_retries`, one-attempt invariants, and PR27.
+
+Required documentation results:
+
+- mark PR27 shipped in the current roadmap and remove it from upcoming work;
+- retain PR26 as shipped fixed provider preference and accurately describe its
+  independent composition with PR27;
+- show omission/default behavior and the recommended
+  `SameProviderRetryPolicy()` construction;
+- show FIRST, ALL, and SELECTED examples;
+- say precisely that max_attempts=3 is three total physical attempts, including
+  the initial attempt;
+- document the clamp-and-`UserWarning` behavior above eight;
+- list the built-in fixed retry categories and all hard exclusions;
+- explain every physical attempt's health, metrics, scoring, and exhaustion
+  consequences;
+- explain that a newly triggered bench ends remaining same-provider retries;
+- distinguish health `failure_threshold` from retry `max_attempts`;
+- document pre-open-only streaming support;
+- prominently disclose replay, duplicate side effect, background/stored work,
+  tool, and billing risks;
+- explain that there is no per-call override and suggest separate router
+  instances when calls need different replay policy;
+- state that provider SDK retries remain disabled;
+- state that there is no delay, backoff, `Retry-After`, async, or persistent
+  retry state;
+- clarify that PR19/PR20 still own general retry logging/observability hooks;
+  the max-attempt configuration warning is a narrow validation signal, not
+  implementation of those PRs; and
+- leave historical planning rationale intact rather than rewriting it as if
+  PR27 had always existed.
+
+Update the OpenAI adapter comment that currently calls cross-provider fallback
+the sole retry path so it accurately describes the new router-controlled path,
+without enabling SDK retries.
+
+Keep `Projectplan/prompt_pr27.txt` as the planning-history copy of this approved
+execution specification.
+
+## Explicit non-goals
+
+PR27 must not:
+
+- enable same-provider retry unless `retry_policy` is explicitly supplied;
+- rename `policy`, add `routing_policy`, or rename the existing `Policy`
+  protocol;
+- make sticky routing own or imply retries;
+- add user-configurable built-in retry categories;
+- retry AUTH, RATE_LIMIT, BAD_REQUEST, or INVALID_OPERATION under any policy;
+- retry inside an opened `RouterStream`;
+- add delay, backoff, jitter, `Retry-After`, a sleeper, or total elapsed-time
+  budget;
+- enable or rely on provider SDK retries;
+- inspect, validate, translate, hash, or infer safety from native arguments;
+- add idempotency keys or claim replay safety;
+- add metrics/store/schema/scoring changes;
+- add retry-specific response wrappers or mutate native results;
+- add affinity state or modify fixed sticky preference;
+- add persistent/distributed retry state, locks, async support, or background
+  workers;
+- implement PR19 logging hooks, PR20 observability hooks, PR21 capability
+  filtering, PR22 pre-flight validation, PR25 durable health, PR13 storage
+  versioning, or unrelated roadmap work; or
+- perform unrelated refactoring.
+
+## Git and tag procedure
+
+Follow repository tag conventions and preserve unrelated work.
+
+Before implementation:
+
+1. Inspect `git status`, recent history, and existing tags.
+2. Understand every pre-existing modification or untracked file. Do not stage,
+   alter, revert, or commit unrelated user work; in particular preserve any
+   pre-existing `.gitignore` change unless the user separately authorizes it.
+3. Confirm this approved prompt exists at `Projectplan/prompt_pr27.txt`.
+4. If the prompt is not yet committed, make a planning-only commit containing
+   it and any explicitly approved PR27 roadmap clarification, without unrelated
+   files, before tagging the implementation start.
+5. Confirm neither `pr27-start` nor `pr27-complete` exists. If either exists,
+   stop and report the conflict; never move, replace, or delete it.
+6. Create local tag `pr27-start` immediately before the first PR27 runtime,
+   test, or implementation-documentation change.
+7. If creating a tag requires an approval prompt, first explain in plain
+   language that permission is needed to write the local Git tag marking the
+   pre-implementation state and why it is required.
+
+During implementation:
+
+- keep changes scoped to PR27;
+- preserve unrelated work;
+- make commits that contain completed PR27 source, tests, this prompt, and
+  synchronized documentation without unrelated changes; and
+- do not push.
+
+At completion:
+
+1. Run every required validation command.
+2. Inspect the final diff against `pr27-start` plus the working tree for
+   unrelated changes.
+3. Confirm the completion commit includes all PR27 source, tests, prompt, and
+   synchronized documentation.
+4. Confirm every completion criterion below is satisfied.
+5. Create local tag `pr27-complete` only then.
+6. Leave both tags ready to push but do not push tags or commits unless the
+   user explicitly instructs it.
+
+## Completion criteria
+
+PR27 is complete only when all of the following are true:
+
+- `retry_policy` is an optional public `ProviderRouter` configuration and
+  omission/None preserves current behavior;
+- the existing `policy` API and all provider-ordering policies remain intact;
+- `RetryPolicy`, `RetryContext`, `RetryProviderScope`,
+  `SameProviderRetryPolicy`, and now-public `ErrorCategory` are exported;
+- the built-in default is exactly three total attempts for the first ordered
+  provider and no retries for fallback providers;
+- ALL and SELECTED targeting work only over eligible providers actually
+  reached in the ordered result;
+- selected provider IDs are strictly validated by canonical identity;
+- max attempts validate below two, accept eight, and clamp larger values to
+  eight with exactly one useful `UserWarning`;
+- the router independently enforces the effective bound for custom policies;
+- built-in retry categories are exactly TIMEOUT, CONNECTION, and SERVER_ERROR;
+- hard gates cannot be bypassed by custom policies;
+- every physical attempt independently updates health, metrics, latency, and
+  exhaustion diagnostics;
+- successful retry resets health through the existing success transition;
+- a newly triggered bench immediately ends the provider's remaining explicit
+  retry cycle;
+- fallback and global STOP semantics remain correct across protocols;
+- provider ordering is computed exactly once and sticky/score/round-robin state
+  is not altered by retry execution;
+- custom ordering omissions and duplicates retain their approved behavior;
+- regular and streaming pre-open failures follow the specified retry rules;
+- no opened stream ever performs same-provider PR27 retry;
+- raw response and chunk identity remain unchanged;
+- arguments are freshly copied per physical attempt without inspection;
+- built-in retry configuration is concurrency-safe and invocation counters do
+  not leak;
+- no SDK retry, delay, backoff, schema, scoring, persistence, async, or
+  unrelated roadmap work is introduced;
+- focused new PR27 tests cover the complete behavior matrix;
+- all existing tests pass without deletion;
+- Ruff, strict mypy, pytest, branch coverage, and lightweight-import checks
+  required by the current repository pass;
+- documentation clearly distinguishes health thresholds, provider ordering,
+  and same-provider retry budgets and prominently discloses replay risks;
+- `Projectplan/NewProjectPlan.md` marks PR27 shipped and repository guidance is
+  synchronized;
+- the final diff contains no unrelated changes;
+- `pr27-start` points to the state immediately before implementation changes;
+- the completed committed work contains source, tests, this prompt, and
+  synchronized documentation;
+- `pr27-complete` exists only after every criterion is satisfied; and
+- nothing has been pushed.
+
+At handoff, summarize the public API, targeting modes, precise total-attempt
+semantics, fixed categories, replay warning, health/metrics/streaming behavior,
+files changed, exact validation results, documentation synchronized, tag
+locations, and any remaining limitations. Never describe retries as inherently
+safe or confuse three total attempts with three additional retries.
