@@ -39,6 +39,8 @@ from nygen_router.policies import (
     RoutingContext,
     StickyRoutingPolicy,
 )
+from nygen_router.retry import RetryContext, RetryPolicy, SameProviderRetryPolicy
+from nygen_router.retry import _normalize_max_attempts as _normalize_retry_max_attempts
 from nygen_router.storage.base import MetricsStore
 from nygen_router.storage.duckdb import DuckDBMetricsStore
 from nygen_router.types import CallType, CallVariant, ProviderAttempt
@@ -55,6 +57,22 @@ SUPPORTED_PROTOCOLS = frozenset({ApiProtocol.OPENAI_CHAT, ApiProtocol.OPENAI_RES
 # request, bad operation, mismatched arguments, missing SDK), so no other
 # provider trying the same broken call would fare any better.
 _STOP_CATEGORIES = frozenset({ErrorCategory.BAD_REQUEST, ErrorCategory.INVALID_OPERATION})
+_NO_RETRY_CATEGORIES = frozenset(
+    {
+        ErrorCategory.BAD_REQUEST,
+        ErrorCategory.INVALID_OPERATION,
+        ErrorCategory.AUTH,
+        ErrorCategory.RATE_LIMIT,
+    }
+)
+
+
+@dataclass(frozen=True)
+class _FailureOutcome:
+    """Classification and health transition produced by one physical failure."""
+
+    category: ErrorCategory
+    newly_benched: bool
 
 
 class StreamFailurePolicy(StrEnum):
@@ -118,6 +136,7 @@ class ProviderRouter:
         on_restart: Callable[[StreamRestart], None] | None = None,
         *,
         metrics_scope: str,
+        retry_policy: RetryPolicy | None = None,
     ):
         self.providers = list(providers)
         self._reject_duplicate_provider_ids(self.providers)
@@ -126,6 +145,19 @@ class ProviderRouter:
         self._policy = policy or RoundRobinPolicy()
         if isinstance(self._policy, StickyRoutingPolicy):
             self._policy.validate_provider_ids(
+                [provider.provider_id for provider in self.providers]
+            )
+        self._retry_policy = retry_policy
+        self._retry_max_attempts = (
+            None
+            if retry_policy is None
+            else _normalize_retry_max_attempts(
+                retry_policy.max_attempts,
+                subject="retry_policy.max_attempts",
+            )
+        )
+        if isinstance(retry_policy, SameProviderRetryPolicy):
+            retry_policy.validate_provider_ids(
                 [provider.provider_id for provider in self.providers]
             )
         # Validated at the boundary so a typo'd key raises here rather than
@@ -203,67 +235,95 @@ class ProviderRouter:
             call_type=call_type,
         )
         ordered = list(self._policy.order(eligible, context))
+        first_order_indexes: dict[str, int] = {}
+        retry_cycles_seen: set[str] = set()
         for index, provider in enumerate(ordered):
+            first_order_indexes.setdefault(provider.provider_id, index)
+            retry_cycle_available = (
+                self._retry_policy is not None and provider.provider_id not in retry_cycles_seen
+            )
+            if self._retry_policy is not None:
+                retry_cycles_seen.add(provider.provider_id)
             variant = variants_by_protocol[provider.protocol]
-            arguments = self._arguments_for(variant, provider)
             adapter = self._adapter_for(provider)
-            start = time.perf_counter()
-            try:
-                response = adapter.invoke(variant.operation, arguments)
-            except Exception as exc:
+            attempt_number = 1
+            while True:
+                # A custom adapter may mutate its input, so every physical
+                # attempt receives a fresh top-level copy from the original
+                # opaque CallVariant.
+                arguments = self._arguments_for(variant, provider)
+                start = time.perf_counter()
+                try:
+                    response = adapter.invoke(variant.operation, arguments)
+                except Exception as exc:
+                    latency_ms = (time.perf_counter() - start) * 1000.0
+                    attempts.append(
+                        ProviderAttempt(
+                            provider_id=provider.provider_id,
+                            provider_name=provider.name,
+                            success=False,
+                            error=exc,
+                        )
+                    )
+                    outcome = self._record_attempt_failure(
+                        provider,
+                        exc,
+                        call_type=call_type,
+                        latency_ms=(latency_ms if call_type is CallType.REGULAR else None),
+                        stream_opened=(None if call_type is CallType.REGULAR else False),
+                        total_duration_ms=(None if call_type is CallType.REGULAR else latency_ms),
+                    )
+                    if outcome.category in _STOP_CATEGORIES:
+                        break
+                    if not self._should_retry_provider(
+                        provider=provider,
+                        error=exc,
+                        outcome=outcome,
+                        attempt_number=attempt_number,
+                        provider_order_index=first_order_indexes[provider.provider_id],
+                        call_type=call_type,
+                        retry_cycle_available=retry_cycle_available,
+                    ):
+                        break
+                    attempt_number += 1
+                    continue
+
+                if isinstance(response, NormalizedStream):
+                    # Nothing is known yet -- headers arriving is not a served call
+                    # -- so no attempt, no metrics and no health change is recorded
+                    # here. RouterStream carries the rest of the ranked order and
+                    # records the real outcome when the stream reaches it. PR27
+                    # counters never enter RouterStream after this boundary.
+                    return RouterStream(
+                        router=self,
+                        stream=response,
+                        provider=provider,
+                        remaining=ordered[index + 1 :],
+                        variants_by_protocol=variants_by_protocol,
+                        attempts=attempts,
+                        started_at=start,
+                        call_type=call_type,
+                    )
+
                 latency_ms = (time.perf_counter() - start) * 1000.0
                 attempts.append(
                     ProviderAttempt(
                         provider_id=provider.provider_id,
                         provider_name=provider.name,
-                        success=False,
-                        error=exc,
+                        success=True,
                     )
                 )
-                category = self._record_attempt_failure(
+                self._record_attempt_success(
                     provider,
-                    exc,
                     call_type=call_type,
                     latency_ms=(latency_ms if call_type is CallType.REGULAR else None),
                     stream_opened=(None if call_type is CallType.REGULAR else False),
                     total_duration_ms=(None if call_type is CallType.REGULAR else latency_ms),
                 )
-                if category in _STOP_CATEGORIES:
-                    break
-                continue
+                return response
 
-            if isinstance(response, NormalizedStream):
-                # Nothing is known yet -- headers arriving is not a served call
-                # -- so no attempt, no metrics and no health change is recorded
-                # here. RouterStream carries the rest of the ranked order and
-                # records the real outcome when the stream reaches it.
-                return RouterStream(
-                    router=self,
-                    stream=response,
-                    provider=provider,
-                    remaining=ordered[index + 1 :],
-                    variants_by_protocol=variants_by_protocol,
-                    attempts=attempts,
-                    started_at=start,
-                    call_type=call_type,
-                )
-
-            latency_ms = (time.perf_counter() - start) * 1000.0
-            attempts.append(
-                ProviderAttempt(
-                    provider_id=provider.provider_id,
-                    provider_name=provider.name,
-                    success=True,
-                )
-            )
-            self._record_attempt_success(
-                provider,
-                call_type=call_type,
-                latency_ms=(latency_ms if call_type is CallType.REGULAR else None),
-                stream_opened=(None if call_type is CallType.REGULAR else False),
-                total_duration_ms=(None if call_type is CallType.REGULAR else latency_ms),
-            )
-            return response
+            if outcome.category in _STOP_CATEGORIES:
+                break
 
         raise RouterExhaustedError(attempts)
 
@@ -326,7 +386,7 @@ class ProviderRouter:
         latency_ms: float | None,
         stream_opened: bool | None,
         total_duration_ms: float | None = None,
-    ) -> ErrorCategory:
+    ) -> _FailureOutcome:
         """Classify one dead attempt, record it, and bench the provider unless the call is at fault.
 
         The single copy of the failure rules, shared by invoke()'s loop and
@@ -344,9 +404,10 @@ class ProviderRouter:
             stream_opened=stream_opened,
             total_duration_ms=total_duration_ms,
         )
+        newly_benched = False
         if category not in _STOP_CATEGORIES:
-            self._record_failure(provider, category, exc)
-        return category
+            newly_benched = self._record_failure(provider, category, exc)
+        return _FailureOutcome(category=category, newly_benched=newly_benched)
 
     def _record_attempt_success(
         self,
@@ -376,7 +437,7 @@ class ProviderRouter:
 
     def _record_failure(
         self, provider: ProviderConfig, category: ErrorCategory, exc: Exception
-    ) -> None:
+    ) -> bool:
         """Apply one failure to a provider's health, reporting any bench it starts.
 
         Get-or-create + mutate, never replace: replacing the state object would
@@ -386,6 +447,51 @@ class ProviderRouter:
         started_bench = state.record_failure(category, str(exc), self._health_config, self._clock())
         if started_bench:
             self._log_bench(provider, state, category)
+        return started_bench
+
+    def _should_retry_provider(
+        self,
+        *,
+        provider: ProviderConfig,
+        error: Exception,
+        outcome: _FailureOutcome,
+        attempt_number: int,
+        provider_order_index: int,
+        call_type: CallType,
+        retry_cycle_available: bool,
+    ) -> bool:
+        """Apply router-owned safety gates, then ask the configured retry policy."""
+        policy = self._retry_policy
+        ceiling = self._retry_max_attempts
+        if policy is None or ceiling is None or not retry_cycle_available:
+            return False
+        if (
+            outcome.category in _NO_RETRY_CATEGORIES
+            or outcome.newly_benched
+            or attempt_number >= ceiling
+        ):
+            return False
+        retry_context = RetryContext(
+            provider_id=provider.provider_id,
+            provider_name=provider.name,
+            model=provider.model,
+            protocol=provider.protocol,
+            error=error,
+            category=outcome.category,
+            attempt_number=attempt_number,
+            provider_order_index=provider_order_index,
+            is_initial_provider=provider_order_index == 0,
+            call_type=call_type,
+            stream_opened=False,
+            newly_benched=outcome.newly_benched,
+        )
+        decision = policy.should_retry(retry_context)
+        if type(decision) is not bool:
+            raise ConfigError(
+                "retry_policy.should_retry() must return exactly bool; "
+                f"received {type(decision).__name__}"
+            )
+        return decision
 
     def _record_success(self, provider: ProviderConfig) -> None:
         """Clear a provider's failure signal, reporting the end of a bench episode."""
@@ -723,7 +829,7 @@ class RouterStream:
                 error=error,
             )
         )
-        category = self._router._record_attempt_failure(
+        outcome = self._router._record_attempt_failure(
             self._provider,
             error,
             call_type=self._call_type,
@@ -740,7 +846,7 @@ class RouterStream:
             error,
         )
         if (
-            category in _STOP_CATEGORIES
+            outcome.category in _STOP_CATEGORIES
             or self._router._stream_failure_policy is StreamFailurePolicy.RAISE
         ):
             # Both stop here, and both hand the consumer the provider's own
@@ -752,9 +858,10 @@ class RouterStream:
     def _restart(self, error: Exception) -> None:
         """Open the next provider in the ranked order, or exhaust trying.
 
-        Each eligible provider is tried at most once per call -- the ranked
-        order is consumed, never refilled -- which is the restart guardrail;
-        there is no separate max-restarts knob.
+        Each remaining ordered occurrence is consumed once and the list is
+        never refilled. PR27 retry counters do not enter RouterStream, so no
+        same-provider retry cycle is added after a stream opens; there is no
+        separate max-restarts knob.
         """
         while self._remaining:
             provider = self._remaining.pop(0)
@@ -773,7 +880,7 @@ class RouterStream:
                         error=exc,
                     )
                 )
-                category = self._router._record_attempt_failure(
+                outcome = self._router._record_attempt_failure(
                     provider,
                     exc,
                     call_type=self._call_type,
@@ -781,7 +888,7 @@ class RouterStream:
                     stream_opened=(None if self._call_type is CallType.REGULAR else False),
                     total_duration_ms=(None if self._call_type is CallType.REGULAR else latency_ms),
                 )
-                if category in _STOP_CATEGORIES:
+                if outcome.category in _STOP_CATEGORIES:
                     break
                 continue
 

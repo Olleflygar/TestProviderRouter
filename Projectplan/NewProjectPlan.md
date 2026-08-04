@@ -14,7 +14,7 @@ optional layers and must not become core import dependencies.
 ## Current implementation status
 
 Git tags, repository history, and source confirm that PR1–5, PR7–10, PR12,
-PR23, PR26, and the PR3R `CallVariant` redesign have shipped. PR29 was added
+PR23, PR26, PR27, and the PR3R `CallVariant` redesign have shipped. PR29 was added
 later as an unplanned corrective prerequisite for the remaining
 metrics/storage roadmap. The old project plan contains 11 remaining roadmap
 PRs: PR6 and PR13–22. PR11 and PR24 have been descoped and are recorded under
@@ -33,7 +33,7 @@ work must preserve.
 - Provider and framework dependencies are optional and lazily imported.
 - Hard capability filters run before provider scoring.
 - A retryable provider failure falls back when another eligible provider
-  remains.
+  remains, after any explicitly configured same-provider retry cycle.
 - Storage, metrics, dashboard, logging, and observability failures must not
   invalidate a successful LLM response.
 - Provider responses retain their native SDK identity unless a framework
@@ -115,6 +115,12 @@ Added the opt-in `StickyRoutingPolicy`, which tries configured provider IDs in
 fixed order when eligible and delegates the non-sticky tail to round-robin,
 score-based, or custom policy ordering.
 
+### [shipped] PR27 — Configurable same-provider retry policy
+
+Added a separate opt-in execution policy for bounded pre-open retries, with
+FIRST, ALL, and SELECTED targeting, hard safety gates, and per-physical-attempt
+health, metrics, and exhaustion accounting.
+
 ### [shipped] PR29 — Corrective metrics identity and history partitioning
 
 Made `provider_id` and `metrics_scope` explicit, partitioned history by stable
@@ -150,8 +156,37 @@ policy may itself be stateful. Fixed preference may improve provider-local
 cache reuse or concentrate usage, but cannot guarantee either. Callers still
 own strict endpoint/account affinity for provider-owned response IDs and state
 because filtering or fallback can select another provider. Dedicated selection
-logging remains with PR19, observability hooks with PR20, and same-provider
-retries with PR27.
+logging remains with PR19 and observability hooks with PR20. Shipped PR27
+same-provider retries compose independently and are never implied by sticky
+preference.
+
+### PR27 — Configurable same-provider retry policy
+
+**Shipped:** Added optional `ProviderRouter(retry_policy=...)` independently of
+the provider-ordering `policy=` seam. Omission and explicit `None` preserve the
+former behavior of making no router-controlled same-provider retry. The
+recommended `SameProviderRetryPolicy()` gives only ordered index zero up to
+three total physical attempts, including its initial attempt; ALL and SELECTED
+can give one bounded cycle to other distinct reached provider IDs. Values above
+eight total attempts clamp to eight with one caller-facing `UserWarning`.
+
+The built-in retries timeout, connection, and server-error categories only.
+Bad request and invalid operation remain global fail-fast errors; auth and rate
+limit bench then fall back; any newly started health bench ends the current
+cycle. Every physical attempt independently updates health, metrics, scoring
+history, and exhaustion diagnostics. Provider SDK retries stay disabled.
+
+Streaming support is pre-open only. Once a `NormalizedStream` exists, PR27
+state does not enter `RouterStream`; its existing restart-or-raise behavior
+continues over the remaining precomputed provider order. There is no delay,
+backoff, `Retry-After`, async support, persistent counter, schema change, or
+per-call override.
+
+Selecting retry is explicit router-wide acceptance of replay risk. The router
+cannot prove a native request is idempotent: retry can duplicate provider work,
+tools, stored/background operations, side effects, or charges. Native arguments
+remain opaque, and caller-supplied idempotency mechanisms are passed through but
+never created or verified.
 
 ### PR29 — Corrective metrics identity and history partitioning
 
@@ -228,24 +263,7 @@ These are the remaining active proposals, ordered by recommended implementation
 sequence rather than by PR number. Their scopes are directional until each PR
 receives its own implementation prompt.
 
-### 1. PR27 — Configurable same-provider retry policy
-
-**Summary:** Control bounded retries before cross-provider fallback.
-
-Keep this separate from sticky routing because retrying a failed request has
-different latency and duplicate-work risks. Retry limits and eligible failure
-categories are explicit configuration, with unsafe request and authentication
-failures excluded and normal fallback preserved after the budget is exhausted.
-
-Expose this independently from provider-ordering policies through an optional
-`ProviderRouter.retry_policy` constructor argument. Omitting it requires no
-configuration and preserves the current behavior of making no same-provider
-retry. Callers that want the feature may explicitly pass a
-`SameProviderRetryPolicy`, including alongside `StickyRoutingPolicy`; its exact
-retry-category, timing, streaming, and health-interaction semantics remain for
-PR27's implementation prompt.
-
-### 2. PR13 — Storage versioning and shared-backend foundation
+### 1. PR13 — Storage versioning and shared-backend foundation
 
 **Summary:** Prepare the storage layer for evolving schemas and managed
 databases.
@@ -256,7 +274,7 @@ sessions, and raw SQL rows remain private implementation details.
 Start from PR29's exact-schema/no-modification behavior; any future migration
 must be explicitly versioned rather than reviving implicit check-and-ALTER.
 
-### 3. PR22 — Pre-flight `CallVariant` validation
+### 2. PR22 — Pre-flight `CallVariant` validation
 
 **Summary:** Validate operations and arguments before attempting a provider.
 
@@ -264,7 +282,7 @@ Resolve supported operations and check argument compatibility before entering
 the fallback loop. Invalid calls fail without network traffic or misleading
 provider-health changes.
 
-### 4. PR21 — Automatic capability filtering
+### 3. PR21 — Automatic capability filtering
 
 **Summary:** Exclude providers that cannot satisfy tools, streaming, or
 structured-output requirements.
@@ -274,7 +292,7 @@ with provider capabilities. This restores the hard-filter behaviour removed by
 the PR3R redesign while keeping interpretation limited to known protocol
 fields.
 
-### 5. PR25 — Durable local provider health
+### 4. PR25 — Durable local provider health
 
 **Summary:** Persist provider cooldowns, rate limits, and health observations
 across router lifecycles.
@@ -284,7 +302,7 @@ implementation. This first stage promises durable state on one installation,
 not organization-wide coordination, and storage failures continue to degrade
 safely to in-memory health.
 
-### 6. PR14 — Postgres/Supabase organizational state
+### 5. PR14 — Postgres/Supabase organizational state
 
 **Summary:** Share metrics and health across applications within an
 organization.
@@ -294,7 +312,7 @@ using the interfaces established by PR13 and PR25. DuckDB remains the local
 default; Postgres/Supabase provides the actual multi-application organizational
 store.
 
-### 7. PR15 — Routing profiles
+### 6. PR15 — Routing profiles
 
 **Summary:** Offer simple profiles for speed, reliability, or balanced routing.
 
@@ -303,7 +321,7 @@ rather than introducing a separate scoring system. Cost is excluded from the
 standard profiles, and capability requirements remain hard filters rather than
 weighted preferences.
 
-### 8. PR6 — Manual token-cost calculation
+### 7. PR6 — Manual token-cost calculation
 
 **Summary:** Estimate cost from user-supplied prices and recorded usage.
 
@@ -312,7 +330,7 @@ cost only from usage supplied through an explicit public seam. Pricing remains
 visibility-only by default: no argument inspection, scraping, or automatic
 cost influence on core routing.
 
-### 9. PR28 — Optional local metrics dashboard
+### 8. PR28 — Optional local metrics dashboard
 
 **Summary:** Provide a read-only single-page view of provider performance.
 
@@ -321,7 +339,7 @@ explicitly configured cost estimates from the reporting interface. Ship it as
 an optional local web extra so dashboard dependencies do not affect the core
 import.
 
-### 10. PR16 — Environment and configuration factories
+### 9. PR16 — Environment and configuration factories
 
 **Summary:** Make common router setup concise and repeatable.
 
@@ -330,7 +348,7 @@ retaining direct `ProviderConfig` construction. Factories may select routing
 profiles and optional stores but must not hide invalid configuration or
 silently enable sticky routing and retries.
 
-### 11. PR19 — Configurable logging hooks
+### 10. PR19 — Configurable logging hooks
 
 **Summary:** Expose routing decisions and failures through standard Python
 logging.
@@ -340,7 +358,7 @@ sticky-provider selections, and storage degradation. Existing internal warnings
 should be consolidated into documented events without adding print-based
 output.
 
-### 12. PR20 — Optional observability hooks
+### 11. PR20 — Optional observability hooks
 
 **Summary:** Integrate routing activity with tracing and custom callbacks.
 
@@ -348,7 +366,7 @@ Provide optional OpenTelemetry, Logfire, and callback integrations using the
 neutral metrics and event model. Observability failures and missing optional
 packages must never break provider calls or the lightweight core import.
 
-### 13. PR18 — Pydantic-AI adapter (very low priority)
+### 12. PR18 — Pydantic-AI adapter (very low priority)
 
 **Summary:** Allow a Pydantic-AI agent to use the router as a model
 implementation.
@@ -363,7 +381,7 @@ The router cannot necessarily be passed directly to a Pydantic-AI `Agent`
 because it does not implement Pydantic AI's model interface. The integration
 must import the router, while the router core must not import Pydantic AI.
 
-### 14. PR17 — LangChain adapter (very low priority)
+### 13. PR17 — LangChain adapter (very low priority)
 
 **Summary:** Allow the router to behave like a LangChain chat model.
 
@@ -389,7 +407,7 @@ not obvious from the numbered roadmap alone.
 - PR13, PR25, and PR14 form a staged persistence path: storage foundation,
   durable local health, then true shared organizational state.
 - PR15 is narrowed to profiles supported by the existing scoring model.
-- Shipped fixed-preference routing and future same-provider retries remain
+- Shipped fixed-preference routing and same-provider retries remain
   separate because they solve different problems and have different failure
   risks.
 - PR6 remains optional and may use only explicitly supplied usage data; it must
@@ -411,5 +429,7 @@ be revisited when evidence or a dedicated PR changes them.
 - `StickyRoutingPolicy` is configurable and opt-in. It supplies fixed provider
   preference only; it never learns affinity or guarantees provider-owned state
   continuity.
+- `SameProviderRetryPolicy` is configurable and opt-in. Transient categories
+  are retry candidates, never evidence that native replay is safe.
 - Manual cost data is informational unless a later roadmap decision explicitly
   introduces cost-aware routing.

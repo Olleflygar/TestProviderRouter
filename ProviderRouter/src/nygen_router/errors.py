@@ -289,10 +289,10 @@ def _http_reason(status_code: int) -> str:
 
 
 class ErrorCategory(StrEnum):
-    """How a provider failure is classified to decide fallback behavior.
+    """Public failure classification used by fallback and retry decisions.
 
-    Internal to the router's fallback loop; not part of any public response
-    schema.
+    Values describe what happened; they do not claim a request is safe to
+    replay. ``RetryContext`` exposes the same enum to custom retry policies.
     """
 
     TIMEOUT = "timeout"

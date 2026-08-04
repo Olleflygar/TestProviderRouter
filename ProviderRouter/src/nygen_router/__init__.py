@@ -5,6 +5,7 @@ from nygen_router.config import ApiProtocol, ProviderCapabilities, ProviderConfi
 from nygen_router.errors import (
     ConfigError,
     DuplicateCallVariantProtocolError,
+    ErrorCategory,
     InvalidOperationArgumentsError,
     MissingApiKeyError,
     MixedCallTypeError,
@@ -34,6 +35,12 @@ from nygen_router.policies import (
     ScoreBasedPolicy,
     StickyRoutingPolicy,
 )
+from nygen_router.retry import (
+    RetryContext,
+    RetryPolicy,
+    RetryProviderScope,
+    SameProviderRetryPolicy,
+)
 from nygen_router.router import ProviderRouter, StreamFailurePolicy, StreamRestart
 from nygen_router.scoring import ProviderScore, ScoreWeights, calculate_provider_score
 from nygen_router.stats import ProviderStats, aggregate_stats
@@ -53,6 +60,7 @@ __all__ = [
     "ConfigError",
     "DuckDBMetricsStore",
     "DuplicateCallVariantProtocolError",
+    "ErrorCategory",
     "EligibilityResult",
     "FilterReason",
     "HealthConfig",
@@ -83,11 +91,15 @@ __all__ = [
     "ProviderStreamInterruptedError",
     "ProviderTimeoutError",
     "RoundRobinPolicy",
+    "RetryContext",
+    "RetryPolicy",
+    "RetryProviderScope",
     "RoutingContext",
     "RouterExhaustedError",
     "ScoreBasedPolicy",
     "ScoreWeights",
     "SQLiteMetricsStore",
+    "SameProviderRetryPolicy",
     "StreamFailurePolicy",
     "StreamRestart",
     "StickyRoutingPolicy",

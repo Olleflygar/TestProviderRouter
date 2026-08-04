@@ -47,7 +47,9 @@ class OpenAICompatibleAdapter:
             api_key=self.config.resolve_api_key(),
             base_url=self.config.base_url,
             timeout=self.config.timeout_seconds,
-            max_retries=0,  # the router's own cross-provider fallback is the sole retry path
+            # SDK retries stay disabled so optional router-controlled same-provider
+            # retries and cross-provider fallback remain observable as physical attempts.
+            max_retries=0,
             http_client=self._http_client,
         )
 

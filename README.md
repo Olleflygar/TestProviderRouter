@@ -70,6 +70,7 @@ from nygen_router import (
     DuckDBMetricsStore,
     ProviderConfig,
     ProviderRouter,
+    SameProviderRetryPolicy,
     ScoreBasedPolicy,
     StickyRoutingPolicy,
 )
@@ -257,9 +258,10 @@ For each call, Nygen Router:
 1. Excludes disabled, unavailable, unsupported, or temporarily benched providers.
 2. Orders eligible providers using the configured policy.
 3. Sends the matching native CallVariant with the selected provider's model.
-4. Falls back on retryable provider failures while eligible alternatives remain.
-5. Records scoped provider-ID/model/protocol/call-type observations and stream timing.
-6. Uses that recent history to improve later choices when ScoreBasedPolicy is enabled.
+4. Optionally retries a reached provider before continuing through the computed order.
+5. Falls back on retryable provider failures while eligible alternatives remain.
+6. Records scoped provider-ID/model/protocol/call-type observations and stream timing.
+7. Uses that recent history to improve later choices when ScoreBasedPolicy is enabled.
 ```
 
 ### Optional fixed provider preference
@@ -291,6 +293,47 @@ router/policy instances are appropriate when users or workflows need different
 preference lists. Fixed preference may help provider-local cache reuse or usage
 concentration, but it cannot guarantee caching, quota behavior, or strict
 provider-owned state continuity.
+
+### Optional same-provider retry
+
+Same-provider retry is disabled by default. Enable it explicitly and independently
+from provider ordering with the compact recommended configuration:
+
+```python
+router = ProviderRouter(
+    providers=providers,
+    metrics_scope="my-app",
+    retry_policy=SameProviderRetryPolicy(),
+)
+```
+
+The default gives only the first provider in the already-computed order up to
+three total physical attempts: its initial attempt plus at most two retries.
+`RetryProviderScope.ALL` gives each distinct reached provider one cycle;
+`RetryProviderScope.SELECTED` limits cycles to configured canonical provider
+IDs. The built-in retries only timeout, connection, and server-error failures.
+Authentication, rate limits, bad requests, invalid operations, a newly started
+health bench, and every failure after a normalized stream opens are hard
+exclusions. Provider SDK retries remain disabled.
+
+Every physical attempt independently affects health, metrics, scoring history,
+and exhaustion diagnostics. `HealthConfig.failure_threshold` is a circuit
+breaker across physical attempts, not the retry budget; reaching it stops the
+current provider's remaining retries. A streaming call may retry only when its
+adapter fails before returning a `NormalizedStream`. Opened streams retain the
+existing restart-or-raise behavior on the remaining provider tail.
+
+**Replay risk:** the router cannot determine whether a native request is safe to
+repeat. A timeout or disconnect does not prove the provider failed to receive or
+process it. Retrying can duplicate provider work, tool side effects,
+stored/background operations, charges, or other non-idempotent behavior.
+`CallVariant.arguments` stays opaque: provider-native idempotency mechanisms pass
+through unchanged but are neither created nor verified. Selecting
+`retry_policy` is router-wide acceptance of this risk; use separate router
+instances when different calls need different replay policies. There is no
+per-call override, delay, backoff, `Retry-After`, async execution, or persistent
+retry state. Values above eight total attempts clamp to eight with one
+caller-facing `UserWarning`.
 
 Capability inference, cost-aware routing, built-in adapters beyond the two
 OpenAI protocols, and framework-specific adapters are not part of the current

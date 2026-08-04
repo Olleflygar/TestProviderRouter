@@ -17,6 +17,7 @@ from nygen_router import (
     CallVariant,
     ProviderConfig,
     ProviderRouter,
+    SameProviderRetryPolicy,
     StickyRoutingPolicy,
 )
 
@@ -47,6 +48,9 @@ def main() -> None:
         policy=StickyRoutingPolicy(
             sticky_provider_ids=["fireworks:gpt-oss-20b"],
         ),
+        # Explicit opt-in: three total attempts on the first reached provider.
+        # Native calls may not be safe to replay; use only when that risk is accepted.
+        retry_policy=SameProviderRetryPolicy(),
     )
 
     response = router.invoke(

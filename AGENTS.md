@@ -27,3 +27,13 @@ from the plans without requiring it to be copied into package-local guidance.
    files alongside existing ones; existing tests keep acting as regression
    coverage. Only update a test (never delete outright) when a later PR
    deliberately changes the exact behavior that test was asserting.
+
+## Retry boundary
+
+PR27's same-provider retry is shipped and remains independent from the
+provider-ordering `Policy` protocol. It is disabled unless callers explicitly
+pass `retry_policy=`. Router-controlled retries are bounded, pre-open only, and
+record every physical attempt in health, metrics, and exhaustion diagnostics.
+Do not describe transient error categories as replay-safe: native arguments are
+opaque, and retries can duplicate work, side effects, background/stored
+operations, or charges.

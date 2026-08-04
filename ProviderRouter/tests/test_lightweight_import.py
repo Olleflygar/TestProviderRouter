@@ -28,8 +28,20 @@ class OptionalDependencyBlocker(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, OptionalDependencyBlocker())
 sys.path.insert(0, {str(source_root)!r})
-from nygen_router import ProviderRouter
+from nygen_router import (
+    ErrorCategory,
+    ProviderRouter,
+    RetryContext,
+    RetryPolicy,
+    RetryProviderScope,
+    SameProviderRetryPolicy,
+)
 assert ProviderRouter.__name__ == "ProviderRouter"
+assert RetryPolicy.__name__ == "RetryPolicy"
+assert RetryContext.__name__ == "RetryContext"
+assert RetryProviderScope.FIRST.value == "first"
+assert SameProviderRetryPolicy().max_attempts == 3
+assert ErrorCategory.TIMEOUT.value == "timeout"
 assert not ({{
     "duckdb",
     "httpx",

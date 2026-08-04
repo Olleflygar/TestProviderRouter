@@ -17,8 +17,8 @@ synchronous or streaming `responses.create`. Every provider attempt is recorded
 as an observational metrics event behind a swappable `MetricsStore` (DuckDB by
 default, SQLite as a fully-supported alternative) -- see "Metrics persistence"
 below. Metrics aggregation, score calculation, score-based routing, recency
-weighting, configurable fixed provider preference, provider health, and
-streaming fallback are implemented.
+weighting, configurable fixed provider preference, optional same-provider
+retry, provider health, and streaming fallback are implemented.
 Token usage remains available on native provider responses and streams, while
 router-owned token instrumentation is descoped. Additional storage layers,
 provider-resource management, and framework adapters remain planned or
@@ -355,13 +355,16 @@ intentional omissions, and duplicates are preserved, but it cannot introduce a
 sticky, disabled, unhealthy, unknown, or otherwise filtered provider. This
 keeps the attempt order structurally bounded by the router's hard filters.
 
-Retryable failures move through the fixed sticky prefix and then the wrapped
-tail. Existing bad-request, invalid-operation/arguments, and missing-SDK paths
-remain globally fail-fast. Health benches remove preferred providers from later
-calls until normal health rules make them eligible again. Streaming uses the
-same precomputed order: `RESTART` continues through its tail, while `RAISE` and
-STOP categories do not. A successful fallback never changes the next call's
-fixed preference, and raw responses and chunks remain untouched.
+Without a retry policy, retryable failures move directly through the fixed
+sticky prefix and then the wrapped tail. An independently configured
+`retry_policy=` may first replay the first eligible sticky provider; sticky
+routing itself never implies that behavior. Existing bad-request,
+invalid-operation/arguments, and missing-SDK paths remain globally fail-fast.
+Health benches remove preferred providers from later calls until normal health
+rules make them eligible again. Streaming uses the same precomputed order:
+`RESTART` continues through its tail, while `RAISE` and STOP categories do not.
+A successful fallback never changes the next call's fixed preference, and raw
+responses and chunks remain untouched.
 
 Despite its name, this policy does not learn session or conversation affinity.
 It stores no affinity key, outcome history, TTL, clock, persistence, cleanup,
@@ -374,8 +377,114 @@ account tier, but it guarantees neither. Callers still own strict affinity for
 provider-owned response IDs and state because health filtering and fallback can
 choose another provider.
 
-PR19 owns dedicated sticky-selection logging, PR20 owns optional observability
-hooks, and PR27 owns explicit same-provider retries; PR26 adds none of those.
+PR19 owns dedicated sticky-selection logging and PR20 owns optional
+observability hooks. Same-provider retry composes independently through the
+separate `retry_policy=` seam below; sticky routing never enables it.
+
+## Optional same-provider retry
+
+Same-provider retry is opt-in. Omitting `retry_policy`, or passing `None`,
+preserves the default behavior: one base attempt for each provider occurrence in
+the already-computed order, with normal cross-provider fallback. Provider SDK
+retries stay disabled so router-controlled attempts remain visible.
+
+```python
+from nygen_router import ProviderRouter, SameProviderRetryPolicy
+
+router = ProviderRouter(
+    providers=providers,
+    metrics_scope="my-application:production",
+    retry_policy=SameProviderRetryPolicy(),
+)
+```
+
+The default `max_attempts=3` means three **total physical attempts** for the
+targeted provider, including its initial ordered attempt—at most two additional
+retries, never three. The effective maximum is eight. A larger configured value
+is clamped to eight and emits exactly one caller-facing `UserWarning` naming the
+requested and effective values; values below two, booleans, and non-integers
+raise `ConfigError`.
+
+### Targeting modes
+
+`FIRST` is the default and gives one retry cycle only to the provider at index
+zero of the provider-ordering result. With score-based routing that is the
+highest-ranked provider; with sticky routing it is the first eligible sticky
+provider. Fallback providers still receive their ordinary base attempts.
+
+```python
+from nygen_router import RetryProviderScope, SameProviderRetryPolicy
+
+retry_first = SameProviderRetryPolicy()
+retry_all = SameProviderRetryPolicy(provider_scope=RetryProviderScope.ALL)
+retry_selected = SameProviderRetryPolicy(
+    provider_scope=RetryProviderScope.SELECTED,
+    provider_ids=["provider-a-production", "provider-b-production"],
+)
+```
+
+`ALL` gives one bounded cycle to the first reached occurrence of every distinct
+eligible provider ID. `SELECTED` does so only for reached configured canonical
+IDs. Selected IDs use an actual non-empty `list[str]`, are trimmed and copied,
+and reject blanks, non-strings, duplicates, and IDs unknown to the router.
+Filtered providers and providers omitted by a custom ordering policy are never
+introduced. Custom ordering duplicates remain deliberate base attempts, but do
+not multiply retry cycles for the same ID. The provider-ordering policy is still
+called exactly once.
+
+The built-in retries exactly these transient candidates:
+
+- timeout, including HTTP 408 and typed Responses timeout codes;
+- connection failure; and
+- server error, including HTTP 5xx and typed Responses server-error codes.
+
+These categories are candidates, not an idempotency guarantee. Unknown and
+stream-interrupted failures are not retried by the built-in. Bad request and
+invalid operation remain global fail-fast errors. Authentication and rate-limit
+failures bench and fall back without same-provider retry. No retry policy,
+including a custom one, can override those gates, a newly started health bench,
+the effective attempt ceiling, or the opened-stream boundary. A trusted custom
+policy may choose a pre-open unknown failure and receives a frozen
+`RetryContext`; its decision must be exactly `bool`.
+
+Every physical attempt is a normal health and metrics observation. Failures
+increment health independently, successful retry resets counted health through
+the normal success transition, and reaching `HealthConfig.failure_threshold`
+immediately ends remaining retries for that provider. That health threshold is
+a circuit breaker across attempts, not a retry budget. Metrics and scoring see
+each failure and success as separate real events, and `RouterExhaustedError`
+retains repeated provider IDs plus exact error objects in physical order. No
+retry metadata is added to responses, events, stores, schemas, aggregation, or
+scores.
+
+Streaming retry applies only when `adapter.invoke()` fails before returning a
+`NormalizedStream`. Such attempts record `stream_opened=False`, NULL TTFT, and
+their measured total duration. Once a normalized stream opens—even if it later
+yields zero chunks—PR27 performs no same-provider retry. `RouterStream` retains
+its existing `RESTART` behavior on the already-computed provider tail or its
+`RAISE` behavior, with chunks unchanged.
+
+### Replay safety and lifecycle
+
+**The router cannot determine whether a native request is safe to replay.** A
+timeout or connection failure does not prove the provider failed to receive or
+process the call. Retrying can duplicate provider work, tool side effects,
+stored or background operations, charges, or any other non-idempotent behavior.
+`CallVariant.arguments` remains opaque and is never inspected for tools,
+idempotency keys, response IDs, or safety. Caller-supplied provider-native
+idempotency mechanisms pass through unchanged, but the router neither creates
+nor verifies them.
+
+Selecting `retry_policy` is explicit router-wide acceptance of these risks.
+There is no per-call override; use separate router instances or a carefully
+scoped custom setup when different calls need different replay safety. Retry
+counters live only inside one synchronous `invoke()` call. The built-in policy
+stores frozen configuration and is safe to share across calls and routers; a
+stateful custom policy owns its own thread safety. There is no sleep, delay,
+backoff, jitter, `Retry-After`, total-duration budget, async execution,
+persistent/distributed retry state, or background scheduler. PR19 and PR20
+still own general retry logging and observability hooks; the maximum-clamp
+warning is only a configuration signal.
 
 ## Provider health and cooldowns
 
@@ -391,8 +500,10 @@ This works with **zero configuration**. By default:
   A 429 is flow control rather than a broken provider, so it does not count
   toward the failure threshold below.
 - **Three consecutive counted failures** (timeout, connection failure, server
-  error, or unknown) bench that provider for **60 seconds**. Only a success
-  resets the count.
+  error, stream interruption, or unknown) bench that provider for **60
+  seconds**. Only a success resets the count. With retry enabled, every physical
+  failure contributes and a newly reached threshold ends the current retry
+  cycle.
 - An **auth failure (401/403)** benches that provider for the rest of the run,
   as it already did before.
 
@@ -574,10 +685,11 @@ for chunk in response:
 What you get on top of the raw SDK stream is that the router is still watching.
 A stream that dies half-way through -- a dropped connection, a read timeout, or
 a provider that simply stops sending without ever marking the response finished
--- falls back to the next provider in the same ranked order `invoke()` was
-working through, instead of surfacing a raw SDK exception in your loop. Each
-eligible provider is tried at most once per call; when none are left you get
-`RouterExhaustedError` listing every provider's own real reason.
+-- falls back to the next occurrence in the same ranked order `invoke()` was
+working through, instead of surfacing a raw SDK exception in your loop. The
+remaining finite order is consumed without adding PR27 retry cycles; when none
+is left you get `RouterExhaustedError` listing every physical attempt's real
+reason.
 
 A stream that ends without yielding even one chunk is also a failed attempt,
 even if the provider marked it complete: it produced no usable response.

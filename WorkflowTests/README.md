@@ -80,4 +80,5 @@ correction call, after which the script stops with a clear error.
 workflow depends only on a small `TextModel` protocol, while `RouterTextModel`
 adapts `ProviderRouter` to that interface. Replacing the model object does not
 change the workflow. It uses the shared DuckDB and score-based routing but
-omits calibration, retries, and diagnostic output.
+omits calibration, an explicit same-provider retry policy, and diagnostic
+output.

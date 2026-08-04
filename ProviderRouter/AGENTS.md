@@ -56,8 +56,10 @@ Implementation rules for this package:
   hooks belong at their own boundaries, not in a field on the return value
   (see PR19 and PR20 in the current roadmap).
 - Round robin rotates among eligible providers, and a failed provider falls
-  back to the next eligible one, re-picking whichever `CallVariant` matches
-  the new provider's protocol. An auth failure (401/403) benches a provider
+  back to the next eligible one after any explicitly configured same-provider
+  retry cycle, re-picking whichever `CallVariant` matches the new provider's
+  protocol. Omitting `retry_policy` preserves direct fallback with no
+  same-provider retry. An auth failure (401/403) benches a provider
   for the rest of the run (`FilterReason.AUTH_DISABLED_THIS_RUN`), and a 429
   or repeated failures bench it temporarily (`FilterReason.IN_COOLDOWN`) --
   see "Provider health" below; a bad request (400/422 or an explicit Responses
@@ -281,7 +283,49 @@ learned affinity or outcome state:
   raw pass-through behavior.
 - There is no affinity key, TTL, clock, persistence, cleanup, reset, per-call
   override, sticky-specific logging, or observability schema. PR19/PR20 own
-  those signals and PR27 owns same-provider retry.
+  those signals. Shipped PR27 retry composes independently and is never implied
+  by sticky preference.
+
+## Same-provider retry
+
+`SameProviderRetryPolicy` is the shipped, opt-in PR27 execution policy. It is
+separate from provider-ordering `Policy` implementations and selected only
+through `ProviderRouter(retry_policy=...)`:
+
+- Omission and explicit `None` mean no router-controlled same-provider retry.
+  Provider SDK retries remain disabled.
+- `max_attempts` is total physical attempts in one targeted cycle, including
+  the initial ordered attempt. The default is 3 and the effective maximum is
+  8; larger values clamp with one caller-facing `UserWarning`.
+- `FIRST` targets ordered index zero, `ALL` the first reached occurrence of
+  every distinct eligible provider ID, and `SELECTED` only reached configured
+  canonical IDs. Filters and custom-policy omissions are never bypassed;
+  deliberate ordering duplicates remain base occurrences but do not gain new
+  cycles.
+- The built-in category set is exactly timeout, connection, and server error.
+  Bad request and invalid operation stop globally; auth and rate limit bench
+  then fall back. A newly triggered health bench or the effective ceiling ends
+  the cycle. A trusted custom policy may select pre-open unknown failures but
+  cannot bypass hard gates and must return exactly `bool`.
+- Construct one adapter per ordered occurrence and reuse it for that
+  occurrence's retries. Build a fresh top-level argument dict and measure,
+  record metrics, update health, and preserve the exact error for every
+  physical attempt.
+- `RetryContext` is frozen and contains no provider configuration, API key,
+  arguments, adapter, metrics store, or mutable health/fallback state. Router
+  counters remain local to one synchronous `invoke()` call; built-in policy
+  configuration is frozen and reusable across concurrent calls.
+- Streaming retry is pre-open only. Once an adapter returns a
+  `NormalizedStream`, no PR27 state enters `RouterStream`, including for empty
+  or interrupted streams and pre-open failures encountered during a later
+  stream restart.
+- Never claim retry safety. A timeout or disconnect does not prove the provider
+  did not process the request. Replay can duplicate work, tools, side effects,
+  stored/background operations, or charges. Native arguments remain opaque;
+  idempotency mechanisms pass through but are neither created nor verified.
+- There is no per-call override, delay, backoff, jitter, `Retry-After`, async
+  support, persistent retry state, retry metrics/schema, or response wrapper.
+  PR19/PR20 still own general logging and observability hooks.
 
 ## Provider health
 
@@ -295,12 +339,15 @@ whole point of the feature:
   get-or-create + mutate -- never replace the state object, which would
   silently zero an existing failure count.
 - A 429 benches immediately without counting (flow control, not a broken
-  provider). Timeout, connection, server error, and unknown are counted;
-  crossing `failure_threshold` benches. The STOP categories (bad request,
+  provider). Timeout, connection, server error, stream interruption, and
+  unknown are counted; crossing `failure_threshold` benches. The STOP
+  categories (bad request,
   invalid operation) must never touch health -- the call is at fault, not the
   provider. Only a success resets the count, which is what makes a
   persistently broken provider cost one probe per cooldown window rather than
   three; do not "helpfully" reset the count on cooldown expiry.
+  With retries enabled, every physical failure contributes independently and a
+  newly reached threshold stops that provider's remaining retry cycle.
 - `HealthConfig` (`health.py`, exported from the package root) is validated at
   the constructor boundary via `HealthConfig.model_validate`, so a dict typo
   raises immediately and no raw dict flows past `__init__`.
