@@ -17,7 +17,8 @@ synchronous or streaming `responses.create`. Every provider attempt is recorded
 as an observational metrics event behind a swappable `MetricsStore` (DuckDB by
 default, SQLite as a fully-supported alternative) -- see "Metrics persistence"
 below. Metrics aggregation, score calculation, score-based routing, recency
-weighting, provider health, and streaming fallback are implemented.
+weighting, configurable fixed provider preference, provider health, and
+streaming fallback are implemented.
 Token usage remains available on native provider responses and streams, while
 router-owned token instrumentation is descoped. Additional storage layers,
 provider-resource management, and framework adapters remain planned or
@@ -189,9 +190,10 @@ responsibility through the exact provider's native SDK client. Response IDs and
 conversation IDs belong to the endpoint/account that created them.
 `previous_response_id`, conversations, stored responses, and background calls
 may pass through `responses.create`, but the router does not promise that a
-later call will pick the same provider. Preserve provider affinity yourself for
-stateful continuation; stateless calls are safe across interchangeable
-providers.
+later call will pick the same provider. `StickyRoutingPolicy` can make that
+provider a best-effort fixed preference, but filtering and fallback may still
+select another endpoint/account. Preserve strict provider affinity yourself for
+stateful continuation; stateless calls are safe across interchangeable providers.
 
 ## Installing the openai SDK
 
@@ -309,6 +311,71 @@ router = ProviderRouter(
     providers=[...], metrics_scope="my-application:production", policy=RoundRobinPolicy()
 )
 ```
+
+## Fixed provider preference (`StickyRoutingPolicy`)
+
+`StickyRoutingPolicy` is an opt-in wrapper for applications that want selected
+providers tried first in a fixed order. It is enabled only through the existing
+`policy=` constructor seam; the default router and every other policy remain
+unchanged.
+
+```python
+from nygen_router import ProviderRouter, ScoreBasedPolicy, StickyRoutingPolicy
+
+router = ProviderRouter(
+    providers=providers,
+    metrics_scope="my-app",
+    policy=StickyRoutingPolicy(
+        sticky_provider_ids=["provider-a", "provider-b"],
+        fallback_policy=ScoreBasedPolicy(),
+    ),
+)
+```
+
+The compact form gives the non-sticky remainder a fresh round-robin policy:
+
+```python
+router = ProviderRouter(
+    providers=providers,
+    metrics_scope="my-app",
+    policy=StickyRoutingPolicy(sticky_provider_ids=["provider-a"]),
+)
+```
+
+The constructor accepts a non-empty `list[str]`. Values are trimmed and copied;
+non-string, blank, duplicate-after-trimming, and router-unknown IDs raise
+`ConfigError` before a provider call. These are canonical `provider_id` values,
+never display `name` values. A known provider may still be disabled or unhealthy
+at construction because runtime eligibility remains the hard filter's job.
+
+For every invocation, eligible sticky providers lead in configured ID order.
+The wrapped round-robin, score-based, or custom policy is called once with a
+fresh list containing only the eligible non-sticky remainder. Its ordering,
+intentional omissions, and duplicates are preserved, but it cannot introduce a
+sticky, disabled, unhealthy, unknown, or otherwise filtered provider. This
+keeps the attempt order structurally bounded by the router's hard filters.
+
+Retryable failures move through the fixed sticky prefix and then the wrapped
+tail. Existing bad-request, invalid-operation/arguments, and missing-SDK paths
+remain globally fail-fast. Health benches remove preferred providers from later
+calls until normal health rules make them eligible again. Streaming uses the
+same precomputed order: `RESTART` continues through its tail, while `RAISE` and
+STOP categories do not. A successful fallback never changes the next call's
+fixed preference, and raw responses and chunks remain untouched.
+
+Despite its name, this policy does not learn session or conversation affinity.
+It stores no affinity key, outcome history, TTL, clock, persistence, cleanup,
+reset, or per-call override. The preference is router-wide; create separate
+router/policy instances—or a custom policy—for different users or workflows.
+Separate policy instances per router are recommended because a wrapped policy
+such as round robin may itself be stateful. Fixed preference may improve the
+chance of provider-local prompt-cache reuse or concentrate traffic toward an
+account tier, but it guarantees neither. Callers still own strict affinity for
+provider-owned response IDs and state because health filtering and fallback can
+choose another provider.
+
+PR19 owns dedicated sticky-selection logging, PR20 owns optional observability
+hooks, and PR27 owns explicit same-provider retries; PR26 adds none of those.
 
 ## Provider health and cooldowns
 

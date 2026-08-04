@@ -258,6 +258,31 @@ ignores it.
 - Decay affects scoring evidence only. The exact diagnostic error,
   rate-limit, and timeout counts remain unweighted.
 
+## Fixed provider preference
+
+`StickyRoutingPolicy` is the shipped, opt-in PR26 wrapper around another
+`Policy`. It stores a validated fixed list of canonical provider IDs, never
+learned affinity or outcome state:
+
+- Hard filtering happens first. Eligible sticky IDs lead in configured order;
+  disabled, keyless, unsupported, protocol-mismatched, or benched providers
+  cannot be reintroduced.
+- The wrapped policy is called exactly once with a fresh list containing only
+  the eligible non-sticky remainder and the unchanged `RoutingContext`.
+  Its ordering, omissions, and duplicates are preserved, but foreign provider
+  IDs raise `ConfigError` before adapter invocation.
+- Omitting `fallback_policy` creates a fresh `RoundRobinPolicy` per sticky
+  policy. Score-based and custom wrapped policies remain supported.
+- Configuration requires a non-empty `list[str]` of configured `provider_id`
+  values. Values are trimmed and copied; non-strings, blanks, duplicates, and
+  unknown IDs are rejected. Display names are never identity.
+- Successful fallback does not rewrite preference. Regular and streaming calls
+  use the same composed order and existing fallback, STOP, health, metrics, and
+  raw pass-through behavior.
+- There is no affinity key, TTL, clock, persistence, cleanup, reset, per-call
+  override, sticky-specific logging, or observability schema. PR19/PR20 own
+  those signals and PR27 owns same-provider retry.
+
 ## Provider health
 
 `ProviderRouter` benches temporarily-bad providers so they stop being called,

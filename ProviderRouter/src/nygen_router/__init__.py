@@ -32,6 +32,7 @@ from nygen_router.policies import (
     RoundRobinPolicy,
     RoutingContext,
     ScoreBasedPolicy,
+    StickyRoutingPolicy,
 )
 from nygen_router.router import ProviderRouter, StreamFailurePolicy, StreamRestart
 from nygen_router.scoring import ProviderScore, ScoreWeights, calculate_provider_score
@@ -89,6 +90,7 @@ __all__ = [
     "SQLiteMetricsStore",
     "StreamFailurePolicy",
     "StreamRestart",
+    "StickyRoutingPolicy",
     "UnsupportedOperationError",
     "UnsupportedProtocolError",
     "aggregate_stats",

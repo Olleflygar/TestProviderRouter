@@ -71,6 +71,7 @@ from nygen_router import (
     ProviderConfig,
     ProviderRouter,
     ScoreBasedPolicy,
+    StickyRoutingPolicy,
 )
 
 metrics = DuckDBMetricsStore("router_metrics.duckdb")
@@ -189,8 +190,10 @@ and yields typed events ending in `response.completed` or
 `response.incomplete`. An incomplete response is a served result: it warns once
 but does not fall back or bench the provider. Stored responses, continuation
 IDs, conversations, and background lifecycles are provider-owned state; callers
-must preserve provider affinity when using them. Stateless routed calls are the
-safe interchangeable-provider pattern.
+must preserve strict endpoint/account affinity when using them.
+`StickyRoutingPolicy` can provide a best-effort fixed preference, but health
+filtering and fallback may still choose another provider. Stateless routed
+calls are the safe interchangeable-provider pattern.
 
 ## LangChain
 
@@ -258,6 +261,36 @@ For each call, Nygen Router:
 5. Records scoped provider-ID/model/protocol/call-type observations and stream timing.
 6. Uses that recent history to improve later choices when ScoreBasedPolicy is enabled.
 ```
+
+### Optional fixed provider preference
+
+Select `StickyRoutingPolicy` explicitly when one or more canonical provider IDs
+should always lead while eligible:
+
+```python
+router = ProviderRouter(
+    providers=providers,
+    metrics_scope="my-app",
+    policy=StickyRoutingPolicy(
+        sticky_provider_ids=["provider-a", "provider-b"],
+        fallback_policy=ScoreBasedPolicy(),
+    ),
+)
+```
+
+The sticky IDs form a fixed ordered prefix; the wrapped policy orders only the
+remaining eligible providers. Without `fallback_policy`, each sticky policy
+gets its own `RoundRobinPolicy`. IDs must be a non-empty `list[str]` of configured
+`provider_id` values; whitespace, blanks, duplicates, non-strings, and unknown
+IDs are validated at construction.
+
+This feature stores no learned affinity, key, TTL, or persistent state. A
+successful fallback does not change the next call's preference. Health and hard
+eligibility always take precedence, including for streaming restarts. Separate
+router/policy instances are appropriate when users or workflows need different
+preference lists. Fixed preference may help provider-local cache reuse or usage
+concentration, but it cannot guarantee caching, quota behavior, or strict
+provider-owned state continuity.
 
 Capability inference, cost-aware routing, built-in adapters beyond the two
 OpenAI protocols, and framework-specific adapters are not part of the current

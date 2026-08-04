@@ -33,7 +33,12 @@ from nygen_router.health import (
     ProviderHealthState,
 )
 from nygen_router.metrics import MetricsEvent
-from nygen_router.policies import Policy, RoundRobinPolicy, RoutingContext
+from nygen_router.policies import (
+    Policy,
+    RoundRobinPolicy,
+    RoutingContext,
+    StickyRoutingPolicy,
+)
 from nygen_router.storage.base import MetricsStore
 from nygen_router.storage.duckdb import DuckDBMetricsStore
 from nygen_router.types import CallType, CallVariant, ProviderAttempt
@@ -119,6 +124,10 @@ class ProviderRouter:
         self.metrics_scope = self._validate_metrics_scope(metrics_scope)
         self._adapter_factory = adapter_factory or self._default_adapter_for
         self._policy = policy or RoundRobinPolicy()
+        if isinstance(self._policy, StickyRoutingPolicy):
+            self._policy.validate_provider_ids(
+                [provider.provider_id for provider in self.providers]
+            )
         # Validated at the boundary so a typo'd key raises here rather than
         # flowing on as a raw dict that silently means nothing.
         self._health_config = (

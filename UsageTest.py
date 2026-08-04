@@ -17,6 +17,7 @@ from nygen_router import (
     CallVariant,
     ProviderConfig,
     ProviderRouter,
+    StickyRoutingPolicy,
 )
 
 
@@ -43,6 +44,9 @@ def main() -> None:
             ),
         ],
         metrics_scope="usage-test:local",
+        policy=StickyRoutingPolicy(
+            sticky_provider_ids=["fireworks:gpt-oss-20b"],
+        ),
     )
 
     response = router.invoke(
