@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from nygen_router.config import ApiProtocol
@@ -130,10 +130,17 @@ def _logical_type(value: str) -> str:
 
 
 def event_to_params(event: MetricsEvent) -> tuple[object, ...]:
-    """Serialize an event in the single shared column order."""
+    """Serialize an event in the single shared column order.
+
+    Timestamps are compared lexically as ISO text, so every timezone-aware
+    value must be stored in the same UTC offset representation.
+    """
+    timestamp = event.timestamp
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.astimezone(UTC)
     return (
         event.id,
-        event.timestamp.isoformat(),
+        timestamp.isoformat(),
         event.metrics_scope,
         event.provider_id,
         event.provider_name,
@@ -162,7 +169,9 @@ def build_query_recent_sql(
     if since.tzinfo is None:
         raise ValueError("since must be timezone-aware")
     query = _SELECT_PROVIDER_ATTEMPTS_SQL
-    params: list[object] = [since.isoformat()]
+    # Normalized to UTC because the comparison against stored rows is lexical:
+    # a non-UTC offset would compare wrongly against the stored +00:00 text.
+    params: list[object] = [since.astimezone(UTC).isoformat()]
     filters: tuple[tuple[str, object | None], ...] = (
         ("metrics_scope", metrics_scope),
         ("provider_id", provider_id),

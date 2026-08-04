@@ -13,6 +13,9 @@ htmlcov/
 WorkflowTests/*.duckdb
 WorkflowTests/*.duckdb.wal
 
+**/.claude/settings.local.json
+**/.claude/scheduled_tasks.lock
+
 CODEBASE_AUDIT.md
 scoring_health_summary.tex
 prompt_construction.md

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -239,6 +239,29 @@ def test_query_recent_raises_value_error_for_naive_since(store: MetricsStore) ->
 
     with pytest.raises(ValueError, match="timezone-aware"):
         store.query_recent(since=naive_since)
+
+
+def test_query_recent_honors_non_utc_timezone_aware_since(store: MetricsStore) -> None:
+    """The same instant must select the same events whatever offset expresses it."""
+    event = _event()
+    store.record_attempt(event)
+    utc_since = event.timestamp - timedelta(seconds=1)
+    same_instant_plus_two = utc_since.astimezone(timezone(timedelta(hours=2)))
+
+    assert store.query_recent(since=same_instant_plus_two) == store.query_recent(since=utc_since)
+    assert len(store.query_recent(since=same_instant_plus_two)) == 1
+
+
+def test_non_utc_timezone_aware_timestamps_are_stored_as_utc(store: MetricsStore) -> None:
+    """A +02:00 event timestamp must round-trip as the same instant in UTC."""
+    now = datetime.now(UTC)
+    offset_timestamp = (now - timedelta(minutes=5)).astimezone(timezone(timedelta(hours=2)))
+    store.record_attempt(_event(timestamp=offset_timestamp))
+
+    (read_back,) = store.query_recent(since=now - timedelta(minutes=6))
+
+    assert read_back.timestamp.utcoffset() == timedelta(0)
+    assert read_back.timestamp == offset_timestamp
 
 
 def test_timestamps_round_trip_as_timezone_aware_utc(store: MetricsStore) -> None:
