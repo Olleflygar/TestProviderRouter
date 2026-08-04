@@ -167,8 +167,10 @@ score-based routing has real history to work from:
   never alter, backfill, rename, delete, or replace a legacy database. PR13
   owns future explicit schema-versioning and migration design.
 - `request_size_bucket` is reserved and nullable in the PR29 schema. Router
-  events leave it `NULL`; PR11 owns its producer, values, filtering,
-  aggregation, and scoring.
+  events leave it `NULL`. PR11 is descoped: do not inspect opaque call
+  arguments to populate it or add bucket-aware aggregation/scoring. Use
+  caller-defined `metrics_scope` values to separate materially different
+  workloads.
 
 ## Metrics aggregation
 
@@ -199,8 +201,9 @@ turns recorded events into one `ProviderStats` per provider for scoring:
 - Match every event exactly on provider ID, model, protocol, and invocation
   call type. A former display name does not prevent a stable ID from matching.
   Wrong-partition events affect no count, tally, average, or score.
-- Cost statistics remain optional future work dependent on usage
-  instrumentation and user-supplied prices (PR24 and PR6).
+- Cost statistics remain optional future work under PR6 and may depend only on
+  usage supplied through an explicit public seam and user-supplied prices.
+  PR24's router-owned token instrumentation is descoped.
 
 ## Score calculation
 
@@ -363,5 +366,5 @@ still act:
 - Do not add per-call overrides for `stream_failure_policy` or `on_restart`, a
   max-restarts knob, or any async support as unrelated work -- all were
   considered and deferred in `../Projectplan/OldProjectPlan.md`. Usage is
-  exposed on the wrapper but is not persisted until the planned PR24
-  framework-neutral usage instrumentation is implemented.
+  exposed on the wrapper but is not persisted by the router. PR24 is descoped;
+  do not revive usage extraction or argument inspection as unrelated work.

@@ -18,8 +18,10 @@ as an observational metrics event behind a swappable `MetricsStore` (DuckDB by
 default, SQLite as a fully-supported alternative) -- see "Metrics persistence"
 below. Metrics aggregation, score calculation, score-based routing, recency
 weighting, provider health, and streaming fallback are implemented.
-Token-usage instrumentation, additional storage layers, provider-resource
-management, and framework adapters remain planned or caller-owned work.
+Token usage remains available on native provider responses and streams, while
+router-owned token instrumentation is descoped. Additional storage layers,
+provider-resource management, and framework adapters remain planned or
+caller-owned work.
 
 The source and tests define shipped behavior. See
 [`../Projectplan/NewProjectPlan.md`](../Projectplan/NewProjectPlan.md) for the
@@ -637,8 +639,9 @@ provider responses. The database owner must move or replace obsolete local
 history manually. Runtime code never deletes a user database.
 
 `request_size_bucket` is already present and nullable, but router-written PR29
-events leave it `NULL`. PR11 owns estimation, bucket definitions, filtering,
-aggregation, and bucket-aware scoring.
+events leave it `NULL`. PR11 is descoped because estimating size would require
+the router to interpret opaque native arguments. Use separate `metrics_scope`
+values when materially different workloads need separate routing history.
 
 `metrics_store` is a `ProviderRouter` constructor parameter with three forms:
 
@@ -780,8 +783,10 @@ for exploration—there is no separate exploration-bonus switch.
 Cost is deliberately not a scoring factor. Automatic pricing is outside the
 router's core model, and manually configured cost remains the deferred,
 optional work described in
-[`../Projectplan/NewProjectPlan.md`](../Projectplan/NewProjectPlan.md) (PR24
-followed by PR6).
+[`../Projectplan/NewProjectPlan.md`](../Projectplan/NewProjectPlan.md) (PR6).
+Any future implementation must use explicitly supplied usage and pricing rather
+than inspect native call arguments; PR24's router-owned instrumentation is
+descoped.
 
 ## Score-based routing
 
