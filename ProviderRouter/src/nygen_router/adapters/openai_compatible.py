@@ -31,6 +31,11 @@ class OpenAICompatibleAdapter:
     def __init__(self, config: ProviderConfig, http_client: httpx.Client | None = None) -> None:
         self.config = config
         self._http_client = http_client
+        # One SDK client per adapter, built on first use and kept so its pooled
+        # HTTP connections survive across attempts instead of paying a fresh
+        # TCP/TLS handshake per request.
+        self._client: Any = None
+        self._client_api_key: str | None = None
 
     def invoke(self, operation: str, arguments: dict[str, object]) -> Any:
         """Resolve operation on an openai client and call it with arguments, or raise."""
@@ -43,15 +48,7 @@ class OpenAICompatibleAdapter:
         except ModuleNotFoundError as exc:
             raise ProviderSDKNotInstalledError(provider_id, name, "openai", original=exc) from exc
 
-        client = openai.OpenAI(
-            api_key=self.config.resolve_api_key(),
-            base_url=self.config.base_url,
-            timeout=self.config.timeout_seconds,
-            # SDK retries stay disabled so optional router-controlled same-provider
-            # retries and cross-provider fallback remain observable as physical attempts.
-            max_retries=0,
-            http_client=self._http_client,
-        )
+        client = self._client_for(openai)
 
         target: Any = client
         try:
@@ -101,6 +98,27 @@ class OpenAICompatibleAdapter:
         if isinstance(response, openai.Stream):
             return self._wrap_stream(response)
         return self._handle_response(response)
+
+    def _client_for(self, openai_module: Any) -> Any:
+        """Return the cached SDK client, rebuilding it only on a changed resolved key.
+
+        Re-resolving per attempt keeps the pre-cache contract: a key corrected
+        mid-run takes effect on the next call, so reset_health() still recovers
+        an auth-benched provider without a process restart.
+        """
+        api_key = self.config.resolve_api_key()
+        if self._client is None or api_key != self._client_api_key:
+            self._client = openai_module.OpenAI(
+                api_key=api_key,
+                base_url=self.config.base_url,
+                timeout=self.config.timeout_seconds,
+                # SDK retries stay disabled so optional router-controlled same-provider
+                # retries and cross-provider fallback remain observable as physical attempts.
+                max_retries=0,
+                http_client=self._http_client,
+            )
+            self._client_api_key = api_key
+        return self._client
 
     def _wrap_stream(self, stream: Any) -> NormalizedStream:
         """Wrap the SDK stream shape this adapter understands."""

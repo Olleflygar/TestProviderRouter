@@ -142,6 +142,12 @@ class ProviderRouter:
         self._reject_duplicate_provider_ids(self.providers)
         self.metrics_scope = self._validate_metrics_scope(metrics_scope)
         self._adapter_factory = adapter_factory or self._default_adapter_for
+        self._using_default_adapters = adapter_factory is None
+        # Built-in adapters cache their SDK client, so reusing the adapter is
+        # what keeps pooled HTTP connections alive across calls. Only the
+        # default factory's adapters are cached: a custom adapter_factory
+        # keeps its existing call-per-attempt behavior and owns its own reuse.
+        self._default_adapter_cache: dict[str, ProviderAdapter] = {}
         self._policy = policy or RoundRobinPolicy()
         if isinstance(self._policy, StickyRoutingPolicy):
             self._policy.validate_provider_ids(
@@ -661,7 +667,13 @@ class ProviderRouter:
         return variants_by_protocol, call_type
 
     def _adapter_for(self, provider: ProviderConfig) -> ProviderAdapter:
-        return self._adapter_factory(provider)
+        if not self._using_default_adapters:
+            return self._adapter_factory(provider)
+        adapter = self._default_adapter_cache.get(provider.provider_id)
+        if adapter is None:
+            adapter = self._adapter_factory(provider)
+            self._default_adapter_cache[provider.provider_id] = adapter
+        return adapter
 
     @staticmethod
     def _default_adapter_for(provider: ProviderConfig) -> ProviderAdapter:

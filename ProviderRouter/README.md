@@ -213,6 +213,14 @@ export PROVIDER_A_API_KEY="your-key"
 API keys can also be passed explicitly with `api_key`, but keys are never printed
 or included in router errors.
 
+The built-in adapters build one SDK client per provider and reuse it -- along
+with its pooled HTTP connections -- across calls, retries, and fallbacks for
+the router's lifetime, so only a provider's first request pays the TCP/TLS
+handshake. Connections are released when the process exits. The client is
+rebuilt only when the provider's resolved API key changes, so a key corrected
+mid-run still takes effect on the next call. A custom `adapter_factory` is
+still called per attempt and owns its own client reuse.
+
 The recommended batteries-included install adds DuckDB too, so metrics
 persistence (see below) works out of the box:
 
