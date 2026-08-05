@@ -817,10 +817,11 @@ actionable schema-mismatch error; router calls degrade safely and keep serving
 provider responses. The database owner must move or replace obsolete local
 history manually. Runtime code never deletes a user database.
 
-`request_size_bucket` is already present and nullable, but router-written PR29
-events leave it `NULL`. PR11 is descoped because estimating size would require
-the router to interpret opaque native arguments. Use separate `metrics_scope`
-values when materially different workloads need separate routing history.
+PR11's request-size buckets are descoped because estimating size would require
+the router to interpret opaque native arguments; the formerly reserved
+`request_size_bucket` column has been removed from the schema. Use separate
+`metrics_scope` values when materially different workloads need separate
+routing history.
 
 `metrics_store` is a `ProviderRouter` constructor parameter with three forms:
 

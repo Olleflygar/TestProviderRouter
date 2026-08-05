@@ -66,7 +66,6 @@ def _event(
         success=True,
         stream_opened=None if call_type is CallType.REGULAR else True,
         latency_ms=5.0,
-        request_size_bucket=None,
         timestamp=datetime.now(UTC) if timestamp is None else timestamp,
     )
 

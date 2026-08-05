@@ -205,8 +205,8 @@ automatically selects the invocation call type instead of exposing a separate
 The complete PR29 `provider_attempts` schema is created only for an absent
 table. Incompatible existing tables are detected read-only and left untouched;
 there is no automatic migration, backfill, deletion, or replacement. The
-nullable `request_size_bucket` field is reserved for compatibility and remains
-NULL for router-produced events; the proposed PR11 producer was descoped.
+formerly reserved `request_size_bucket` field was removed from the event
+record and schema (2026-08-05); the proposed PR11 producer was descoped.
 
 ### PR12 — OpenAI Responses API adapter
 

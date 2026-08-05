@@ -355,4 +355,3 @@ def test_streaming_failure_before_open_has_streaming_classification_and_duration
     assert event.latency_ms is None
     assert event.total_duration_ms is not None
     assert event.total_duration_ms >= 0
-    assert event.request_size_bucket is None

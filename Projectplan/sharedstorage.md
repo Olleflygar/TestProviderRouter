@@ -188,7 +188,6 @@ private representations.
 | `latency_ms` | Regular response latency or streaming TTFT | Speed scoring for successful attempts |
 | `total_duration_ms` | Total streaming attempt duration | Stored; not currently scored |
 | `error_type` | Normalized error category | Diagnostic error/rate-limit/timeout tallies |
-| `request_size_bucket` | Reserved workload bucket | Router writes `NULL`; unused |
 
 There is currently no token usage, cost, response body, request body, sticky
 affinity, or durable health state in the metrics table. Health remains separate
@@ -447,8 +446,7 @@ CREATE TABLE provider_attempts (
     stream_opened BOOLEAN,
     latency_ms DOUBLE PRECISION,
     total_duration_ms DOUBLE PRECISION,
-    error_type TEXT,
-    request_size_bucket TEXT
+    error_type TEXT
 );
 
 CREATE INDEX provider_attempts_scope_timestamp_idx

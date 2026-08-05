@@ -44,8 +44,7 @@ CREATE TABLE IF NOT EXISTS provider_attempts (
     stream_opened INTEGER,
     latency_ms REAL,
     total_duration_ms REAL,
-    error_type TEXT,
-    request_size_bucket TEXT
+    error_type TEXT
 )
 """
 
@@ -63,7 +62,6 @@ COLUMN_NAMES = (
     "latency_ms",
     "total_duration_ms",
     "error_type",
-    "request_size_bucket",
 )
 
 _COLUMNS_SQL = ", ".join(COLUMN_NAMES)
@@ -90,7 +88,6 @@ _EXPECTED_SCHEMA = (
     ("latency_ms", "real", False, False),
     ("total_duration_ms", "real", False, False),
     ("error_type", "text", False, False),
-    ("request_size_bucket", "text", False, False),
 )
 
 
@@ -152,7 +149,6 @@ def event_to_params(event: MetricsEvent) -> tuple[object, ...]:
         event.latency_ms,
         event.total_duration_ms,
         event.error_type,
-        event.request_size_bucket,
     )
 
 
@@ -203,7 +199,6 @@ def row_to_event(row: Sequence[Any]) -> MetricsEvent:
         latency_ms,
         total_duration_ms,
         error_type,
-        request_size_bucket,
     ) = row
     return MetricsEvent(
         id=str(id_),
@@ -219,5 +214,4 @@ def row_to_event(row: Sequence[Any]) -> MetricsEvent:
         latency_ms=None if latency_ms is None else float(latency_ms),
         total_duration_ms=None if total_duration_ms is None else float(total_duration_ms),
         error_type=None if error_type is None else str(error_type),
-        request_size_bucket=(None if request_size_bucket is None else str(request_size_bucket)),
     )

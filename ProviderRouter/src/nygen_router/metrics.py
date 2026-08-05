@@ -35,6 +35,5 @@ class MetricsEvent:
     latency_ms: float | None = None
     total_duration_ms: float | None = None
     error_type: str | None = None
-    request_size_bucket: str | None = None
     id: str = field(default_factory=lambda: uuid4().hex)
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))

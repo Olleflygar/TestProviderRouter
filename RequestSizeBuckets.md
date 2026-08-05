@@ -25,8 +25,9 @@ This conflicts with the router's native pass-through, transparency, and
 lightweight-core principles. The motivating use case is already handled more
 explicitly by `metrics_scope`: callers can partition short chats, document
 analysis, vision, or other materially different workloads without the router
-interpreting their call arguments. The reserved `request_size_bucket` field
-therefore remains nullable, and router-produced events leave it `NULL`.
+interpreting their call arguments. The formerly reserved `request_size_bucket`
+field and column were removed from the event record and metrics schema on
+2026-08-05.
 
 The remainder of this document is the original proposed PR11 design. It is
 preserved as historical rationale, including the alternatives and tradeoffs

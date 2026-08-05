@@ -168,9 +168,9 @@ score-based routing has real history to work from:
   actionable mismatch error and router calls degrade safely. Runtime code must
   never alter, backfill, rename, delete, or replace a legacy database. PR13
   owns future explicit schema-versioning and migration design.
-- `request_size_bucket` is reserved and nullable in the PR29 schema. Router
-  events leave it `NULL`. PR11 is descoped: do not inspect opaque call
-  arguments to populate it or add bucket-aware aggregation/scoring. Use
+- PR11 is descoped and the formerly reserved `request_size_bucket` column has
+  been removed from the schema: do not inspect opaque call arguments to
+  estimate request size or add bucket-aware aggregation/scoring. Use
   caller-defined `metrics_scope` values to separate materially different
   workloads.
 

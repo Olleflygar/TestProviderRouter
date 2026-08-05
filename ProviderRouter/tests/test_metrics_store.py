@@ -61,7 +61,6 @@ def _event(
     call_type: CallType = CallType.REGULAR,
     stream_opened: bool | None = None,
     total_duration_ms: float | None = None,
-    request_size_bucket: str | None = None,
     timestamp: datetime | None = None,
 ) -> MetricsEvent:
     return MetricsEvent(
@@ -76,7 +75,6 @@ def _event(
         error_type=error_type,
         stream_opened=stream_opened,
         total_duration_ms=total_duration_ms,
-        request_size_bucket=request_size_bucket,
         timestamp=timestamp if timestamp is not None else datetime.now(UTC),
     )
 
@@ -122,7 +120,6 @@ def test_records_and_reads_back_a_streaming_event(store: MetricsStore) -> None:
         stream_opened=True,
         latency_ms=8.0,
         total_duration_ms=1200.0,
-        request_size_bucket="large",
     )
 
     store.record_attempt(event)
@@ -132,7 +129,6 @@ def test_records_and_reads_back_a_streaming_event(store: MetricsStore) -> None:
     assert read_back.stream_opened is True
     assert read_back.latency_ms == pytest.approx(8.0)
     assert read_back.total_duration_ms == pytest.approx(1200.0)
-    assert read_back.request_size_bucket == "large"
 
 
 def test_regular_event_reads_back_with_stream_opened_none_and_no_total_duration(

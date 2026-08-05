@@ -565,7 +565,6 @@ class ProviderRouter:
             latency_ms=latency_ms,
             error_type=error_type,
             total_duration_ms=total_duration_ms,
-            request_size_bucket=None,
         )
         try:
             self._metrics_store.record_attempt(event)
