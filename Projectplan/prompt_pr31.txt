@@ -1,0 +1,302 @@
+You are implementing PR31 — Baseline thread safety and connection lifecycle in
+the existing nygen-router repository. Complete the work end to end:
+implementation, focused and regression tests, documentation synchronization
+including the new concurrency support matrix, sensible local commits, and the
+required local Git tags. Do not push commits or tags.
+
+Repository root:
+
+    /Users/olleflygar/Developer/TestProviderRouter
+
+Package root:
+
+    /Users/olleflygar/Developer/TestProviderRouter/ProviderRouter
+
+This is an implementation task, not a design task. The specification below is
+the approved result of a requirements interview. Do not reopen its decisions,
+retain rejected alternatives as parallel behavior, or reduce mandatory
+requirements to suggestions. If a requirement genuinely conflicts with an
+unchangeable engine constraint, stop and report the conflict rather than
+inventing weaker semantics.
+
+## Outcome
+
+Make one ProviderRouter instance safe to share across threads within a single
+process, and give the router a defined end of life. Concretely:
+
+- Both bundled metrics stores become thread-safe within one process by
+  serializing all database access behind one lock per store instance.
+- All mutable router state — health, the default adapter cache, policy
+  ordering, and the warning/drop counters — is protected by one router lock.
+- Provider network calls remain fully concurrent: no lock is ever held across
+  an adapter invocation or while a stream is being consumed.
+- ProviderRouter gains close() and context-manager support. Close is
+  idempotent and terminal for the router, and closes only the store the
+  router itself created.
+- A support matrix in ProviderRouter/README.md declares exactly what is and
+  is not supported.
+
+PR31 deliberately does not add buffered/batched writes (PR32), native async
+(PR33), multi-process DuckDB coordination, cross-process health sharing
+(PR25/PR14), or a graceful-drain close that waits for outstanding streams.
+
+## Authority and precedence
+
+Before changing anything, read and follow in full:
+
+- AGENTS.md
+- ProviderRouter/AGENTS.md
+- CODEBASE_AUDIT.md
+- Projectplan/Newprojectplan.md, especially the PR31 boundary statements and
+  the PR30/PR32/PR33 ordering notes
+- Projectplan/prompt_construction.md for repository conventions
+- this approved Projectplan/prompt_pr31.txt
+
+Treat current source and tests as the primary description of shipped
+behavior. The approved PR31 decisions in this prompt deliberately supersede
+only these existing behaviors:
+
+- SQLiteMetricsStore connections are created with the sqlite3 default
+  check_same_thread=True and therefore refuse cross-thread use; and
+- ProviderRouter has no close or lifecycle surface.
+
+Everything else — eager per-attempt writes, lazy store connection creation,
+store close semantics, the MetricsStore three-method contract, scoring,
+health transitions, retry, streaming, and error behavior — is preserved
+exactly.
+
+## Inspect the current implementation
+
+Inspect relevant code in full before editing, especially router.py, health.py,
+filters.py, the three policy modules, storage/duckdb.py, storage/sqlite.py,
+storage/base.py, errors.py, and the package exports. Inspect the tests that
+define current behavior, including the router, health, streaming, retry,
+metrics-store, and storage tests, and the fakes in conftest.py. Inspect
+ProviderRouter/pyproject.toml for the configured quality commands rather than
+assuming invocations.
+
+## Non-negotiable repository rules
+
+- No monkeypatching of internal collaborators in tests; use real seams (the
+  injected clock, adapter factory, policy, and metrics_store parameters) and
+  real temporary databases.
+- Never delete existing tests; add focused new test_pr31_*.py files. Update an
+  existing test only where PR31 deliberately changes the exact behavior it
+  asserted.
+- No new runtime dependency. threading is standard library. Keep
+  `from nygen_router import ProviderRouter` lightweight, DuckDB optional and
+  lazy, and router.py provider-SDK-free.
+- Preserve native pass-through, raw response identity, error transparency, and
+  all shipped routing, health, retry, and streaming semantics.
+- Avoid unrelated refactoring and do not pull PR32/PR33 features forward.
+
+## Store-level serialization
+
+Give DuckDBMetricsStore and SQLiteMetricsStore the identical treatment: one
+threading.Lock per store instance, held for the full duration of every
+database operation — lazy connection creation (including existing-schema
+validation and fresh-database creation), record_attempt, query_recent,
+query_score_aggregates, the private explain helper, and close. The lock is
+never held during any non-database work.
+
+For SQLite, create the connection with check_same_thread=False. This is safe
+precisely because the store lock now guarantees the connection is only ever
+used by one thread at a time; state that constraint in the code where the
+connection is created.
+
+Store close semantics are unchanged: close releases the connection now, is
+idempotent, and a later operation lazily reconnects. Do not make the stores
+terminal, do not add per-thread connections, and do not change any public
+store signature. Direct users of a store class continue to see exactly
+today's behavior, now safe from any thread.
+
+## Router-level serialization
+
+Add one threading.Lock to ProviderRouter guarding all of its mutable state:
+
+- the _health dictionary and every ProviderHealthState mutation (including
+  the read-modify-write in record_failure reached through the router);
+- the default adapter cache, so exactly one adapter is ever created per
+  provider;
+- the metrics warning/recovery flags, the dropped-events counter, and the
+  stream-shape warning set; and
+- the call to policy.order(), so built-in policies (including
+  RoundRobinPolicy's index and ScoreBasedPolicy's warning flag) need no
+  internal locks of their own.
+
+Health reads for eligibility filtering and health_report(), and health writes
+from both the regular path and RouterStream's deferred recording, all go
+through the same lock.
+
+Never hold the router lock (or any lock) across an adapter invocation, a
+stream's chunk iteration, or any provider network activity. Lock acquisition
+order is always router lock before store lock when both are needed; the
+score-based policy's aggregate read during ordering therefore runs under the
+router lock and takes the store lock inside it. Keep every critical section
+short and document the ordering rule where the locks are defined.
+
+The documented policy contract becomes: the router always invokes
+policy.order() while holding its lock, so custom policies are automatically
+serialized per router instance and must not call back into the router.
+
+## Close and lifecycle
+
+Add ProviderRouter.close() plus __enter__/__exit__ context-manager support.
+
+Ownership: close() closes the metrics store only when the router constructed
+it — the unset-default DuckDB case. A caller-provided store (including
+metrics_store=None) is the caller's to close; the router must not touch it.
+
+Terminality: close() is idempotent, and after it completes the router is
+finished. A subsequent invoke() raises a new clearly named error from the
+existing NygenRouterError hierarchy (for example RouterClosedError extending
+ConfigError or NygenRouterError — follow the hierarchy's conventions) whose
+message states the router was closed. reset_health() and health_report()
+after close may keep working on the in-memory state; do not add errors there.
+
+The straggler rule: the router's internal metrics-recording path checks the
+closed flag under the router lock. After close, a metrics write coming from a
+still-draining RouterStream (or any late bookkeeping) is dropped and counted
+through the existing dropped-events counter at DEBUG — it must not reach the
+store, must not lazily reopen the closed connection, and must not emit the
+"metrics storage is unavailable" warning. The stream itself keeps flowing
+untouched, and its in-memory health update still lands. Never interrupt an
+in-flight call or stream from close(); close does not wait for them.
+
+Closing while another thread holds a lock simply waits its turn; the store
+lock already guarantees close cannot interleave with a write in progress.
+
+Export the new error and any new public surface following the package's
+existing export conventions.
+
+## Support matrix documentation
+
+Add a "Concurrency and lifecycle" section to ProviderRouter/README.md,
+alongside the existing health and metrics sections, containing a clear
+support matrix. It must state at minimum:
+
+Supported:
+- one ProviderRouter shared by multiple threads in one process — health,
+  policy ordering, adapter reuse, and metrics recording are serialized;
+- provider network calls running fully concurrently across threads;
+- DuckDBMetricsStore and SQLiteMetricsStore used from multiple threads in one
+  process;
+- several processes sharing one metrics database via SQLiteMetricsStore; and
+- close() as an idempotent, terminal end of life, with with-statement usage.
+
+Not supported (each with its one-line reason and, where applicable, the PR
+that owns it later):
+- multiple processes writing one DuckDB file (DuckDB is single-writer;
+  use SQLite);
+- sharing health state across processes (in-memory by design; PR25/PR14);
+- one stream consumed by more than one thread (streams are single-consumer);
+- using the router after close() (raises; late stream bookkeeping loses only
+  its metrics row, never stream content); and
+- buffered/batched writes and native async (eager per-attempt writes remain;
+  PR32/PR33).
+
+Also state the shutdown rule plainly: finish calls and fully drain or close
+streams before closing the router; a stream finishing after close drops
+exactly its one metrics row, visibly counted.
+
+## Required tests
+
+Add focused test_pr31_*.py files. Follow the repository's fake-adapter and
+temporary-database conventions; no real network, no sleeps as
+synchronization, no monkeypatching internals. Cover at least these behaviors,
+and add whatever further tests the implementation genuinely needs — the
+listed items are the floor, not the ceiling:
+
+- SQLiteMetricsStore used from a second thread works (this test must fail
+  against the current code and pass after the fix).
+- DuckDBMetricsStore and SQLiteMetricsStore accept concurrent
+  writes/reads from multiple threads with an exact final row count.
+- A single shared router driven by roughly a dozen threads with instant fake
+  adapters and a real temporary store records exactly the expected number of
+  metrics rows and ends with coherent health state (a bounded, CI-safe smoke
+  test — assert on exact counts, not timing).
+- Exactly one default adapter instance is created per provider under
+  concurrent first calls.
+- close() is idempotent; the context manager closes; invoke() after close
+  raises the new error.
+- close() closes the router-created default store but never a caller-provided
+  store.
+- A stream still draining at close() completes for its consumer, its health
+  update lands, its metrics row is dropped and counted, and the database file
+  is not reopened.
+- Round-robin ordering remains a correct rotation under concurrent invokes
+  (no lost updates).
+- All existing regression tests continue to pass unchanged.
+
+## Explicit scope boundaries
+
+Do not add: buffered, batched, or background metrics writing; queues or
+worker threads; async APIs; per-thread or pooled database connections;
+cross-process locking or coordination; terminal store close; a close that
+waits for outstanding streams; multi-thread stream consumption; new
+configuration surface for concurrency; retention, rollups, or storage schema
+changes; logging/observability systems; or unrelated refactoring. PR32 owns
+buffering, PR33 owns async, PR25/PR14 own shared persistence.
+
+## Documentation synchronization
+
+After implementation and tests pass, synchronize the repository's explanatory
+material: the new README section above, ProviderRouter/AGENTS.md and root
+AGENTS.md where they describe threading or lifecycle assumptions,
+Projectplan/Newprojectplan.md (mark PR31 shipped with its actual scope),
+CODEBASE_AUDIT.md if it records the concurrency gap, docstrings on the
+touched classes (including the store docstrings' existing single-process
+claims), and any stale statement that the router or stores are not
+thread-safe. Documentation must be accurate about what was not done: writes
+remain eager and synchronous, DuckDB remains single-process, async remains
+future work.
+
+## Git safety, commits, and tags
+
+Inspect git status and existing tags first; preserve unrelated pre-existing
+changes. Confirm neither pr31-start nor pr31-complete exists — if either
+does, stop and report rather than moving it. Establish the repository's
+normal clean prompt-only baseline commit containing this approved prompt,
+create pr31-start immediately before the first implementation change, make
+sensible local commits, and create pr31-complete only after every completion
+criterion passes and all tracked PR31 work is committed. Do not push.
+
+## Validation
+
+Run the configured equivalents of: the focused PR31 tests, the full offline
+pytest suite, coverage, ruff format --check, ruff check, strict mypy over
+src, and the lightweight-import check without DuckDB installed. Inspect
+pyproject.toml for the exact commands. Report exact commands, pass counts,
+and results; do not weaken any configured gate. The concurrency smoke tests
+must be run repeatedly enough locally (for example a handful of consecutive
+full runs) to give confidence they are not flaky before declaring them done.
+
+## Completion criteria
+
+PR31 is complete only when:
+
+- both bundled stores serialize all database access behind one per-instance
+  lock and are usable from any thread in one process;
+- SQLite cross-thread use works where it previously raised;
+- all mutable router state, including policy ordering, is guarded by one
+  router lock with the documented router-before-store acquisition order;
+- no lock is ever held across provider network activity;
+- close() exists, is idempotent and terminal, closes only the router-created
+  store, and post-close stragglers drop their metrics row through the
+  existing counter without reopening the connection;
+- the new error type is exported and raised by invoke() after close;
+- the README support matrix section exists with the agreed supported and
+  unsupported lists and the drain-before-close rule;
+- every required test above exists and passes, the full suite passes, and
+  quality gates pass;
+- documentation is synchronized and PR31 is marked shipped; and
+- pr31-start and pr31-complete correctly bracket the committed work.
+
+## Final handoff
+
+Report concisely: the locking design as implemented (locks, what each
+guards, acquisition order), the close/ownership semantics, important files
+changed, exact test and quality-gate results including the repeated
+smoke-test runs, the README matrix location, documentation synchronized,
+commits created, both tag targets, and the deliberately deferred limitations
+(eager writes, single-process DuckDB, no async, no graceful drain).
