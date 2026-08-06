@@ -25,6 +25,16 @@ class ConfigError(NygenRouterError):
     """Invalid configuration, detected before any request is sent."""
 
 
+class RouterClosedError(NygenRouterError):
+    """The router was closed; close() is terminal and a closed router serves no calls."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This ProviderRouter has been closed. close() is terminal: create a new "
+            "router instead of reusing a closed one."
+        )
+
+
 def _provider_label(provider_name: str, provider_id: str) -> str:
     return f'Provider "{provider_name}" (id="{provider_id}")'
 

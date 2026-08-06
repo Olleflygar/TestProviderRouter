@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,9 @@ class SQLiteMetricsStore:
 
     The recommended option when several local processes must share one store:
     SQLite handles cross-process file locking natively, unlike DuckDB.
+    Within one process the store is thread-safe: one lock serializes every
+    database operation (connection creation, reads, writes, close) on the
+    single shared connection, and is never held outside database work.
     Metrics v2 keeps raw query_recent for direct callers and executes one
     backend aggregate query for scoring through the single measured partition-
     and-timestamp index used by current- and all-scope plans.
@@ -49,12 +53,18 @@ class SQLiteMetricsStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._connection: sqlite3.Connection | None = None
+        # Serializes all use of the single connection, including its lazy
+        # creation and close: one database operation at a time from any
+        # thread. Held only for database work, never around callers' other
+        # activity.
+        self._lock = threading.Lock()
 
     def record_attempt(self, event: MetricsEvent) -> None:
         params = event_to_params(event)
-        connection = self._connect()
-        connection.execute(INSERT_PROVIDER_ATTEMPT_SQL, params)
-        connection.commit()
+        with self._lock:
+            connection = self._connect()
+            connection.execute(INSERT_PROVIDER_ATTEMPT_SQL, params)
+            connection.commit()
 
     def query_recent(
         self,
@@ -74,14 +84,16 @@ class SQLiteMetricsStore:
             protocol=protocol,
             call_type=call_type,
         )
-        connection = self._connect()
-        rows = connection.execute(query, params).fetchall()
+        with self._lock:
+            connection = self._connect()
+            rows = connection.execute(query, params).fetchall()
         return [row_to_event(row) for row in rows]
 
     def query_score_aggregates(self, query: ScoreAggregateQuery) -> list[ScoreAggregate]:
         """Return one validated intermediate-total row per requested provider."""
         sql, params = _build_score_aggregate_sql(query)
-        rows = self._connect().execute(sql, params).fetchall()
+        with self._lock:
+            rows = self._connect().execute(sql, params).fetchall()
         aggregates = [_row_to_score_aggregate(row) for row in rows]
         validated = validate_score_aggregates(query, aggregates)
         return [validated[provider.provider_id] for provider in query.providers]
@@ -89,15 +101,18 @@ class SQLiteMetricsStore:
     def _explain_score_aggregates(self, query: ScoreAggregateQuery) -> tuple[str, ...]:
         """Return private, engine-neutral plan text for deterministic validation."""
         sql, params = _build_score_aggregate_sql(query)
-        rows = self._connect().execute(f"EXPLAIN QUERY PLAN {sql}", params).fetchall()
+        with self._lock:
+            rows = self._connect().execute(f"EXPLAIN QUERY PLAN {sql}", params).fetchall()
         return tuple(" | ".join(str(value) for value in row) for row in rows)
 
     def close(self) -> None:
-        if self._connection is not None:
-            self._connection.close()
-            self._connection = None
+        with self._lock:
+            if self._connection is not None:
+                self._connection.close()
+                self._connection = None
 
     def _connect(self) -> sqlite3.Connection:
+        # Callers hold self._lock; never call this without it.
         if self._connection is None:
             existed = self.path.exists()
             if existed:
@@ -107,7 +122,9 @@ class SQLiteMetricsStore:
                 from nygen_router.storage.admin import LocalBackend, create_database
 
                 create_database(LocalBackend.SQLITE, self.path)
-            connection = sqlite3.connect(str(self.path))
+            # check_same_thread=False is safe only because self._lock
+            # guarantees the connection is used by one thread at a time.
+            connection = sqlite3.connect(str(self.path), check_same_thread=False)
             self._connection = connection
         return self._connection
 

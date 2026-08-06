@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping
@@ -22,6 +23,7 @@ from nygen_router.errors import (
     NoProvidersConfiguredError,
     ProviderError,
     ProviderStreamInterruptedError,
+    RouterClosedError,
     RouterExhaustedError,
     UnsupportedProtocolError,
     categorize_error,
@@ -187,9 +189,15 @@ class ProviderRouter:
         self._health: dict[str, ProviderHealthState] = {}
         # metrics_store=None disables persistence entirely; not passing it at
         # all defaults to a DuckDBMetricsStore pointed at its own default path.
-        selected_metrics_store: object | None = (
-            DuckDBMetricsStore() if isinstance(metrics_store, _UnsetType) else metrics_store
-        )
+        # Only that router-created default is owned by the router: close()
+        # closes what the router created, never a caller-provided store.
+        selected_metrics_store: object | None
+        if isinstance(metrics_store, _UnsetType):
+            self._owned_metrics_store: DuckDBMetricsStore | None = DuckDBMetricsStore()
+            selected_metrics_store = self._owned_metrics_store
+        else:
+            self._owned_metrics_store = None
+            selected_metrics_store = metrics_store
         self._metrics_store = self._validate_metrics_store(selected_metrics_store)
         # A missing DuckDB dependency was already reported by the store at
         # construction, so the first failed write must not repeat the warning.
@@ -206,6 +214,19 @@ class ProviderRouter:
         # Operations whose stream shape this router has already reported as
         # unreadable, so one unfamiliar provider cannot flood the log.
         self._stream_shape_warned: set[str] = set()
+        # One lock guards every piece of mutable router state: health, the
+        # default adapter cache, the metrics/stream-shape counters, the closed
+        # flag, and policy ordering (so built-in and custom policies alike are
+        # serialized per router without locks of their own). It is never held
+        # across an adapter invocation or stream iteration -- provider network
+        # calls stay fully concurrent. When the store's lock is also needed,
+        # this lock is always taken first; nothing ever takes them in the
+        # other order, so deadlock is impossible.
+        self._lock = threading.Lock()
+        # close() is terminal: a closed router raises on invoke() and drops
+        # (counts) any late metrics write from a still-draining stream rather
+        # than reopening the connection it just closed.
+        self._closed = False
 
     def invoke(self, calls: list[CallVariant]) -> Any:
         """Filter, order eligible providers, then try them in turn with fallback.
@@ -220,28 +241,38 @@ class ProviderRouter:
         finishes the job -- fallback, metrics and health -- while the consumer
         iterates. Consumers write the same ``for chunk in ...`` loop either way.
         """
+        with self._lock:
+            if self._closed:
+                raise RouterClosedError()
+
         if not self.providers:
             raise NoProvidersConfiguredError("No providers configured.")
 
         variants_by_protocol, call_type = self._prepare_variants(calls)
 
-        eligible, excluded = filter_eligible_providers(
-            self.providers,
-            supported_protocols=self._supported_protocols,
-            requested_protocols=variants_by_protocol.keys(),
-            health=self._health,
-            now=self._clock(),
-        )
-        if not eligible or call_type is None:
-            raise NoEligibleProvidersError(excluded)
+        # One critical section covers the health-reading eligibility filter
+        # and policy ordering, so concurrent invokes see consistent health and
+        # policies never run concurrently. Provider attempts below run outside
+        # any lock.
+        with self._lock:
+            eligible, excluded = filter_eligible_providers(
+                self.providers,
+                supported_protocols=self._supported_protocols,
+                requested_protocols=variants_by_protocol.keys(),
+                health=self._health,
+                now=self._clock(),
+            )
+            if not eligible or call_type is None:
+                raise NoEligibleProvidersError(excluded)
+
+            context = RoutingContext(
+                metrics_store=self._metrics_store,
+                metrics_scope=self.metrics_scope,
+                call_type=call_type,
+            )
+            ordered = list(self._policy.order(eligible, context))
 
         attempts: list[ProviderAttempt] = []
-        context = RoutingContext(
-            metrics_store=self._metrics_store,
-            metrics_scope=self.metrics_scope,
-            call_type=call_type,
-        )
-        ordered = list(self._policy.order(eligible, context))
         first_order_indexes: dict[str, int] = {}
         retry_cycles_seen: set[str] = set()
         for index, provider in enumerate(ordered):
@@ -334,6 +365,31 @@ class ProviderRouter:
 
         raise RouterExhaustedError(attempts)
 
+    def __enter__(self) -> ProviderRouter:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """End this router's life, releasing the metrics store it created.
+
+        Idempotent and terminal, matching RouterStream: invoke() afterwards
+        raises RouterClosedError. Only the router-created default store is
+        closed -- a caller-provided store is the caller's to close, following
+        close-what-you-create. Never interrupts in-flight calls or streams:
+        they complete normally, and only bookkeeping that reaches the metrics
+        path after close is dropped (visibly counted) so a late write cannot
+        reopen the connection this close just released. Finish calls and fully
+        drain or close streams before closing to lose nothing.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._owned_metrics_store is not None:
+                self._owned_metrics_store.close()
+
     def reset_health(self, provider_id: str | None = None) -> None:
         """Treat one provider -- or every provider, if given None -- as brand new.
 
@@ -345,7 +401,8 @@ class ProviderRouter:
         actually happened survives every reset.
         """
         if provider_id is None:
-            self._health.clear()
+            with self._lock:
+                self._health.clear()
             return
         known = sorted(provider.provider_id for provider in self.providers)
         if provider_id not in known:
@@ -355,7 +412,8 @@ class ProviderRouter:
                 f"Cannot reset health for unknown provider ID {provider_id!r}; "
                 f"configured provider IDs are: {', '.join(repr(item) for item in known)}."
             )
-        self._health.pop(provider_id, None)
+        with self._lock:
+            self._health.pop(provider_id, None)
 
     def health_report(self) -> dict[str, ProviderHealthReport]:
         """Report every configured provider's health, so a reset can be an informed choice.
@@ -366,22 +424,23 @@ class ProviderRouter:
         """
         now = self._clock()
         report: dict[str, ProviderHealthReport] = {}
-        for provider in self.providers:
-            state = self._health.get(provider.provider_id)
-            if state is None:
+        with self._lock:
+            for provider in self.providers:
+                state = self._health.get(provider.provider_id)
+                if state is None:
+                    report[provider.provider_id] = ProviderHealthReport(
+                        provider_id=provider.provider_id,
+                        provider_name=provider.name,
+                    )
+                    continue
                 report[provider.provider_id] = ProviderHealthReport(
                     provider_id=provider.provider_id,
                     provider_name=provider.name,
+                    auth_disabled=state.auth_disabled,
+                    consecutive_failures=state.consecutive_failures,
+                    cooldown_remaining_seconds=state.cooldown_remaining(now),
+                    last_error=state.last_error,
                 )
-                continue
-            report[provider.provider_id] = ProviderHealthReport(
-                provider_id=provider.provider_id,
-                provider_name=provider.name,
-                auth_disabled=state.auth_disabled,
-                consecutive_failures=state.consecutive_failures,
-                cooldown_remaining_seconds=state.cooldown_remaining(now),
-                last_error=state.last_error,
-            )
         return report
 
     def _record_attempt_failure(
@@ -450,10 +509,13 @@ class ProviderRouter:
         Get-or-create + mutate, never replace: replacing the state object would
         silently zero an existing failure count.
         """
-        state = self._health.setdefault(provider.provider_id, ProviderHealthState())
-        started_bench = state.record_failure(category, str(exc), self._health_config, self._clock())
-        if started_bench:
-            self._log_bench(provider, state, category)
+        with self._lock:
+            state = self._health.setdefault(provider.provider_id, ProviderHealthState())
+            started_bench = state.record_failure(
+                category, str(exc), self._health_config, self._clock()
+            )
+            if started_bench:
+                self._log_bench(provider, state, category)
         return started_bench
 
     def _should_retry_provider(
@@ -502,12 +564,13 @@ class ProviderRouter:
 
     def _record_success(self, provider: ProviderConfig) -> None:
         """Clear a provider's failure signal, reporting the end of a bench episode."""
-        state = self._health.get(provider.provider_id)
-        if state is None:
-            # No entry means nothing to reset; don't create a bogus one.
-            return
-        was_benched = state.benched
-        state.record_success()
+        with self._lock:
+            state = self._health.get(provider.provider_id)
+            if state is None:
+                # No entry means nothing to reset; don't create a bogus one.
+                return
+            was_benched = state.benched
+            state.record_success()
         if was_benched:
             logger.info(
                 'Provider "%s" (id="%s") recovered; it is no longer benched.',
@@ -573,26 +636,37 @@ class ProviderRouter:
             error_type=error_type,
             total_duration_ms=total_duration_ms,
         )
-        try:
-            self._metrics_store.record_attempt(event)
-        except Exception:
-            self._dropped_metrics_events += 1
-            logger.debug("Metrics storage write failed.", exc_info=True)
-            if not self._metrics_warning_emitted:
-                logger.warning(
-                    "Metrics storage is unavailable (%s); routing will continue, but "
-                    "attempts are not being recorded. Enable debug logging for details.",
-                    type(self._metrics_store).__name__,
-                )
-                self._metrics_warning_emitted = True
-            return
+        with self._lock:
+            if self._closed:
+                # A stream draining past close() still reports its outcome
+                # here. Dropping the write -- counted, at DEBUG -- is what
+                # keeps a closed router closed: reaching the store would
+                # lazily reopen the connection close() just released. This is
+                # a deliberate close, not a storage outage, so the
+                # unavailability warning stays silent.
+                self._dropped_metrics_events += 1
+                logger.debug("Metrics write after close() dropped.")
+                return
+            try:
+                self._metrics_store.record_attempt(event)
+            except Exception:
+                self._dropped_metrics_events += 1
+                logger.debug("Metrics storage write failed.", exc_info=True)
+                if not self._metrics_warning_emitted:
+                    logger.warning(
+                        "Metrics storage is unavailable (%s); routing will continue, but "
+                        "attempts are not being recorded. Enable debug logging for details.",
+                        type(self._metrics_store).__name__,
+                    )
+                    self._metrics_warning_emitted = True
+                return
 
-        if self._dropped_metrics_events > 0 and not self._metrics_recovery_emitted:
-            logger.info(
-                "Metrics storage recovered after %d unrecorded attempt(s).",
-                self._dropped_metrics_events,
-            )
-            self._metrics_recovery_emitted = True
+            if self._dropped_metrics_events > 0 and not self._metrics_recovery_emitted:
+                logger.info(
+                    "Metrics storage recovered after %d unrecorded attempt(s).",
+                    self._dropped_metrics_events,
+                )
+                self._metrics_recovery_emitted = True
 
     def _log_unrecognized_stream_shape(self, operation: str) -> None:
         """Report once per operation that this stream shape carries no completion marker.
@@ -601,8 +675,9 @@ class ProviderRouter:
         whose chunk shape the adapter cannot read is one fact about that
         operation, not one line per call.
         """
-        first_time = operation not in self._stream_shape_warned
-        self._stream_shape_warned.add(operation)
+        with self._lock:
+            first_time = operation not in self._stream_shape_warned
+            self._stream_shape_warned.add(operation)
         logger.log(
             logging.WARNING if first_time else logging.DEBUG,
             "A stream for operation %r ended without any chunk shape this adapter "
@@ -692,10 +767,14 @@ class ProviderRouter:
     def _adapter_for(self, provider: ProviderConfig) -> ProviderAdapter:
         if not self._using_default_adapters:
             return self._adapter_factory(provider)
-        adapter = self._default_adapter_cache.get(provider.provider_id)
-        if adapter is None:
-            adapter = self._adapter_factory(provider)
-            self._default_adapter_cache[provider.provider_id] = adapter
+        # Check-then-create under the lock: concurrent first calls must not
+        # each build an adapter, or the pooled HTTP connections the cache
+        # exists to reuse would be duplicated.
+        with self._lock:
+            adapter = self._default_adapter_cache.get(provider.provider_id)
+            if adapter is None:
+                adapter = self._adapter_factory(provider)
+                self._default_adapter_cache[provider.provider_id] = adapter
         return adapter
 
     @staticmethod

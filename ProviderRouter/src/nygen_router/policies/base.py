@@ -21,5 +21,10 @@ class Policy(Protocol):
     def order(
         self, eligible: list[ProviderConfig], context: RoutingContext
     ) -> list[ProviderConfig]:
-        """Return eligible providers in the order to attempt them this call."""
+        """Return eligible providers in the order to attempt them this call.
+
+        The router always calls this while holding its own lock, so per-router
+        mutable policy state needs no lock of its own. The flip side: order()
+        must not call back into the router, or it would deadlock on that lock.
+        """
         ...

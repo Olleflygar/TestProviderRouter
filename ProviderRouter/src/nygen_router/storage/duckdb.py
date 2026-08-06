@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -47,6 +48,9 @@ class DuckDBMetricsStore:
     Single-process by design: DuckDB allows one writing process per file. Do
     not build cross-process coordination here -- users who need several local
     processes sharing one store should use SQLiteMetricsStore instead.
+    Within one process the store is thread-safe: one lock serializes every
+    database operation (connection creation, reads, writes, close) on the
+    single shared connection, and is never held outside database work.
     Metrics v2 keeps raw query_recent for direct callers and executes one
     backend aggregate query for scoring. Measured DuckDB plans stayed
     sequential with or without candidate ART indexes, so v2 retains none.
@@ -71,6 +75,11 @@ class DuckDBMetricsStore:
             )
         self._sdk_available = available
         self._connection: duckdb.DuckDBPyConnection | None = None
+        # Serializes all use of the single connection, including its lazy
+        # creation and close: one database operation at a time from any
+        # thread. Held only for database work, never around callers' other
+        # activity.
+        self._lock = threading.Lock()
 
     @property
     def available(self) -> bool:
@@ -79,8 +88,9 @@ class DuckDBMetricsStore:
 
     def record_attempt(self, event: MetricsEvent) -> None:
         params = event_to_params(event)
-        connection = self._connect()
-        connection.execute(INSERT_PROVIDER_ATTEMPT_SQL, list(params))
+        with self._lock:
+            connection = self._connect()
+            connection.execute(INSERT_PROVIDER_ATTEMPT_SQL, list(params))
 
     def query_recent(
         self,
@@ -100,14 +110,16 @@ class DuckDBMetricsStore:
             protocol=protocol,
             call_type=call_type,
         )
-        connection = self._connect()
-        rows: list[Any] = connection.execute(query, params).fetchall()
+        with self._lock:
+            connection = self._connect()
+            rows: list[Any] = connection.execute(query, params).fetchall()
         return [row_to_event(row) for row in rows]
 
     def query_score_aggregates(self, query: ScoreAggregateQuery) -> list[ScoreAggregate]:
         """Return one validated intermediate-total row per requested provider."""
         sql, params = _build_score_aggregate_sql(query)
-        rows: list[Any] = self._connect().execute(sql, list(params)).fetchall()
+        with self._lock:
+            rows: list[Any] = self._connect().execute(sql, list(params)).fetchall()
         aggregates = [_row_to_score_aggregate(row) for row in rows]
         validated = validate_score_aggregates(query, aggregates)
         return [validated[provider.provider_id] for provider in query.providers]
@@ -115,15 +127,18 @@ class DuckDBMetricsStore:
     def _explain_score_aggregates(self, query: ScoreAggregateQuery) -> tuple[str, ...]:
         """Return private, engine-neutral plan text for deterministic validation."""
         sql, params = _build_score_aggregate_sql(query)
-        rows: list[Any] = self._connect().execute(f"EXPLAIN {sql}", list(params)).fetchall()
+        with self._lock:
+            rows: list[Any] = self._connect().execute(f"EXPLAIN {sql}", list(params)).fetchall()
         return tuple(" | ".join(str(value) for value in row) for row in rows)
 
     def close(self) -> None:
-        if self._connection is not None:
-            self._connection.close()
-            self._connection = None
+        with self._lock:
+            if self._connection is not None:
+                self._connection.close()
+                self._connection = None
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
+        # Callers hold self._lock; never call this without it.
         if not self._sdk_available:
             raise ImportError(
                 'duckdb is not installed; install it with pip install "nygen-router[duckdb]"'
