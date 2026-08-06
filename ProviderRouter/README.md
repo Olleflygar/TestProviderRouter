@@ -244,14 +244,13 @@ essential check is excluded, not ranked lower:
 - **no matching `CallVariant`** -- the provider's protocol has an adapter, but
   this specific `invoke()` call didn't supply a `CallVariant` for it
 
-Note: the router does not currently check whether a provider *declares* support
-for what a call's `arguments` actually need (tool calls, streaming, JSON mode,
-etc.) -- `ProviderConfig.capabilities` exists and can be set, but nothing reads
-it yet. A provider that can't handle a given call today discovers that the same
-way any other failure is discovered: the call fails and the router falls back to
-the next eligible provider. Automatic capability-based pre-flight filtering,
-driven from a call's own `arguments`, is planned in
-[`../Projectplan/NewProjectPlan.md`](../Projectplan/NewProjectPlan.md) (PR21).
+The router intentionally does not infer whether a provider supports what a
+call's native `arguments` request (tool calls, streaming, JSON mode, etc.).
+`ProviderConfig` has no capability declaration: keeping one would imply that
+the router understands provider-specific argument semantics. An incompatible
+call is rejected by the provider SDK at call time and follows the documented
+failure classification. PR21 capability inference and PR22 SDK-signature
+pre-validation were scrapped to preserve this pass-through boundary.
 
 If filtering removes every configured provider, `invoke()` raises
 `NoEligibleProvidersError`, whose message enumerates each excluded provider with

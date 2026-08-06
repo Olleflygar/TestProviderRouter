@@ -21,6 +21,19 @@ def test_valid_openai_compatible_config() -> None:
     assert config.protocol == ApiProtocol.OPENAI_CHAT
 
 
+def test_capabilities_configuration_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        ProviderConfig(
+            provider_id="provider_a",
+            name="provider_a",
+            protocol=ApiProtocol.OPENAI_CHAT,
+            model="model-a",
+            base_url="https://api.example.com/v1",
+            api_key="secret",
+            capabilities={"supports_tools": True},
+        )
+
+
 def test_empty_name_rejected() -> None:
     with pytest.raises(ValidationError):
         ProviderConfig(

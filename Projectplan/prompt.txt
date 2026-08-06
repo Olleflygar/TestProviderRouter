@@ -1,3 +1,8 @@
+Historical note (2026-08-06): this prompt records PR1's original scope.
+`ProviderCapabilities` was later removed when PR21 capability inference and
+PR22 pre-flight validation were scrapped. Do not use those parts as current
+implementation guidance; use `NewProjectPlan.md` and the current source.
+
 You are implementing PR 1 of a Python package called nygen-router.
 
 Create a complete folder called:

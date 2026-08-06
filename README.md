@@ -379,11 +379,13 @@ per-call override, delay, backoff, `Retry-After`, async execution, or persistent
 retry state. Values above eight total attempts clamp to eight with one
 caller-facing `UserWarning`.
 
-Capability inference, cost-aware routing, built-in adapters beyond the two
-OpenAI protocols, and framework-specific adapters are not part of the current
-shipped implementation. The examples above show the integration surface
-available today: workflows keep their own structure and delegate only the
-provider call to Nygen Router.
+Capability inference and SDK-signature pre-validation are intentionally
+excluded: provider-native arguments remain opaque until the selected adapter
+passes them to the provider SDK. Cost-aware routing, built-in adapters beyond
+the two OpenAI protocols, and framework-specific adapters are not part of the
+current shipped implementation. The examples above show the integration
+surface available today: workflows keep their own structure and delegate only
+the provider call to Nygen Router.
 
 ## Workflow examples
 

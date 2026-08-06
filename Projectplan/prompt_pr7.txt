@@ -1,3 +1,7 @@
+Historical note (2026-08-06): this shipped-PR prompt retains its original
+boundaries. PR21 capability inference was later scrapped and is not active
+roadmap work.
+
 You are implementing PR 7 ("Metrics aggregation") of the nygen-router
 package.
 
@@ -162,7 +166,7 @@ Out of scope -- do not implement
   parameter must exist and default to flat weight-1.0 behavior, nothing
   more
 - Cost tracking (PR 6), request-size buckets (PR 11), capability
-  inference (PR 21), token usage (PR 24)
+  inference (then-planned PR 21, later scrapped), token usage (PR 24)
 - Any change to MetricsStore, MetricsEvent, or the provider_attempts
   schema -- this PR only reads events that already exist, via the
   existing query_recent

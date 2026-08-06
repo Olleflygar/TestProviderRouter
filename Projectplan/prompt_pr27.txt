@@ -1,3 +1,7 @@
+Historical note (2026-08-06): this shipped-PR prompt retains its original
+boundaries. PR21 capability inference and PR22 pre-flight validation were later
+scrapped and are not active roadmap work.
+
 # Execution prompt: PR27 — Configurable same-provider retry policy
 
 You are implementing **PR27 — Configurable same-provider retry policy** in the
@@ -846,8 +850,9 @@ PR27 must not:
 - add affinity state or modify fixed sticky preference;
 - add persistent/distributed retry state, locks, async support, or background
   workers;
-- implement PR19 logging hooks, PR20 observability hooks, PR21 capability
-  filtering, PR22 pre-flight validation, PR25 durable health, PR13 storage
+- implement PR19 logging hooks, PR20 observability hooks, then-planned PR21
+  capability filtering or PR22 pre-flight validation (both later scrapped),
+  PR25 durable health, PR13 storage
   versioning, or unrelated roadmap work; or
 - perform unrelated refactoring.
 

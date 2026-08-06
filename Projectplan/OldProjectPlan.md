@@ -48,6 +48,15 @@ also match model and protocol. Duplicate display names are valid. Existing
 incompatible tables are inspected read-only and left untouched. The older PR
 sections remain unchanged as historical descriptions of their own time.
 
+Corrective roadmap note (2026-08-06): PR21 capability inference and PR22
+pre-flight SDK-signature validation were scrapped. Both required the router to
+inspect provider-native arguments or load provider integrations earlier than
+the native pass-through design permits. `ProviderCapabilities` and
+`ProviderConfig.capabilities` were subsequently removed as unused public
+configuration. References below remain only as historical records of earlier
+plans and must not be treated as future work. The active roadmap is
+`NewProjectPlan.md`.
+
 Verified: `ruff check .`, `mypy src` (strict mode), and `pytest` all pass;
 combined coverage across PR1-3 is 93% (branch coverage on), meeting the 90%+
 target set. 
@@ -589,12 +598,10 @@ What shipped (verified against src/nygen_router/):
   exceptions end-to-end through mocked HTTP responses rather than
   constructing router errors by hand.
 
-Two deliberately deferred follow-ups, not part of this redesign -- see their
-own backlog entries below: PR 21 (restoring pre-flight capability filtering,
-now driven from a call's own arguments instead of dedicated boolean flags)
-and PR 22 (pre-flight CallVariant dispatch validation, so a bad operation/
-arguments typo is caught once upfront instead of costing one wasted live
-provider attempt).
+Two follow-ups were deferred at the time of this redesign: PR 21 (restoring
+pre-flight capability filtering from native arguments) and PR 22 (pre-flight
+`CallVariant` dispatch validation). Both were later scrapped; see the
+corrective roadmap note above and their historical entries below.
 
 Files touched:
 ProviderRouterPR1/
@@ -1716,8 +1723,12 @@ Optional support for:
 Rule:
 No observability dependency in core.
 
-PR 21: Capability-based hard filtering v2 (automatic inference)
------------------------------------------------------------------
+PR 21 [SCRAPPED 2026-08-06]: Capability-based hard filtering v2
+----------------------------------------------------------------
+Historical proposal only. It was rejected because interpreting provider-native
+arguments creates semantic coupling and works against lightweight optional
+provider integrations.
+
 Goal:
 Restore pre-flight capability exclusion, dropped by the PR 3R CallVariant
 redesign (see that section above) when the normalized request's requires_tools
@@ -1749,8 +1760,12 @@ Tests:
   response_format
 - a fully capable provider remains eligible
 
-PR 22: Pre-flight CallVariant dispatch validation
-----------------------------------------------------
+PR 22 [SCRAPPED 2026-08-06]: Pre-flight CallVariant dispatch validation
+------------------------------------------------------------------------
+Historical proposal only. It was rejected because eager SDK resolution and
+signature binding violate the opaque native-argument boundary and load
+optional provider integrations before the selected attempt.
+
 Goal:
 Deferred from PR 3R (see that section above): catch a bad operation string or
 mismatched arguments once, before the fallback loop starts, instead of

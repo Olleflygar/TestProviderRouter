@@ -42,14 +42,12 @@ Implementation rules for this package:
   in cooldown, resolvable API key, protocol has a registered adapter, and
   protocol has a matching `CallVariant` in this specific call. Apart from the
   two health checks (see "Provider health" below), they are static. There is
-  currently no
-  capability-based filtering (no `requires_tools`-style check) -- a provider
-  that can't actually handle a call's `arguments` fails at call time like any
-  other provider error, rather than being excluded pre-flight. Restoring
-  pre-flight capability filtering (inferred from a call's own `arguments`,
-  compared against `ProviderConfig.capabilities`) is planned in
-  `../Projectplan/NewProjectPlan.md` (PR21). Do not build that inference logic
-  as part of unrelated work.
+  intentionally no capability-based filtering (no `requires_tools`-style
+  check) -- a provider that can't actually handle a call's `arguments` fails
+  at call time like any other provider error, rather than being excluded
+  pre-flight. PR21 and PR22 were scrapped to preserve opaque native arguments
+  and lightweight optional provider integrations. Do not add capability
+  inference or SDK-signature pre-validation to router code.
 - A successful `invoke()` call returns the provider SDK's raw response object,
   completely untouched -- no wrapper, no `.attempts`/`.excluded` attached to
   it. Do not reintroduce a response wrapper; planned logging and observability

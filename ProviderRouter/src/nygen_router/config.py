@@ -4,7 +4,7 @@ import os
 from enum import StrEnum
 from typing import Self
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, SecretStr, field_validator, model_validator
 
 from nygen_router.errors import MissingApiKeyError
 
@@ -13,16 +13,6 @@ class ApiProtocol(StrEnum):
     OPENAI_CHAT = "openai_chat"
     OPENAI_RESPONSES = "openai_responses"
     ANTHROPIC_MESSAGES = "anthropic_messages"
-
-
-class ProviderCapabilities(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    supports_chat: bool = True
-    supports_responses_api: bool = False
-    supports_tools: bool = False
-    supports_streaming: bool = False
-    supports_json_mode: bool = False
 
 
 class ProviderConfig(BaseModel):
@@ -37,7 +27,6 @@ class ProviderConfig(BaseModel):
     api_key_env: str | None = None
     enabled: bool = True
     timeout_seconds: float = 30.0
-    capabilities: ProviderCapabilities = Field(default_factory=ProviderCapabilities)
 
     @field_validator("provider_id", "name", "model")
     @classmethod

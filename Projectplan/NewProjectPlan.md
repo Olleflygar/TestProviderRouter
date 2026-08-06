@@ -4,8 +4,8 @@
 
 Build `nygen-router`, a lightweight Python router that selects the best
 configured provider for a user-chosen model. Routing decisions use observed
-latency, reliability, rate limits, provider capabilities, and explicit
-caller-defined metrics scopes.
+latency, reliability, rate limits, provider health, and explicit caller-defined
+metrics scopes.
 
 Cost visibility is optional and based only on user-supplied pricing. Framework
 adapters, dashboards, remote storage, and observability integrations remain
@@ -17,9 +17,9 @@ Git tags, repository history, and source confirm that PR1–5, PR7–10, PR12,
 PR13, PR23, PR26, PR27, and the PR3R `CallVariant` redesign have shipped. PR29 was added
 later as an unplanned corrective prerequisite for the remaining
 metrics/storage roadmap. PR13 has now shipped; the old project plan's remaining
-roadmap IDs are PR6 and PR14–22. PR11 and PR24 have been descoped and are
-recorded under Scrapped PRs, while PR30 is the next corrective storage-track
-step from the codebase audit.
+active roadmap IDs are PR6 and PR14–20. PR11, PR21, PR22, and PR24 have been
+descoped and are recorded under Scrapped PRs, while PR30 is the next corrective
+storage-track step from the codebase audit.
 
 The roadmap below preserves those PR identifiers, revises overlapping scopes
 where necessary, and adds four candidate PRs. It is ordered by recommended
@@ -32,7 +32,8 @@ work must preserve.
 
 - `from nygen_router import ProviderRouter` must remain lightweight.
 - Provider and framework dependencies are optional and lazily imported.
-- Hard capability filters run before provider scoring.
+- Provider-native `CallVariant.arguments` remain opaque to router code. The
+  router does not infer capabilities or pre-validate SDK call signatures.
 - A retryable provider failure falls back when another eligible provider
   remains, after any explicitly configured same-provider retry cycle.
 - Storage, metrics, dashboard, logging, and observability failures must not
@@ -263,6 +264,29 @@ response/conversation affinity remain caller responsibilities.
 These proposals are intentionally excluded from the active roadmap. Their
 numbers remain reserved so historical references continue to make sense.
 
+### [scrapped] PR21 — Automatic capability filtering
+
+Inferring tools, streaming, or structured-output requirements would require
+the router to interpret provider-native argument keys and maintain semantic
+knowledge of multiple SDK request formats. It would also encourage capability
+metadata and provider-specific dependencies to spread into the routing core.
+
+The router instead treats `CallVariant.arguments` as opaque pass-through data.
+Eligibility remains limited to router-owned configuration and state. A provider
+that cannot satisfy a native call reports that incompatibility through its SDK
+at call time, using the existing failure classification and fallback behavior.
+
+### [scrapped] PR22 — Pre-flight `CallVariant` validation
+
+Resolving every operation and binding arguments against live SDK signatures
+before routing would require optional provider SDKs to be loaded early and
+would make the router validate data it otherwise promises to pass through
+unchanged. SDK signatures can also be dynamic or differ across versions.
+
+Operation and argument errors therefore remain adapter-time fail-fast errors.
+They do not bench a provider, and the router does not add a separate pre-flight
+inspection phase.
+
 ### [scrapped] PR24 — Framework-neutral token usage instrumentation
 
 Token counting on the router's hot path is CPU-bound and can create memory
@@ -315,25 +339,7 @@ large-history benchmark. PR30 adds no dashboard/reporting API, rollup cache,
 retention behavior, or remote backend. It builds on PR13's versioned schema and
 must land before PR14 is treated as production-ready for live score routing.
 
-### 2. PR22 — Pre-flight `CallVariant` validation
-
-**Summary:** Validate operations and arguments before attempting a provider.
-
-Resolve supported operations and check argument compatibility before entering
-the fallback loop. Invalid calls fail without network traffic or misleading
-provider-health changes.
-
-### 3. PR21 — Automatic capability filtering
-
-**Summary:** Exclude providers that cannot satisfy tools, streaming, or
-structured-output requirements.
-
-Inspect the relevant `CallVariant` arguments and compare inferred requirements
-with provider capabilities. This restores the hard-filter behaviour removed by
-the PR3R redesign while keeping interpretation limited to known protocol
-fields.
-
-### 4. PR25 — Durable local provider health
+### 2. PR25 — Durable local provider health
 
 **Summary:** Persist provider cooldowns, rate limits, and health observations
 across router lifecycles.
@@ -343,7 +349,7 @@ implementation. This first stage promises durable state on one installation,
 not organization-wide coordination, and storage failures continue to degrade
 safely to in-memory health.
 
-### 5. PR14 — PostgreSQL organizational state (including Supabase)
+### 3. PR14 — PostgreSQL organizational state (including Supabase)
 
 **Summary:** Share metrics and health across applications within an
 organization.
@@ -377,16 +383,16 @@ policy's documented tie-break behavior. Any future caching, background writes,
 rollups, retention, or local-to-global replication requires separate explicit
 semantics because each changes freshness, durability, or routing latency.
 
-### 6. PR15 — Routing profiles
+### 4. PR15 — Routing profiles
 
 **Summary:** Offer simple profiles for speed, reliability, or balanced routing.
 
 Profiles configure the scoring weights and history settings that already exist
 rather than introducing a separate scoring system. Cost is excluded from the
-standard profiles, and capability requirements remain hard filters rather than
-weighted preferences.
+standard profiles. Profiles do not inspect native arguments, infer provider
+capabilities, or introduce new eligibility rules.
 
-### 7. PR6 — Manual token-cost calculation
+### 5. PR6 — Manual token-cost calculation
 
 **Summary:** Estimate cost from user-supplied prices and recorded usage.
 
@@ -395,7 +401,7 @@ cost only from usage supplied through an explicit public seam. Pricing remains
 visibility-only by default: no argument inspection, scraping, or automatic
 cost influence on core routing.
 
-### 8. PR28 — Optional local metrics dashboard
+### 6. PR28 — Optional local metrics dashboard
 
 **Summary:** Provide a read-only single-page view of provider performance.
 
@@ -404,7 +410,7 @@ explicitly configured cost estimates from the reporting interface. Ship it as
 an optional local web extra so dashboard dependencies do not affect the core
 import.
 
-### 9. PR16 — Environment and configuration factories
+### 7. PR16 — Environment and configuration factories
 
 **Summary:** Make common router setup concise and repeatable.
 
@@ -413,7 +419,7 @@ retaining direct `ProviderConfig` construction. Factories may select routing
 profiles and optional stores but must not hide invalid configuration or
 silently enable sticky routing and retries.
 
-### 10. PR19 — Configurable logging hooks
+### 8. PR19 — Configurable logging hooks
 
 **Summary:** Expose routing decisions and failures through standard Python
 logging.
@@ -423,7 +429,7 @@ sticky-provider selections, and storage degradation. Existing internal warnings
 should be consolidated into documented events without adding print-based
 output.
 
-### 11. PR20 — Optional observability hooks
+### 9. PR20 — Optional observability hooks
 
 **Summary:** Integrate routing activity with tracing and custom callbacks.
 
@@ -431,7 +437,7 @@ Provide optional OpenTelemetry, Logfire, and callback integrations using the
 neutral metrics and event model. Observability failures and missing optional
 packages must never break provider calls or the lightweight core import.
 
-### 12. PR18 — Pydantic-AI adapter (very low priority)
+### 10. PR18 — Pydantic-AI adapter (very low priority)
 
 **Summary:** Allow a Pydantic-AI agent to use the router as a model
 implementation.
@@ -446,7 +452,7 @@ The router cannot necessarily be passed directly to a Pydantic-AI `Agent`
 because it does not implement Pydantic AI's model interface. The integration
 must import the router, while the router core must not import Pydantic AI.
 
-### 13. PR17 — LangChain adapter (very low priority)
+### 11. PR17 — LangChain adapter (very low priority)
 
 **Summary:** Allow the router to behave like a LangChain chat model.
 
@@ -471,7 +477,8 @@ not obvious from the numbered roadmap alone.
   explicit administration, and no-runtime-migration boundaries.
 - PR30 is the next storage-track step and precedes production PostgreSQL score
   reads. PR31 separately owns concurrency and connection lifecycle.
-- PR22 and PR21 follow the shipped PR13 foundation in the broader sequence.
+- PR21 and PR22 are scrapped. Native arguments stay opaque, and operation or
+  argument errors remain adapter-time fail-fast errors.
 - PR13, PR25, and PR14 form a staged persistence path: shipped storage
   foundation, durable local health, then true shared organizational state.
 - PR15 is narrowed to profiles supported by the existing scoring model.

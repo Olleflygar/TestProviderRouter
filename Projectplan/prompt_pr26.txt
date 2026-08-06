@@ -1,3 +1,7 @@
+Historical note (2026-08-06): this shipped-PR prompt retains its original
+boundaries. PR21 capability inference was later scrapped and is not active
+roadmap work.
+
 # Execution prompt: PR26 — Configurable sticky routing
 
 You are implementing **PR26 — Configurable sticky routing** in the existing
@@ -75,8 +79,8 @@ Confirm the following shipped architecture before implementing:
   returned attempt order through the existing fallback loop.
 - Hard eligibility currently means enabled, not auth-benched, not in an active
   cooldown, resolvable API key, registered protocol adapter, and a matching
-  `CallVariant` protocol. PR21 owns future pre-flight capability inference; do
-  not implement it here.
+  `CallVariant` protocol. The then-planned PR21 owned pre-flight capability
+  inference; it was later scrapped and must not be implemented here.
 - `ProviderConfig.provider_id` is canonical and unique within a router.
   `ProviderConfig.name` is display metadata and must never become an identity
   or filter key.
@@ -489,7 +493,7 @@ PR26 must not:
   mandatory database;
 - add locks to unrelated policies;
 - change retry budgets or implement PR27;
-- implement PR21 capability inference;
+- implement the then-planned PR21 capability inference (later scrapped);
 - add PR19 logging hooks or PR20 observability hooks;
 - add metrics fields, store methods, schema changes, reporting queries, or
   storage migrations;
@@ -817,7 +821,7 @@ PR26 is complete only when all of the following are true:
   learned/session affinity or guaranteed provider-side caching;
 - strict provider-owned state limitations remain accurately documented;
 - the current roadmap marks PR26 shipped and remains consistent with PR16,
-  PR19, PR20, PR21, and PR27 boundaries;
+  PR19, PR20, the then-planned PR21, and PR27 boundaries;
 - the final diff contains no unrelated changes;
 - `pr26-start` points to the pre-execution starting commit;
 - the committed completed work includes source, tests, this prompt, and

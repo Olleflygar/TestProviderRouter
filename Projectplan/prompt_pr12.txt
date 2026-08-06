@@ -1,3 +1,7 @@
+Historical note (2026-08-06): this shipped-PR prompt retains its original
+boundaries. PR21 capability inference and PR22 pre-flight validation were later
+scrapped, and `ProviderCapabilities` was removed from the public configuration.
+
 You are implementing PR12 in the current `nygen-router` repository. Complete the
 work end to end, including implementation, tests, documentation synchronization,
 validation, Git commits, and the required local tags. Do not push commits or tags.
@@ -297,8 +301,9 @@ router to the SDK:
   validation coverage.
 - Update adapter/package exports only where the current public architecture
   expects them.
-- Do not activate `ProviderCapabilities.supports_responses_api` filtering.
-  Capabilities remain unused until PR21.
+- At the time, do not activate
+  `ProviderCapabilities.supports_responses_api` filtering. The unused
+  capabilities configuration and then-planned PR21 were later removed.
 - Preserve custom `adapter_factory` and `supported_protocols` extension seams.
 
 ## Implementation phase 2: preserve and verify global fail-fast behavior
@@ -314,7 +319,8 @@ The agreed reason is:
 > another protocol variant succeeds. This prevents a misconfigured preferred
 > path from silently being replaced by a secondary provider in a long-running
 > workflow. These failures do not bench the provider. General pre-flight
-> validation may improve how early they are detected in PR22, but
+> validation was then expected to improve how early they were detected in
+> PR22 (later scrapped), but
 > cross-protocol recovery from them is intentionally out of scope.
 
 Only after the Responses adapter and its focused tests are implemented and
@@ -348,7 +354,8 @@ Required regression expectations:
   unknown errors still fall back across protocols, selecting each provider's
   matching `CallVariant`, operation, arguments, and model.
 
-Do not pull PR22 pre-flight validation into PR12.
+Do not pull the then-planned PR22 pre-flight validation into PR12. PR22 was
+later scrapped.
 
 ## Tests
 

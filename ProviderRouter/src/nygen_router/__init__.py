@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from nygen_router.adapters.base import NormalizedStream
-from nygen_router.config import ApiProtocol, ProviderCapabilities, ProviderConfig
+from nygen_router.config import ApiProtocol, ProviderConfig
 from nygen_router.errors import (
     ConfigError,
     DuplicateCallVariantProtocolError,
@@ -104,7 +104,6 @@ __all__ = [
     "NygenRouterError",
     "Policy",
     "ProviderAttempt",
-    "ProviderCapabilities",
     "ProviderConfig",
     "ProviderConnectionError",
     "ProviderError",

@@ -1,3 +1,7 @@
+Historical note (2026-08-06): this shipped-PR prompt retains its original
+boundaries. PR21 and PR22 were later scrapped; references to their prospective
+schema or behavior are not active roadmap requirements.
+
 You are implementing PR 4 ("DuckDB-backed metrics storage (default), behind
 a swappable interface") of the nygen-router package.
 
@@ -95,7 +99,8 @@ exactly:
 3. Schema — identical columns in both engines, created lazily with CREATE
    TABLE IF NOT EXISTS on first use (no separate init step). Exactly these
    eight columns, no more: input_tokens/output_tokens (PR 24),
-   required_tools (PR 21), request_size_bucket (PR 11), cost (PR 6), and
+   required_tools (then-planned PR 21, later scrapped), request_size_bucket
+   (PR 11), cost (PR 6), and
    stream/total_duration_ms (PR 23) all arrive in later PRs with their data
    sources.
 
@@ -199,8 +204,8 @@ exactly:
 Out of scope — do not implement
 
 - token columns / usage extraction (PR 24), request_size_bucket (PR 11),
-  required_tools (PR 21), cost (PR 6), stream flag / TTFT semantics /
-  total_duration_ms (PR 23)
+  required_tools (then-planned PR 21, later scrapped), cost (PR 6), stream flag /
+  TTFT semantics / total_duration_ms (PR 23)
 - aggregation, ProviderStats, or any query beyond query_recent (PR 7)
 - schema versioning, migrations, Postgres/Supabase (PR 13, PR 14)
 - async/batched/queued writes — writes are synchronous on the calling
