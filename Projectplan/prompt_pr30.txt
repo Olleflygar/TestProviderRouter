@@ -1,0 +1,908 @@
+You are implementing PR30 — Storage-side score aggregation in the existing
+nygen-router repository. Complete the work end to end: implementation, focused
+and regression tests, performance validation, documentation synchronization,
+sensible local commits, the explicitly authorized one-time recreation of the
+disposable local demo metrics databases, and the required local Git tags. Do
+not push commits or tags.
+
+Repository root:
+
+    /Users/olleflygar/Developer/TestProviderRouter
+
+Package root:
+
+    /Users/olleflygar/Developer/TestProviderRouter/ProviderRouter
+
+This is an implementation task, not a design task. The specification below is
+the approved result of a requirements interview. Do not reopen its decisions,
+retain rejected alternatives as parallel behavior, or reduce mandatory
+requirements to suggestions. If a requirement genuinely conflicts with an
+unchangeable engine constraint, stop and report the conflict rather than
+inventing weaker semantics.
+
+## Outcome
+
+Move ScoreBasedPolicy's history reduction into each supported database so a
+score query returns one bounded aggregate per distinct eligible provider
+partition rather than every matching MetricsEvent.
+
+PR30 deliberately evolves MetricsStore into a mandatory three-method contract.
+DuckDBMetricsStore and SQLiteMetricsStore must perform score aggregation in
+backend-specific SQL automatically. ScoreBasedPolicy must always use the
+aggregate operation when metrics are enabled; it must never fall back to
+query_recent for scoring.
+
+Preserve the existing self-correcting optimistic-start behavior: a genuinely
+new provider receives explicit zero evidence and can be explored, while later
+successes and failures change its score. At the same time, never confuse a
+missing aggregate row with legitimate zero history. The aggregate query must
+return exactly one row per requested provider, including explicit zero rows,
+and malformed or incomplete aggregate results must be rejected.
+
+Ship an indexed metrics schema version 2 for fresh DuckDB and SQLite databases.
+Existing version-1 and implicit PR29 databases are disposable for this
+pre-release/demo repository and do not receive a PR30 migration. Normal runtime
+must still refuse to delete, overwrite, rename, redirect, or silently alter an
+existing database.
+
+## Authority and precedence
+
+Before changing anything, read and follow in full:
+
+- AGENTS.md
+- ProviderRouter/AGENTS.md
+- any more-local AGENTS.md governing a touched file
+- CODEBASE_AUDIT.md, especially Finding A and the storage delivery order
+- Projectplan/Newprojectplan.md, especially PR30 and its ordering boundaries
+- Projectplan/sharedstorage.md
+- the relevant PR7, PR9, PR10, PR13, PR29, and storage passages in
+  Projectplan/OldProjectPlan.md
+- Projectplan/prompt_construction.md
+- Projectplan/prompt_construction_pr27.md
+- Projectplan/prompt_pr13.txt
+- Projectplan/prompt_pr29.txt
+- this approved Projectplan/prompt_pr30.txt
+
+Treat current source and tests as the primary description of shipped behavior.
+Use the current roadmap next and historical material for rationale.
+
+The approved PR30 decisions in this prompt deliberately supersede only these
+existing statements:
+
+- MetricsStore is permanently limited to record_attempt and query_recent.
+- custom two-method MetricsStore implementations retain a Python aggregation
+  fallback;
+- PR30's aggregate operation is an optional secondary capability;
+- ScoreBasedPolicy may fetch raw history after aggregate failure;
+- the exact implicit PR29/version-1 database remains usable by PR30 runtime;
+- every PR30 schema revision must provide a version-1-to-version-2 migration;
+  and
+- current disposable local metrics history must be preserved.
+
+Name these compatibility breaks explicitly in code documentation, the current
+roadmap, agent guidance, storage documentation, and release/audit notes. Do not
+use them to weaken unrelated PR13 safety guarantees. Runtime still never
+silently changes an existing target, administration remains separate from
+MetricsStore, schema inspection remains read-only, creation still refuses
+existing targets, component versions stay independent, and database-native
+objects remain private.
+
+## Inspect the current implementation
+
+Inspect relevant code in full before editing, especially:
+
+- ProviderRouter/src/nygen_router/metrics.py
+- ProviderRouter/src/nygen_router/stats.py
+- ProviderRouter/src/nygen_router/scoring.py
+- ProviderRouter/src/nygen_router/policies/base.py
+- ProviderRouter/src/nygen_router/policies/score_based.py
+- ProviderRouter/src/nygen_router/policies/round_robin.py
+- ProviderRouter/src/nygen_router/policies/sticky.py
+- ProviderRouter/src/nygen_router/storage/base.py
+- ProviderRouter/src/nygen_router/storage/schema.py
+- ProviderRouter/src/nygen_router/storage/admin.py
+- ProviderRouter/src/nygen_router/storage/duckdb.py
+- ProviderRouter/src/nygen_router/storage/sqlite.py
+- ProviderRouter/src/nygen_router/storage/__init__.py
+- ProviderRouter/src/nygen_router/router.py
+- ProviderRouter/src/nygen_router/config.py
+- ProviderRouter/src/nygen_router/types.py
+- ProviderRouter/src/nygen_router/errors.py
+- ProviderRouter/src/nygen_router/__init__.py
+
+Inspect tests that define current behavior, including:
+
+- ProviderRouter/tests/test_stats.py
+- ProviderRouter/tests/test_scoring.py
+- ProviderRouter/tests/test_score_based_policy.py
+- ProviderRouter/tests/test_recency_weighting.py
+- ProviderRouter/tests/test_metrics_store.py
+- ProviderRouter/tests/test_duckdb_storage.py
+- ProviderRouter/tests/test_sqlite_storage.py
+- ProviderRouter/tests/test_pr29_identity_scope.py
+- ProviderRouter/tests/test_pr29_storage_contract.py
+- ProviderRouter/tests/test_pr13_schema_versioning.py
+- ProviderRouter/tests/test_pr13_storage_admin.py
+- ProviderRouter/tests/test_pr13_storage_cli.py
+- router, retry, sticky-policy, health, and streaming tests containing custom
+  or fake metrics stores
+
+Also inspect ProviderRouter/pyproject.toml, CI, dependency files, package
+exports, README examples, and WorkflowTests/shared.py plus
+WorkflowTests/README.md.
+
+Preserve the current meanings:
+
+- one MetricsEvent per physical provider attempt;
+- canonical provider identity is provider_id, never display name;
+- exact scoring partitions are metrics scope, provider ID, model, protocol,
+  and caller-declared CallType;
+- regular latency is full-response latency;
+- streaming latency is TTFT and remains NULL when no first chunk arrives;
+- only successful attempts with non-NULL latency enter latency averages;
+- failed attempts never look fast;
+- diagnostic error/rate-limit/timeout tallies are exact, integer, and
+  unweighted;
+- scoring-relevant attempt and success counts may be fractional under decay;
+- ScoreBasedPolicy calls its tie-break policy exactly once before reading
+  history;
+- stable score sorting preserves the tie-break order for equal scores;
+- the default tie-break policy is RoundRobinPolicy;
+- metrics read failure cannot prevent a provider call;
+- metrics_scope=None in a score query means HistoryScope.ALL, not a blank
+  current scope;
+- metrics_store=None explicitly disables persistence/history; and
+- calculate_provider_score remains pure Python with no storage or I/O.
+
+## Non-negotiable repository rules
+
+- Do not monkeypatch internal collaborators in tests. Do not use
+  monkeypatch.setattr or unittest.mock.patch to swap internal functions,
+  classes, methods, drivers, connections, clocks, or query builders. Use real
+  temporary databases, public constructors, typed requests, and established
+  public seams. Environment-variable monkeypatching remains allowed.
+- Do not delete existing tests. Update an existing test only when PR30
+  deliberately changes the exact behavior it asserted. Add focused PR30 test
+  files alongside the regression suite.
+- Keep from nygen_router import ProviderRouter lightweight. DuckDB stays
+  optional and lazy. SQLite stays standard-library-only. Add no new mandatory
+  runtime dependency or benchmark framework.
+- Keep drivers, SQL rows, cursors, connections, sessions, engines, query plans,
+  and SQL expressions out of router, policy, scoring, and public domain
+  results.
+- Keep router.py entirely provider-SDK-free and preserve lazy provider SDK
+  imports.
+- Preserve native CallVariant pass-through, raw response identity, error
+  transparency, health, hard filters, fallback, retry, and streaming behavior.
+- Do not expose secrets, API keys, database credentials, event payloads, or
+  sensitive bound values in logs, exceptions, benchmark output, tests, or
+  documentation.
+- Avoid unrelated refactoring and do not pull later roadmap features into
+  PR30.
+
+## Mandatory MetricsStore contract
+
+Evolve the existing public structural MetricsStore protocol rather than adding
+an optional capability protocol. It must require all three operations:
+
+~~~python
+class MetricsStore(Protocol):
+    def record_attempt(self, event: MetricsEvent) -> None: ...
+
+    def query_recent(
+        self,
+        *,
+        since: datetime,
+        metrics_scope: str | None = None,
+        provider_id: str | None = None,
+        model: str | None = None,
+        protocol: ApiProtocol | None = None,
+        call_type: CallType | None = None,
+    ) -> list[MetricsEvent]: ...
+
+    def query_score_aggregates(
+        self,
+        query: ScoreAggregateQuery,
+    ) -> list[ScoreAggregate]: ...
+~~~
+
+Exact names may be adjusted only if an existing naming collision requires it;
+prefer the names in this prompt. Do not add a second
+ScoreAggregateMetricsStore protocol, a capability flag, a use_sql_aggregation
+option, or runtime selection between aggregate and raw scoring paths.
+
+Retain query_recent as the explicit raw-history operation for direct callers,
+conformance tests, diagnosis, and Python-reference comparisons. It is not used
+by ScoreBasedPolicy after PR30.
+
+When metrics_store is not None, ProviderRouter construction must validate that
+record_attempt, query_recent, and query_score_aggregates are present and
+callable. A path string, legacy two-method object, missing method, or
+non-callable attribute raises ConfigError before any provider call. The
+built-in default and both bundled stores must always pass. Do not use
+isinstance checks against a concrete store class.
+
+Update every test fake/custom store that is deliberately valid to implement
+the new method. Add focused invalid-store tests. Do not preserve two-method
+custom-store compatibility.
+
+## Storage-neutral aggregate domain types
+
+Add a focused storage-neutral module, preferably
+ProviderRouter/src/nygen_router/storage/score_aggregation.py, containing
+frozen typed records for the request and response. Export the public
+implementation contract from nygen_router.storage and the package root without
+loading optional database packages.
+
+Provide a frozen requested-provider partition equivalent to:
+
+~~~python
+@dataclass(frozen=True)
+class ScoreAggregateProvider:
+    provider_id: str
+    model: str
+    protocol: ApiProtocol
+~~~
+
+Provide two explicit frozen weighting specifications:
+
+~~~python
+@dataclass(frozen=True)
+class FlatScoreWeighting:
+    pass
+
+
+@dataclass(frozen=True)
+class ExponentialScoreWeighting:
+    half_life_hours: float
+~~~
+
+Provide a frozen request equivalent to:
+
+~~~python
+@dataclass(frozen=True)
+class ScoreAggregateQuery:
+    providers: tuple[ScoreAggregateProvider, ...]
+    metrics_scope: str | None
+    call_type: CallType
+    since: datetime
+    reference_time: datetime
+    weighting: FlatScoreWeighting | ExponentialScoreWeighting
+~~~
+
+Provide a frozen aggregate record equivalent to:
+
+~~~python
+@dataclass(frozen=True)
+class ScoreAggregate:
+    provider_id: str
+    attempt_weight: float
+    success_weight: float
+    successful_latency_weight: float
+    successful_latency_total_ms: float
+    recent_error_count: int
+    rate_limit_count: int
+    timeout_count: int
+~~~
+
+The aggregate is deliberately not ProviderStats and does not contain a final
+success rate, average, speed quality, provider score, historical display name,
+raw event, event timestamp, SQL row, or database diagnostics.
+
+Validate request construction or the aggregate entry boundary as appropriate:
+
+- providers are non-empty for a real query;
+- provider IDs and models are nonblank;
+- provider partitions are distinct by canonical provider ID;
+- since and reference_time are timezone-aware and normalized/handled as UTC;
+- since is not later than reference_time;
+- half_life_hours is finite and positive;
+- metrics scope is None for all scopes or a valid nonblank current scope; and
+- caller-owned mutable collections are defensively converted to tuples.
+
+Keep these models lightweight dataclasses unless current public-model
+conventions provide a compelling reason otherwise. Do not introduce an ORM or
+Pydantic database row model.
+
+## One query and exact result cardinality
+
+For one ScoreBasedPolicy ordering operation:
+
+1. Call the tie-break policy exactly once on a copy of the eligible list.
+2. If metrics are disabled or the returned list is empty, return that baseline
+   order without querying.
+3. Capture reference_time by calling the injected now function exactly once.
+4. Deduplicate the baseline list by canonical provider ID only for the
+   aggregate request, preserving first occurrence for deterministic request
+   construction. Do not remove deliberate duplicate occurrences from the
+   provider order itself.
+5. Build one ScoreAggregateProvider per distinct requested provider using its
+   current provider ID, model, and protocol.
+6. Issue exactly one query_score_aggregates call.
+7. Validate and map the results by provider ID.
+8. Build ProviderStats through shared Python.
+9. Calculate scores with the existing calculate_provider_score function.
+10. Stably sort every original baseline occurrence by its provider's score.
+
+Each bundled backend must execute one parameterized aggregate query, not one
+query per provider. Construct a requested-provider relation (for example a
+VALUES/CTE relation) and left-join matching provider_attempts history so the
+database returns exactly one aggregate for every distinct requested provider,
+including one with no matching events.
+
+The join/filter must match every identity dimension:
+
+- lower timestamp bound;
+- metrics scope when not None;
+- provider ID;
+- provider model;
+- provider protocol; and
+- invocation call type.
+
+HistoryScope.CURRENT supplies context.metrics_scope. HistoryScope.ALL supplies
+None and omits only the scope equality filter. Do not combine partitions by
+display name, provider ID alone, or a broad provider-ID IN filter that ignores
+model/protocol/call type.
+
+The number of returned aggregate rows must equal the number of distinct
+requested provider IDs and must not grow with event volume.
+
+## Exact aggregate arithmetic
+
+For each matching event, SQL computes one weight.
+
+Flat mode:
+
+    weight = 1.0
+    since = reference_time - lookback_hours
+
+Exponential mode:
+
+    since = reference_time - (6 * half_life_hours)
+    age_hours = (reference_time - event.timestamp) in hours
+    weight = 0.5 ** (age_hours / half_life_hours)
+
+Preserve the shipped six-half-life window and formula. Use the one captured
+reference_time for the whole query; never call now repeatedly per event or let
+the database choose its own current timestamp. Keep backend-specific timestamp
+and exponent syntax private and prove equivalent semantics across engines.
+
+For the selected call type and exact partition, calculate:
+
+- attempt_weight: SUM(weight) over every matching event;
+- success_weight: SUM(weight) over successful matching events;
+- successful_latency_weight: SUM(weight) only where success is true and
+  latency_ms is not NULL;
+- successful_latency_total_ms: SUM(weight * latency_ms) over that same
+  successful non-NULL-latency subset;
+- recent_error_count: exact unweighted count of failed matching events;
+- rate_limit_count: exact unweighted failed-event count whose error_type is
+  ErrorCategory.RATE_LIMIT.value; and
+- timeout_count: exact unweighted failed-event count whose error_type is
+  ErrorCategory.TIMEOUT.value.
+
+Use explicit conditional aggregation and COALESCE so a requested provider with
+no events returns zeros, not NULL aggregate fields. Failed latency never
+contributes. A successful NULL latency contributes success evidence but no
+latency weight or total.
+
+Derive in shared Python:
+
+    success_rate =
+        None when attempt_weight is zero
+        otherwise success_weight / attempt_weight
+
+    average_latency_or_ttft =
+        None when successful_latency_weight is zero
+        otherwise successful_latency_total_ms / successful_latency_weight
+
+Build the selected regular or streaming ProviderStats bucket from these values
+and leave the other bucket at its established zero/None values. Take
+provider_name from the current ProviderConfig. Then use the unchanged
+ScoreWeights and calculate_provider_score logic to derive success quality,
+speed quality, and total score.
+
+Keep aggregate_stats(events, providers, call_type, weight_fn=...) public and
+pure. It remains the semantic oracle for tests and direct Python aggregation,
+including its general callable weight_fn. ScoreBasedPolicy no longer calls it
+for persisted scoring.
+
+## Self-correction and malformed results
+
+A valid new provider is represented explicitly:
+
+    provider-b -> zero attempts, zero successes, zero latency evidence,
+                  zero diagnostic tallies
+
+That explicit record produces the existing optimistic-start score. Once
+attempts are recorded, subsequent queries include their success/failure
+evidence and scoring self-corrects.
+
+A missing record is never interpreted as zero history. This guards against,
+for example, buggy SQL that groups only successful-latency rows and therefore
+omits a provider with twenty failures and no successes. Filling that omission
+with zeros would repeatedly make the failing provider look new and optimistic.
+
+Validate every result before scoring:
+
+- exactly one record for every requested provider ID;
+- no missing, duplicate, or unexpected provider ID;
+- all weighted fields are real, finite, and non-negative;
+- success_weight does not exceed attempt_weight, allowing only an appropriate
+  tiny floating-point tolerance;
+- successful_latency_weight does not exceed success_weight with the same
+  care;
+- successful_latency_total_ms is finite and non-negative;
+- diagnostic tallies are non-boolean, exact non-negative integers; and
+- zero latency weight produces no average rather than a fabricated 0.0.
+
+Any invalid aggregate set invalidates the complete scoring read. Do not use
+partial results, assign missing providers zero or worst scores, or mix trusted
+and untrusted rows.
+
+## Score-policy failure behavior
+
+Preserve the established availability boundary:
+
+- metrics_store=None returns the baseline order;
+- a valid empty database yields explicit zeros, equal optimistic scores, and
+  therefore the stable baseline order;
+- a query_score_aggregates exception returns the baseline order;
+- invalid aggregate results return the baseline order;
+- no failure path calls query_recent;
+- no metrics failure prevents the provider invocation; and
+- health/cooldown filtering has already run and remains authoritative.
+
+Use the existing ScoreBasedPolicy warning deduplication: the first unavailable
+or invalid history read warns and later failures from the same policy instance
+log at DEBUG. Do not add per-query success logs, runtime latency logs,
+callbacks, response annotations, or public diagnostics fields; PR19 and PR20
+retain their broader logging/observability scopes.
+
+Direct calls to DuckDBMetricsStore.query_score_aggregates and
+SQLiteMetricsStore.query_score_aggregates must expose their real storage,
+schema, request, or result errors. ScoreBasedPolicy, not the store, owns
+graceful degradation.
+
+## Backend SQL implementations
+
+Implement private SQL separately for DuckDB and SQLite while sharing request
+validation, aggregate domain records, result validation, and ProviderStats
+construction.
+
+Requirements for both:
+
+- one parameterized query per score ordering;
+- requested-provider relation plus left join;
+- no string interpolation of provider/scope/model values;
+- exact identity matching and lower-bound semantics;
+- flat and exponential weighting;
+- correct NULL latency handling;
+- explicit zero rows;
+- bounded result cardinality;
+- conversion to ScoreAggregate before leaving storage;
+- current connection ownership and lazy dependency behavior unchanged; and
+- query failures left transparent to direct store callers.
+
+Do not force one universal SQL string when engine timestamp, exponent, CTE,
+parameter, or plan syntax differs. Keep common logical constants singular
+where useful without inventing a general SQL framework, ORM, expression
+language, repository hierarchy, or new dependency.
+
+## Indexed metrics schema version 2
+
+Set the current metrics component version to 2. Fresh DuckDB and SQLite
+databases must contain:
+
+- the unchanged logical provider_attempts event columns unless PR30 genuinely
+  requires a corrective type detail;
+- nygen_router_schema_versions with metrics = 2; and
+- the smallest backend-appropriate persistent indexes demonstrated to support
+  the aggregate query with acceptable total read/write trade-offs.
+
+Use the required 50,000+-row benchmark and real query plans to choose index
+columns and order. Start from the dominant current-scope and all-scope
+lookups—scope, timestamp, provider partition, and call type—but do not add an
+index for every possible filter or ship decorative indexes that plans never
+use. The selected index definitions become authoritative version-2 schema
+constants and must be created transactionally with a fresh database.
+
+Extend read-only schema inspection and creation validation to recognize and
+verify the required project-owned indexes. Tolerate engine-owned primary-key
+implementation details; do not expose native catalog rows. A database claiming
+metrics = 2 but missing or misdefining a required PR30 index is incompatible
+and remains untouched.
+
+There is no PR30 version-1-to-version-2 migration. Explicitly update the
+migration registry and administration behavior so:
+
+- fresh creation produces version 2;
+- version 2 is current;
+- versioned metrics = 1 is recognized as older but has no migration route;
+- the exact unversioned PR29 table is identified as implicit version 1 but is
+  not accepted by normal PR30 runtime;
+- inspect remains read-only and gives actionable archive/delete-or-fresh-path
+  guidance;
+- migrate refuses version 1/implicit version 1 without modifying it because no
+  approved route exists;
+- create still refuses every existing path; and
+- normal DuckDBMetricsStore/SQLiteMetricsStore first use never initializes or
+  changes an existing version-1 target.
+
+Do not add force creation, automatic deletion, implicit backup, hidden
+alternate paths, runtime CREATE INDEX, or runtime migration.
+
+## Performance and query-plan validation
+
+Add three layers of verification.
+
+### Fast normal tests
+
+Add focused PR30 tests that remain appropriate for ordinary pytest and cover
+all semantics below with small, deliberate datasets.
+
+### Deterministic plan/cardinality checks
+
+Against real temporary databases, verify:
+
+- required indexes exist in fresh version-2 targets;
+- the actual aggregate query plan is captured and checks the selected access
+  path where the backend exposes a stable assertion;
+- indexed and deliberately unindexed temporary comparisons justify the chosen
+  indexes where feasible;
+- event volume does not change result cardinality;
+- N distinct requested providers yield exactly N aggregate results; and
+- query-plan checks do not leak a public engine/query-plan API.
+
+Avoid brittle assertions over complete engine-version-specific plan text.
+Assert stable meaningful fragments or structured facts where possible.
+
+### Separate 50,000-row benchmark
+
+Add a small reusable benchmark, preferably
+ProviderRouter/benchmarks/pr30_score_aggregation.py. It must:
+
+- require no benchmark framework or new core dependency;
+- use real temporary DuckDB and SQLite databases;
+- create the real version-2 schema;
+- generate at least 50,000 logical event rows spanning multiple scopes,
+  providers, models, protocols, call types, timestamps, successes, failures,
+  NULL/non-NULL latencies, and error categories;
+- seed efficiently in one transaction or transaction-bound chunks, using
+  backend-specific set-based setup where useful;
+- never call SQLite record_attempt 50,000 times with one commit per row;
+- separate or exclude seed time from aggregate-query time;
+- query through the real public query_score_aggregates method;
+- run enough repetitions to report individual and median execute-and-fetch
+  durations;
+- print backend, dataset shape, query plan, rows returned, and timings;
+- compare indexed and unindexed temporary setups where feasible;
+- prove at least 50,000 input rows and exactly the requested-provider result
+  cardinality;
+- compare results with the Python semantic oracle or an independently derived
+  expected result within explicit floating tolerance;
+- use no API keys, network calls, live provider SDKs, active user database, or
+  committed binary fixture; and
+- clean up temporary files.
+
+Do not run this benchmark in ordinary pytest. The implementing session must
+run it during PR30 validation and report exact results. Do not introduce a
+machine-specific millisecond pass/fail threshold. The hard performance
+acceptance criterion is bounded returned cardinality plus a recorded,
+reviewable query plan and timing, not a universal latency promise.
+
+Keep the benchmark straightforward. If it begins to require a framework,
+permanent 50,000-row fixture, complex harness, or substantial infrastructure,
+simplify it rather than expanding PR30.
+
+## Required semantic tests
+
+Add new ProviderRouter/tests/test_pr30_*.py files and update existing fakes
+only where the mandatory protocol deliberately requires it. Cover at least:
+
+1. DuckDB and SQLite both implement the mandatory third method.
+2. Router construction accepts both bundled stores and rejects a path,
+   two-method legacy object, missing aggregate method, and non-callable method.
+3. metrics_store=None remains valid and disables history.
+4. ScoreBasedPolicy never calls query_recent.
+5. ScoreBasedPolicy performs exactly one aggregate call per non-empty ordering.
+6. Tie-break policy is called exactly once and remains the stable equal-score
+   order.
+7. Flat SQL results equal aggregate_stats with flat weights.
+8. Exponential SQL results equal aggregate_stats using the captured reference
+   time and six-half-life window.
+9. The now seam is called exactly once per ordering operation.
+10. CURRENT scope includes only the router scope.
+11. ALL scope combines scopes while preserving every other partition.
+12. Provider ID, model, protocol, and call type mismatches contribute nothing.
+13. Regular and streaming histories never blend.
+14. Streaming latency remains TTFT.
+15. Failed latency never enters averages.
+16. A successful NULL latency contributes success evidence but not latency
+    weight or total.
+17. Failure-only providers return a row with attempts/failures and zero
+    success/latency evidence.
+18. A genuinely empty provider returns an explicit all-zero aggregate and
+    receives the optimistic-start score.
+19. Later success improves a new provider's score and later failure lowers it
+    according to the unchanged scoring formula.
+20. Exact unweighted error, rate-limit, and timeout tallies match Python under
+    both weighting modes.
+21. Multiple provider partitions return exactly one row each.
+22. Custom tie-break duplicates do not duplicate aggregate queries/results and
+    retain their baseline occurrences.
+23. Missing, duplicate, unexpected, negative, inconsistent, NaN, infinite, or
+    non-integer-tally results invalidate the full scoring result.
+24. Invalid results and query exceptions return the exact baseline order.
+25. First history failure logs WARNING and repeats log DEBUG.
+26. A query failure never triggers raw-history fallback.
+27. Direct store errors remain visible.
+28. Fresh databases contain version 2 plus every selected index.
+29. Version-2 database reopen/read/write/aggregate behavior works.
+30. Missing/malformed required indexes are rejected without modification.
+31. Versioned v1 and implicit v1 targets are rejected by runtime and remain
+    unchanged.
+32. Administration inspect classifies v1/v2 accurately and is read-only.
+33. Administration migrate refuses v1 because no PR30 route exists and leaves
+    it unchanged.
+34. Existing query_recent field, filter, UTC, and chronological semantics
+    remain unchanged.
+35. All existing regression tests continue to pass.
+
+Use approximate floating assertions with explicit tolerances appropriate to
+cross-engine exponent and sum behavior. Do not weaken semantic equality into
+broad score-order-only tests.
+
+## One-time authorized local database recreation
+
+The user has explicitly authorized discarding the current local demo metrics
+history so the repository works out of the box after PR30. This is a one-time
+execution step, not product behavior and not a general authorization to delete
+other data.
+
+After implementation, version-2 creation tests, and storage administration
+validation pass:
+
+1. Ensure no router, workflow, DuckDB connection, or other process is using the
+   target.
+2. Resolve DuckDB's public default path through the project helper and verify
+   it is exactly the expected default:
+
+       ~/.nygen_router/metrics.duckdb
+
+3. Verify the repository workflow target is exactly:
+
+       /Users/olleflygar/Developer/TestProviderRouter/WorkflowTests/workflow_history.duckdb
+
+4. Inspect each existing target when possible and report that its history is
+   being discarded under this explicit PR30 authorization.
+5. Remove only those exact two files if present and only their exact
+   engine-owned WAL sidecars if present. Do not use a recursive deletion,
+   wildcard, unresolved environment variable, broad directory, or command
+   substitution to identify targets.
+6. Do not delete or change:
+
+       WorkflowTests/workflow_history.pre-pr29.duckdb
+
+   any SQLite file not explicitly identified above, any cache database, any
+   database outside these exact targets, or any source/test fixture.
+7. Recreate both targets through the public create_database administration
+   implementation so they contain metrics = 2 and all required indexes. Do not
+   initialize them by making live provider calls.
+8. Inspect and validate both recreated targets.
+9. Run a credential-free record/query/aggregate smoke check, then leave the
+   empty/current local stores ready for demos.
+10. Update WorkflowTests --reset-history behavior and documentation only as
+    needed so a future explicit demo reset creates the then-current fresh
+    schema through normal first use; do not add automatic resetting.
+
+The default database is outside the repository writable root and may require a
+permission prompt. Before triggering that prompt, explain plainly that
+permission is needed to replace the exact disposable default metrics file with
+the user-authorized PR30 indexed schema and that no other home-directory data
+will be touched.
+
+The local databases are ignored artifacts and cannot be captured by Git tags
+or commits. Report their recreation separately in the final handoff.
+
+## Explicit scope boundaries
+
+Do not add:
+
+- PostgresMetricsStore, a PostgreSQL driver, Supabase SDK/API support,
+  SQLAlchemy, an ORM, or a general database toolkit;
+- a separate aggregate capability protocol or two-method fallback;
+- SQL rows, connections, sessions, engines, or expressions in public
+  signatures;
+- final score calculation in SQL;
+- arbitrary Python weight functions in the database query contract;
+- rollup tables, materialized views, precomputed scores, caches, or freshness
+  semantics;
+- reporting/dashboard queries, pagination, or generic group-by APIs;
+- retention, deletion, pruning, export/import, cross-backend copy, mirroring,
+  replication, or dual writes;
+- runtime schema changes, automatic database overwrite, or a v1 migration;
+- buffered/batched runtime writes, background workers, or bulk store protocol
+  methods;
+- concurrency/lifecycle changes, async routing/storage, or distributed state;
+- token/cost/request-size metrics or native argument inspection;
+- logging/observability systems beyond preserving existing failure warning
+  behavior; or
+- unrelated router, policy, adapter, retry, health, streaming, or error
+  refactoring.
+
+PR14 owns PostgreSQL/Supabase and must later implement the mandatory aggregate
+contract plus measured PostgreSQL indexes. PR28 owns reporting. PR31 owns
+concurrency/lifecycle. PR32 owns buffered/batched writes. PR33 owns native
+async behavior. PR19/PR20 own general logging/observability.
+
+## Documentation synchronization
+
+After implementation and focused tests pass, search the repository for stale
+or contradictory metrics/aggregation/schema claims and synchronize at least:
+
+- AGENTS.md
+- ProviderRouter/AGENTS.md
+- CODEBASE_AUDIT.md
+- Projectplan/Newprojectplan.md
+- Projectplan/sharedstorage.md
+- relevant historical clarification in Projectplan/OldProjectPlan.md without
+  rewriting shipped history
+- root README.md
+- ProviderRouter/README.md
+- WorkflowTests/README.md
+- storage administration and custom-backend examples
+- package exports, docstrings, comments, CLI help, and schema guidance
+- any setup/usage files that describe metrics storage or score history
+
+Historical completed execution prompts may retain their original approved
+instructions, but current explanatory documents must state clearly that PR30
+supersedes their two-method/version-1 assumptions.
+
+Documentation must explain:
+
+- PR30 is shipped;
+- why raw history transfer did not scale;
+- MetricsStore's mandatory three methods;
+- query_recent remains raw but ScoreBasedPolicy always uses aggregates;
+- no aggregation configuration is required;
+- DuckDB and SQLite use backend SQL automatically;
+- the intermediate totals and shared Python score calculation;
+- exact partition and call-type semantics;
+- flat versus exponential weighting and one reference time;
+- explicit zero history versus a missing invalid result;
+- optimistic self-correction remains;
+- failure degrades to baseline ordering, round robin by default;
+- indexes are part of fresh metrics schema version 2;
+- exact selected indexes and measured plan rationale;
+- version 1 has no PR30 migration and must be manually archived/deleted or
+  replaced with a fresh path;
+- normal runtime never overwrites an existing database;
+- the two active disposable local demo databases were recreated once;
+- benchmark command, dataset size, and interpretation;
+- no universal latency promise;
+- PostgreSQL/Supabase remains PR14; and
+- rollups/caching/reporting/concurrency/buffering/async remain deferred.
+
+Mark PR30 shipped in Projectplan/Newprojectplan.md and update
+CODEBASE_AUDIT.md from an open finding to the verified delivered result,
+including actual test/benchmark figures. Do not claim PostgreSQL production
+readiness.
+
+## Git safety, commits, and tags
+
+Perform read-only Git inspection first:
+
+1. Inspect git status --short --branch, current HEAD, existing tags, and
+   relevant history.
+2. Preserve every unrelated pre-existing change. Do not absorb, overwrite,
+   discard, reset, or commit user work.
+3. Confirm the approved prompt exists at Projectplan/prompt_pr30.txt.
+4. A tag cannot capture uncommitted state. Establish the repository's normal
+   clean prompt-only baseline commit containing this approved prompt but no
+   PR30 implementation. If unrelated changes prevent doing so safely, stop and
+   ask the user.
+5. Confirm neither pr30-start nor pr30-complete exists. If either exists, stop
+   and report the conflict; never move, delete, or force-replace it.
+6. Immediately before the first implementation-related change, create:
+
+       git tag pr30-start
+
+Create sensible local commit(s) for implementation/tests and synchronized
+documentation. Do not include ignored local database files. Do not put
+pr30-complete on a commit that omits any tracked PR30 work.
+
+Only after every completion criterion passes, the benchmark and one-time local
+database recreation are complete, the final diff/status is understood, and all
+tracked PR30 changes are committed, create:
+
+    git tag pr30-complete
+
+Leave commits and tags local and ready to push. Do not push anything.
+
+## Validation
+
+Inspect ProviderRouter/pyproject.toml, CI, and repository conventions before
+running commands. From the correct directory, run the configured equivalents
+of:
+
+- focused PR30 tests during development;
+- affected stats, scoring, policy, metrics-store, schema, admin, CLI, router,
+  retry, sticky, and streaming regression tests;
+- the full offline pytest suite;
+- coverage with configured branch reporting;
+- ruff format --check;
+- ruff check;
+- strict mypy over src;
+- lightweight-import checks without DuckDB/provider SDKs;
+- SQLite storage/admin behavior without DuckDB installed;
+- fresh schema/index inspection for both backends;
+- the separate 50,000+-row benchmark; and
+- credential-free validation of the two recreated local DuckDB targets.
+
+Do not run live provider/network examples as validation. Do not weaken lint,
+typing, coverage, test, schema, or cardinality requirements. Report exact
+commands, pass counts, coverage, benchmark dataset/results, selected query
+plans/index rationale, and any optional-dependency skips.
+
+## Completion criteria
+
+PR30 is complete only when:
+
+- MetricsStore has exactly the agreed mandatory three runtime methods;
+- every valid built-in or custom store must provide query_score_aggregates;
+- DuckDB and SQLite automatically use one SQL aggregate query for score
+  history;
+- ScoreBasedPolicy never uses query_recent;
+- one aggregate row is returned per distinct requested provider partition;
+- returned cardinality is O(requested providers), not O(history events);
+- every identity and call-type partition is exact;
+- flat and exponential weighting match current Python semantics using one
+  reference time;
+- successful NULL latency and failed latency follow the agreed rules;
+- all intermediate totals and diagnostic tallies are exact within documented
+  floating tolerance;
+- ProviderStats and final scoring remain shared pure Python;
+- genuine zero-history providers retain optimistic self-correction;
+- missing/malformed result rows never become optimistic evidence;
+- invalid store configuration fails immediately with ConfigError;
+- runtime aggregate failure preserves provider availability through the
+  baseline order and never fetches raw history;
+- fresh DuckDB and SQLite databases are metrics version 2 with validated,
+  measured indexes;
+- no version-1 migration or runtime alteration path exists;
+- old targets are rejected unchanged with actionable guidance;
+- ordinary tests stay fast;
+- cross-backend semantic, cardinality, plan, schema, and degradation tests
+  pass;
+- the separate 50,000+-row benchmark runs and its results are reported;
+- no optional dependency becomes mandatory and lightweight imports pass;
+- the two explicitly authorized disposable local demo databases are recreated
+  and validated at version 2 without touching the archived pre-PR29 file;
+- documentation is synchronized and PR30 is marked shipped;
+- no unrelated work appears in the final diff;
+- all tracked PR30 work is committed;
+- pr30-start identifies the clean approved-prompt baseline immediately before
+  implementation; and
+- pr30-complete identifies the committed, fully validated result.
+
+## Final handoff
+
+Report concisely:
+
+- the final MetricsStore and aggregate type signatures;
+- the DuckDB and SQLite query/index designs;
+- how optimistic zero history and invalid missing history differ;
+- schema-version and old-database behavior;
+- important files changed;
+- exact tests, coverage, lint, type, import, schema, and benchmark results;
+- measured query durations, returned rows, and query-plan/index rationale;
+- the two local demo databases recreated and validated;
+- documentation synchronized;
+- commits created;
+- pr30-start and pr30-complete targets; and
+- deliberately deferred limitations.
+
+Do not claim PostgreSQL/Supabase implementation, universal latency, rollup
+performance, automatic migration, preserved legacy history, or runtime
+overwrite behavior.
