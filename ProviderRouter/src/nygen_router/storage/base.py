@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from nygen_router.config import ApiProtocol
 from nygen_router.metrics import MetricsEvent
+from nygen_router.storage.schema import COLUMN_NAMES
+from nygen_router.storage.schema import MetricsSchemaMismatchError as MetricsSchemaMismatchError
 from nygen_router.types import CallType
 
 
@@ -26,130 +28,69 @@ class MetricsStore(Protocol):
     ) -> list[MetricsEvent]: ...
 
 
-class MetricsSchemaMismatchError(RuntimeError):
-    """An existing provider_attempts table is not the exact supported schema."""
-
-
-CREATE_PROVIDER_ATTEMPTS_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS provider_attempts (
-    id TEXT PRIMARY KEY,
-    timestamp TEXT NOT NULL,
-    metrics_scope TEXT NOT NULL,
-    provider_id TEXT NOT NULL,
-    provider_name TEXT NOT NULL,
-    model TEXT NOT NULL,
-    protocol TEXT NOT NULL,
-    call_type TEXT NOT NULL,
-    success INTEGER NOT NULL,
-    stream_opened INTEGER,
-    latency_ms REAL,
-    total_duration_ms REAL,
-    error_type TEXT
-)
-"""
-
-COLUMN_NAMES = (
-    "id",
-    "timestamp",
-    "metrics_scope",
-    "provider_id",
-    "provider_name",
-    "model",
-    "protocol",
-    "call_type",
-    "success",
-    "stream_opened",
-    "latency_ms",
-    "total_duration_ms",
-    "error_type",
-)
-
 _COLUMNS_SQL = ", ".join(COLUMN_NAMES)
 INSERT_PROVIDER_ATTEMPT_SQL = (
     f"INSERT INTO provider_attempts ({_COLUMNS_SQL}) VALUES "
     f"({', '.join('?' for _ in COLUMN_NAMES)})"
 )
-TABLE_INFO_SQL = "PRAGMA table_info('provider_attempts')"
 _SELECT_PROVIDER_ATTEMPTS_SQL = f"SELECT {_COLUMNS_SQL} FROM provider_attempts WHERE timestamp >= ?"
 
-# Logical schema shared by SQLite and DuckDB. DuckDB reports TEXT as VARCHAR
-# and REAL as FLOAT, while SQLite reports the spellings used in the DDL.
-_EXPECTED_SCHEMA = (
-    ("id", "text", False, True),
-    ("timestamp", "text", True, False),
-    ("metrics_scope", "text", True, False),
-    ("provider_id", "text", True, False),
-    ("provider_name", "text", True, False),
-    ("model", "text", True, False),
-    ("protocol", "text", True, False),
-    ("call_type", "text", True, False),
-    ("success", "integer", True, False),
-    ("stream_opened", "integer", False, False),
-    ("latency_ms", "real", False, False),
-    ("total_duration_ms", "real", False, False),
-    ("error_type", "text", False, False),
-)
+
+def event_to_record(event: MetricsEvent) -> dict[str, object]:
+    """Convert one domain event to the shared named logical storage record."""
+    timestamp = event.timestamp
+    if timestamp.tzinfo is None:
+        raise ValueError("event timestamp must be timezone-aware")
+    return {
+        "id": event.id,
+        "timestamp": timestamp.astimezone(UTC),
+        "metrics_scope": event.metrics_scope,
+        "provider_id": event.provider_id,
+        "provider_name": event.provider_name,
+        "model": event.model,
+        "protocol": event.protocol.value,
+        "call_type": event.call_type.value,
+        "success": event.success,
+        "stream_opened": event.stream_opened,
+        "latency_ms": event.latency_ms,
+        "total_duration_ms": event.total_duration_ms,
+        "error_type": event.error_type,
+    }
 
 
-def validate_provider_attempts_schema(rows: Sequence[Sequence[Any]]) -> None:
-    """Reject any existing table that is not exactly the PR29 schema."""
-    actual = []
-    for row in rows:
-        name = str(row[1])
-        logical_type = _logical_type(str(row[2]))
-        not_null = bool(row[3])
-        default = row[4]
-        primary_key = bool(row[5])
-        # SQLite reports a TEXT PRIMARY KEY as nullable even though the primary
-        # key itself prevents NULL identity values. Compare that column by PK.
-        if primary_key:
-            not_null = False
-        actual.append((name, logical_type, not_null, primary_key, default))
-    expected = [(*column, None) for column in _EXPECTED_SCHEMA]
-    if actual != expected:
-        actual_names = ", ".join(item[0] for item in actual) or "<none>"
-        raise MetricsSchemaMismatchError(
-            "Existing provider_attempts schema is incompatible with this nygen-router "
-            f"version (found columns: {actual_names}). The database was left untouched; "
-            "move or replace it manually if its legacy history is no longer needed."
-        )
-
-
-def _logical_type(value: str) -> str:
-    normalized = value.upper()
-    if normalized in {"TEXT", "VARCHAR"}:
-        return "text"
-    if normalized in {"INTEGER", "INT"}:
-        return "integer"
-    if normalized in {"REAL", "FLOAT", "DOUBLE"}:
-        return "real"
-    return normalized.lower()
+def record_to_event(record: Mapping[str, object]) -> MetricsEvent:
+    """Convert a named local-text or future native-datetime record to an event."""
+    raw_timestamp = record["timestamp"]
+    if isinstance(raw_timestamp, datetime):
+        timestamp = raw_timestamp
+    else:
+        timestamp = datetime.fromisoformat(str(raw_timestamp))
+    if timestamp.tzinfo is None:
+        raise ValueError("stored event timestamp must be timezone-aware")
+    return MetricsEvent(
+        id=str(record["id"]),
+        timestamp=timestamp.astimezone(UTC),
+        metrics_scope=str(record["metrics_scope"]),
+        provider_id=str(record["provider_id"]),
+        provider_name=str(record["provider_name"]),
+        model=str(record["model"]),
+        protocol=ApiProtocol(str(record["protocol"])),
+        call_type=CallType(str(record["call_type"])),
+        success=_database_bool(record["success"], column="success"),
+        stream_opened=_optional_database_bool(record["stream_opened"], column="stream_opened"),
+        latency_ms=_optional_float(record["latency_ms"]),
+        total_duration_ms=_optional_float(record["total_duration_ms"]),
+        error_type=None if record["error_type"] is None else str(record["error_type"]),
+    )
 
 
 def event_to_params(event: MetricsEvent) -> tuple[object, ...]:
-    """Serialize an event in the single shared column order.
-
-    Timestamps are compared lexically as ISO text, so every timezone-aware
-    value must be stored in the same UTC offset representation.
-    """
-    timestamp = event.timestamp
-    if timestamp.tzinfo is not None:
-        timestamp = timestamp.astimezone(UTC)
-    return (
-        event.id,
-        timestamp.isoformat(),
-        event.metrics_scope,
-        event.provider_id,
-        event.provider_name,
-        event.model,
-        event.protocol.value,
-        event.call_type.value,
-        event.success,
-        event.stream_opened,
-        event.latency_ms,
-        event.total_duration_ms,
-        event.error_type,
-    )
+    """Derive local ISO-text positional parameters from the named record."""
+    record = event_to_record(event)
+    timestamp = record["timestamp"]
+    assert isinstance(timestamp, datetime)
+    local_record = {**record, "timestamp": timestamp.isoformat()}
+    return tuple(local_record[column] for column in COLUMN_NAMES)
 
 
 def build_query_recent_sql(
@@ -185,33 +126,22 @@ def build_query_recent_sql(
 
 def row_to_event(row: Sequence[Any]) -> MetricsEvent:
     """Deserialize an event from the single shared column order."""
-    (
-        id_,
-        timestamp,
-        metrics_scope,
-        provider_id,
-        provider_name,
-        model,
-        protocol,
-        call_type,
-        success,
-        stream_opened,
-        latency_ms,
-        total_duration_ms,
-        error_type,
-    ) = row
-    return MetricsEvent(
-        id=str(id_),
-        timestamp=datetime.fromisoformat(str(timestamp)),
-        metrics_scope=str(metrics_scope),
-        provider_id=str(provider_id),
-        provider_name=str(provider_name),
-        model=str(model),
-        protocol=ApiProtocol(protocol),
-        call_type=CallType(call_type),
-        success=bool(success),
-        stream_opened=None if stream_opened is None else bool(stream_opened),
-        latency_ms=None if latency_ms is None else float(latency_ms),
-        total_duration_ms=None if total_duration_ms is None else float(total_duration_ms),
-        error_type=None if error_type is None else str(error_type),
-    )
+    if len(row) != len(COLUMN_NAMES):
+        raise ValueError(f"stored event row has {len(row)} values; expected {len(COLUMN_NAMES)}")
+    return record_to_event(dict(zip(COLUMN_NAMES, row, strict=True)))
+
+
+def _database_bool(value: object, *, column: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    raise ValueError(f"stored {column} must be a boolean or integer 0/1")
+
+
+def _optional_database_bool(value: object, *, column: str) -> bool | None:
+    return None if value is None else _database_bool(value, column=column)
+
+
+def _optional_float(value: object) -> float | None:
+    return None if value is None else float(value)  # type: ignore[arg-type]

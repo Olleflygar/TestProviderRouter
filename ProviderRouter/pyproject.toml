@@ -12,6 +12,9 @@ dependencies = [
     "pydantic>=2,<3",
 ]
 
+[project.scripts]
+nygen-router = "nygen_router.cli:main"
+
 [project.optional-dependencies]
 openai = [
     "openai>=1.66,<2",

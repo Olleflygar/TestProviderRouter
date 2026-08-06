@@ -22,6 +22,9 @@ class OptionalDependencyBlocker(importlib.abc.MetaPathFinder):
             "openai",
             "opentelemetry",
             "prometheus_client",
+            "psycopg",
+            "sqlalchemy",
+            "supabase",
         }}:
             raise ModuleNotFoundError(fullname)
         return None
@@ -30,11 +33,13 @@ sys.meta_path.insert(0, OptionalDependencyBlocker())
 sys.path.insert(0, {str(source_root)!r})
 from nygen_router import (
     ErrorCategory,
+    LocalBackend,
     ProviderRouter,
     RetryContext,
     RetryPolicy,
     RetryProviderScope,
     SameProviderRetryPolicy,
+    inspect_database,
 )
 assert ProviderRouter.__name__ == "ProviderRouter"
 assert RetryPolicy.__name__ == "RetryPolicy"
@@ -42,6 +47,8 @@ assert RetryContext.__name__ == "RetryContext"
 assert RetryProviderScope.FIRST.value == "first"
 assert SameProviderRetryPolicy().max_attempts == 3
 assert ErrorCategory.TIMEOUT.value == "timeout"
+assert LocalBackend.SQLITE.value == "sqlite"
+assert callable(inspect_database)
 assert not ({{
     "duckdb",
     "httpx",
@@ -50,6 +57,9 @@ assert not ({{
     "openai",
     "opentelemetry",
     "prometheus_client",
+    "psycopg",
+    "sqlalchemy",
+    "supabase",
 }} & sys.modules.keys())
 """
 

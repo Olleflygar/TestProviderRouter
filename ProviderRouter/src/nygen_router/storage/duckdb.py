@@ -9,13 +9,20 @@ from typing import TYPE_CHECKING, Any
 from nygen_router.config import ApiProtocol
 from nygen_router.metrics import MetricsEvent
 from nygen_router.storage.base import (
-    CREATE_PROVIDER_ATTEMPTS_TABLE_SQL,
     INSERT_PROVIDER_ATTEMPT_SQL,
-    TABLE_INFO_SQL,
     build_query_recent_sql,
     event_to_params,
     row_to_event,
-    validate_provider_attempts_schema,
+)
+from nygen_router.storage.schema import (
+    SCHEMA_VERSIONS_TABLE,
+    SELECT_SCHEMA_VERSIONS_SQL,
+    TABLE_INFO_PROVIDER_ATTEMPTS_SQL,
+    TABLE_INFO_SCHEMA_VERSIONS_SQL,
+    MetricsSchemaMismatchError,
+    SchemaReport,
+    inspect_schema_rows,
+    validate_runtime_schema,
 )
 from nygen_router.types import CallType
 
@@ -59,8 +66,9 @@ class DuckDBMetricsStore:
         return self._sdk_available
 
     def record_attempt(self, event: MetricsEvent) -> None:
+        params = event_to_params(event)
         connection = self._connect()
-        connection.execute(INSERT_PROVIDER_ATTEMPT_SQL, list(event_to_params(event)))
+        connection.execute(INSERT_PROVIDER_ATTEMPT_SQL, list(params))
 
     def query_recent(
         self,
@@ -97,17 +105,55 @@ class DuckDBMetricsStore:
         if self._connection is None:
             import duckdb
 
-            if self.path.exists():
-                inspection = duckdb.connect(str(self.path), read_only=True)
+            existed = self.path.exists()
+            if existed:
                 try:
-                    rows = inspection.execute(TABLE_INFO_SQL).fetchall()
-                    if rows:
-                        validate_provider_attempts_schema(rows)
-                finally:
-                    inspection.close()
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+                    inspection = duckdb.connect(str(self.path), read_only=True)
+                    try:
+                        report = _inspect_connection(inspection)
+                    finally:
+                        inspection.close()
+                except Exception as exc:
+                    if isinstance(exc, MetricsSchemaMismatchError):
+                        raise
+                    raise MetricsSchemaMismatchError(
+                        f"DuckDB metrics database at {str(self.path.resolve())!r} could not be "
+                        "inspected safely. The existing target was left untouched; inspect it "
+                        "with the storage administration command or choose and configure a "
+                        "different absent path."
+                    ) from exc
+                validate_runtime_schema(report, backend="DuckDB", path=str(self.path.resolve()))
+            else:
+                from nygen_router.storage.admin import LocalBackend, create_database
+
+                create_database(LocalBackend.DUCKDB, self.path)
             connection = duckdb.connect(str(self.path))
-            connection.execute(CREATE_PROVIDER_ATTEMPTS_TABLE_SQL)
-            validate_provider_attempts_schema(connection.execute(TABLE_INFO_SQL).fetchall())
             self._connection = connection
         return self._connection
+
+
+def _inspect_connection(connection: duckdb.DuckDBPyConnection) -> SchemaReport:
+    table_names: list[Any] = connection.execute("SHOW TABLES").fetchall()
+    tables = {str(row[0]) for row in table_names}
+    provider_rows: list[Any] = (
+        connection.execute(TABLE_INFO_PROVIDER_ATTEMPTS_SQL).fetchall()
+        if "provider_attempts" in tables
+        else []
+    )
+    version_schema_rows: list[Any] = (
+        connection.execute(TABLE_INFO_SCHEMA_VERSIONS_SQL).fetchall()
+        if SCHEMA_VERSIONS_TABLE in tables
+        else []
+    )
+    version_columns = tuple(str(row[1]) for row in version_schema_rows)
+    version_rows: list[Any] = (
+        connection.execute(SELECT_SCHEMA_VERSIONS_SQL).fetchall()
+        if {"component", "version"}.issubset(version_columns)
+        else []
+    )
+    return inspect_schema_rows(
+        table_names=table_names,
+        provider_schema_rows=provider_rows,
+        version_schema_rows=version_schema_rows,
+        version_rows=version_rows,
+    )
