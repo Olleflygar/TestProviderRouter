@@ -1,0 +1,705 @@
+You are implementing PR13 in the current `nygen-router` repository. Complete the
+work end to end, including implementation, focused and regression tests,
+documentation synchronization, validation, sensible local commits, and the
+required local Git tags. Do not push commits or tags.
+
+Repository root:
+
+`/Users/olleflygar/Developer/TestProviderRouter`
+
+Package root:
+
+`/Users/olleflygar/Developer/TestProviderRouter/ProviderRouter`
+
+## Outcome
+
+Establish the versioned-schema and administration foundation for the existing
+DuckDB and SQLite metrics stores without changing the router's storage-neutral
+runtime contract.
+
+PR13 must provide explicit, safe schema inspection, fresh database creation,
+and administrator-triggered migration. Normal router startup may initialize a
+database only when its configured local path is absent. It must never silently
+migrate, replace, rename, delete, redirect, copy, or switch an existing
+database.
+
+This PR is intentionally a local storage-foundation PR. It does not add
+PostgreSQL/Supabase, SQLAlchemy, psycopg, Alembic, storage-side score
+aggregation, or new metrics-reporting queries.
+
+## Authority and context
+
+Before changing anything, read and follow in full:
+
+- `AGENTS.md`
+- `ProviderRouter/AGENTS.md`
+- any more-local `AGENTS.md` governing a file you touch
+- `Projectplan/sharedstorage.md`
+- the PR13 sections and related storage-ordering passages in
+  `Projectplan/Newprojectplan.md`
+- the historical PR13/PR14 rationale in `Projectplan/OldProjectPlan.md`
+- `CODEBASE_AUDIT.md`, especially the PR13, PR30, PR31, PR14, and storage
+  delivery-order findings
+
+Inspect current source and tests as the primary description of shipped
+behavior. For this execution, the decisions in this prompt are the approved
+PR13 contract. `sharedstorage.md` contains the freshest architectural context;
+older material remains useful rationale but must not expand the agreed scope.
+
+In particular, inspect:
+
+- `ProviderRouter/src/nygen_router/storage/base.py`
+- `ProviderRouter/src/nygen_router/storage/duckdb.py`
+- `ProviderRouter/src/nygen_router/storage/sqlite.py`
+- `ProviderRouter/src/nygen_router/storage/__init__.py`
+- `ProviderRouter/src/nygen_router/metrics.py`
+- `ProviderRouter/src/nygen_router/router.py`
+- `ProviderRouter/src/nygen_router/policies/score_based.py`
+- `ProviderRouter/src/nygen_router/stats.py`
+- `ProviderRouter/src/nygen_router/errors.py`
+- `ProviderRouter/src/nygen_router/__init__.py`
+- `ProviderRouter/tests/test_metrics_store.py`
+- `ProviderRouter/tests/test_duckdb_storage.py`
+- `ProviderRouter/tests/test_sqlite_storage.py`
+- `ProviderRouter/tests/test_pr29_storage_contract.py`
+- router metrics and score-policy degradation tests
+- `ProviderRouter/pyproject.toml`, the CI workflow, and current development
+  dependency files
+
+Use Git history and the shipped PR tags where useful to understand why PR29
+removed implicit schema alteration. Do not treat historical experimental
+schemas as supported migration inputs merely because they can be found in Git.
+
+## Non-negotiable repository rules
+
+- Do not monkeypatch internal collaborators in tests. Do not use
+  `monkeypatch.setattr(...)` or `unittest.mock.patch(...)` to swap a class,
+  function, connection, driver, or attribute referenced internally. Exercise
+  public constructors, the administration API, subprocess CLI calls, real
+  temporary DuckDB/SQLite databases, and existing public injection seams.
+  Environment-variable monkeypatching remains allowed where process state is
+  the public input.
+- Do not delete existing tests. Update an existing test only if PR13
+  deliberately changes the exact behavior it asserted. Add focused PR13 test
+  files alongside the existing regression suite.
+- Keep `from nygen_router import ProviderRouter` lightweight. DuckDB remains
+  optional and lazily imported. SQLite remains standard-library-only.
+- Keep database connections, cursors, native rows, SQL toolkits, sessions, and
+  engine objects out of router, policy, and domain-model APIs.
+- Preserve raw provider response identity, native request pass-through,
+  error transparency, retry behavior, health behavior, and streaming behavior.
+  PR13 changes storage schema administration, not provider execution.
+- Preserve best-effort metrics behavior: a router-owned metrics read/write
+  failure cannot replace a provider response. Score history failure retains the
+  existing tie-break degradation behavior.
+- Do not leak API keys, passwords, connection parameters, or sensitive bound
+  values into logs, exceptions, CLI output, test fixtures, or snapshots.
+- Avoid unrelated refactoring and do not pull other roadmap features into this
+  PR.
+
+## Explicit scope boundaries
+
+### Aggregation belongs wholly to PR30
+
+Do not add an aggregate-query method or optional aggregate capability in PR13.
+Do not push `aggregate_stats()` into SQL, change `ScoreBasedPolicy`, create
+rollups, add caches, add aggregate indexes, or benchmark aggregate queries.
+
+PR30 owns the complete storage-side scoring-aggregation design, including:
+
+- bounded `O(eligible providers)` result cardinality;
+- flat and exponential-recency weighting;
+- exact diagnostic tallies;
+- compatibility for custom two-method stores;
+- SQL/Python semantic equivalence;
+- aggregate indexes, query-plan validation, and large-history benchmarks.
+
+PR13 should leave clean internal schema/serialization seams for PR30, but must
+not pre-emptively design or expose its public aggregate contract.
+
+### No new reporting-query API
+
+Preserve `MetricsStore.query_recent()` and formally retain its current logical
+behavior: UTC-aware lower-bound filtering, optional equality filters, complete
+`MetricsEvent` results, and chronological ascending order. Do not add generic
+reporting methods, pagination, dashboard summaries, retention APIs, or richer
+stats queries. PR28 owns dashboard-oriented reporting.
+
+### No remote backend implementation
+
+Do not add `PostgresMetricsStore`, Supabase SDK support, a generic remote store,
+remote connection factories, a public `RemoteStorageConfig`, SQLAlchemy,
+psycopg, Alembic, or another database dependency.
+
+PR13 must document the contract future PR14 code must satisfy:
+
+- optional backend-specific dependencies and lazy imports;
+- explicit deployment/admin migrations rather than runtime DDL;
+- least-privilege runtime connections;
+- credential-safe errors and logging;
+- bounded connect, statement, and pool timeouts;
+- explicit TLS/SSL, direct-versus-pooled mode, connection ownership, and
+  idempotent cleanup;
+- no hidden local/remote switching, mirroring, replication, or dual writes.
+
+This is a documented and testable extension boundary, not speculative remote
+executable code.
+
+### Removed and deferred features
+
+`request_size_bucket` is completely out of scope. Do not add it to the event
+model, schema, reports, migrations, compatibility fixtures, or documentation
+as a supported metric. Do not build a special migration for a historical
+schema containing it.
+
+Do not implement PR25 durable health, PR31 concurrency changes, PR32 buffered
+writes, PR33 async routing, cross-backend data copying, retention, deletion,
+batching, background queues, or automatic backups.
+
+## Preserve the runtime storage protocol
+
+`MetricsStore` remains the structural, storage-neutral protocol used by the
+router and routing policies, with exactly:
+
+```python
+def record_attempt(self, event: MetricsEvent) -> None: ...
+
+def query_recent(
+    self,
+    *,
+    since: datetime,
+    metrics_scope: str | None = None,
+    provider_id: str | None = None,
+    model: str | None = None,
+    protocol: ApiProtocol | None = None,
+    call_type: CallType | None = None,
+) -> list[MetricsEvent]: ...
+```
+
+Do not add `inspect`, `create`, `migrate`, `close`, version, aggregation, or
+administration methods to this protocol. Administration is a separate public
+surface. Custom `MetricsStore` implementations must not be required to
+implement schema management.
+
+Keep the bundled stores' existing constructors and idempotent `close()`
+behavior. The router continues to use exactly the one store supplied at
+construction. It never owns or closes an application-injected store
+unexpectedly.
+
+## Storage-neutral event conversion
+
+Refactor the current positional serialization carefully so all bundled and
+future backends share one named logical conversion contract. Provide small,
+focused helpers equivalent to:
+
+```python
+event_to_record(event: MetricsEvent) -> dict[str, object]
+record_to_event(record: Mapping[str, object]) -> MetricsEvent
+```
+
+Exact public/private placement may follow the current storage package style,
+but the logical behavior must be singular and covered directly through the
+backend conformance suite:
+
+- preserve every current `MetricsEvent` field exactly;
+- normalize every timezone-aware timestamp to UTC;
+- reject naive timestamps rather than storing ambiguous time;
+- preserve enum values as stable strings at the database boundary;
+- preserve booleans and nullable values without truthiness accidents;
+- support local ISO-text timestamps while allowing a future PostgreSQL backend
+  to use native timezone-aware datetimes;
+- never expose a database-native row to routing code;
+- derive backend-specific positional parameters and row mappings privately
+  from the named logical record;
+- retain current identity/filter dimensions: metrics scope, canonical provider
+  ID, model, protocol, and call type.
+
+Do not couple `MetricsEvent` to an ORM or turn it into a database row model.
+
+## Version metadata and baseline
+
+Introduce one deliberately small metadata table named:
+
+`nygen_router_schema_versions`
+
+Its logical schema is:
+
+```text
+component TEXT PRIMARY KEY
+version   INTEGER NOT NULL
+```
+
+Version stored components independently. PR13 creates the `metrics` component
+at integer version `1`. A later PR may add `health` as a separate row and
+revision stream. Runtime metrics validation reads only the `metrics` revision;
+it must tolerate and preserve other well-formed component rows rather than
+coupling unrelated schemas.
+
+Keep the metadata table's schema and version constants in one authoritative
+location. The latest creation DDL, runtime validation, administration
+inspection, and migration registry must agree. Unknown metadata-table shapes,
+duplicate/invalid component records, nonpositive/noninteger revisions, a
+missing required metrics row, and a metrics revision newer than the installed
+package are actionable incompatibilities.
+
+### Fresh database behavior
+
+- If the configured local database path is absent, normal first use by
+  `DuckDBMetricsStore` or `SQLiteMetricsStore` may create the parent directory,
+  the exact current `provider_attempts` schema, and the version table with
+  `metrics = 1`.
+- Creation must complete transactionally where supported. Do not leave a
+  database advertised as current when its metrics table was not created.
+- Every later run reuses the same configured path and validates it; it must not
+  create timestamped, numbered, temporary, alternate, or fallback databases.
+- DuckDB's omitted-path behavior remains the stable default
+  `~/.nygen_router/metrics.duckdb`.
+- SQLite continues to require the explicit path its constructor currently
+  requires.
+
+### Existing database behavior during normal runtime
+
+- An existing, correctly versioned version-1 database is validated and reused
+  without DDL.
+- An existing `provider_attempts` table that exactly matches today's approved
+  schema but has no version table may be recognized read-only as the implicit
+  version-1 baseline. Normal `record_attempt()` and `query_recent()` must not
+  stamp or otherwise alter its schema. The explicit `migrate` operation may
+  stamp it.
+- If an existing path has an absent, partial, extra, reordered, mistyped, or
+  otherwise incompatible metrics schema, normal runtime must not initialize,
+  alter, rebuild, backfill, rename, replace, delete, or copy it. Raise a
+  credential-safe, actionable schema error to direct store callers; retain the
+  router's existing graceful metrics degradation.
+- Do not add migration support for arbitrary pre-PR13 or experimental layouts.
+  There is no important deployed legacy database population. Unknown layouts
+  remain untouched, and the user is directed to preserve/manual-export them or
+  create a fresh database.
+
+## Separate administration API
+
+Add a typed public administration module under the storage package, for
+example `nygen_router.storage.admin`, with exactly these conceptual operations:
+
+- `inspect_database(...)`
+- `create_database(...)`
+- `migrate_database(...)`
+
+Use an explicit typed local-backend selector with only DuckDB and SQLite. Do
+not accept arbitrary backend strings deep in the implementation or leak native
+connections. Functions should accept `str | Path` targets. An omitted path may
+mean the stable default only for DuckDB; reject an omitted SQLite path.
+
+Return frozen typed result records containing the information callers need.
+Raise focused typed administration/schema errors with actionable messages.
+The Python API must not print or log routine success output.
+
+Keep this API separate from `MetricsStore`, `ProviderRouter`, and policy
+construction. It operates directly on a deliberately selected database target
+and never makes provider calls.
+
+### `inspect`
+
+`inspect` is strictly read-only:
+
+- report the backend and fully resolved path;
+- report whether the path exists and whether it is DuckDB's default path;
+- do not create a missing file or parent directory;
+- report the metadata-table state and every valid component revision;
+- distinguish a fresh/missing target, implicit unversioned baseline, current
+  version, supported older version, unsupported/unknown schema, and
+  newer-than-installed version;
+- report compatibility and the next safe action;
+- never acquire a write connection merely for convenience.
+
+Prove with tests that inspecting an absent path creates nothing and inspecting
+an existing target changes neither schema nor rows.
+
+### `create`
+
+`create` means only "create a completely new database":
+
+- require an absent target;
+- create the current metrics schema and `metrics = 1` metadata atomically;
+- validate the result before reporting success;
+- refuse any existing filesystem target, including an empty or incompatible
+  database, and leave it byte-for-byte/schema-for-schema untouched;
+- do not offer `--force`, overwrite, replace, delete, archive, move, redirect,
+  or automatic alternate-name behavior;
+- do not import or copy history from another database.
+
+If an existing database occupies the desired path, tell the user to inspect
+it, migrate it when supported, manually move/archive it while the application
+is stopped, or choose a different path and update router configuration.
+
+If creation itself fails after this operation created a brand-new target,
+clean up only that provably operation-owned partial target when it is safe to
+do so. Never delete a target that predated the call.
+
+### `migrate`
+
+`migrate` means only "upgrade this existing database through known version
+steps":
+
+- require an existing target;
+- support the exact current unversioned schema as the implicit version-1
+  baseline and explicitly stamp it with `metrics = 1`;
+- treat a correctly versioned current database as a successful no-op;
+- build and validate the complete ordered migration route before writing;
+- accept no version gaps, guessed transforms, or migrations from unknown
+  shapes;
+- reject a database newer than the installed package;
+- update the version row only after the corresponding schema/data step has
+  succeeded, in the same transaction;
+- roll back the whole attempted migration on failure and never continue to a
+  later step;
+- preserve unrelated valid component rows;
+- be idempotent when invoked again after success.
+
+Create a small ordered migration registry/mechanism that future PRs can extend
+one version step at a time. Do not invent fake historical metrics schemas or a
+fake v0 data transformation merely to demonstrate the mechanism. The real
+PR13 migration is explicit stamping of the exact implicit baseline; every
+future schema-changing step must bring its own forward-migration and tests.
+
+### Offline and failure-safety contract
+
+Administration migration is offline. Require documentation and errors to say
+that the application, routers, and other database writers must be stopped.
+Acquire the backend-appropriate exclusive transaction/lock and fail safely if
+the target is busy; do not promise online migration or add PR31 concurrency
+work.
+
+Use transactional DDL/data changes supported and verified against each real
+engine. A migration failure must leave the original schema version and history
+usable. If an engine operation cannot satisfy the required atomicity, stop and
+report the architectural conflict rather than weakening the guarantee.
+
+Backups are never automatic. `migrate_database` and the CLI may accept one
+optional, explicit backup destination for local databases:
+
+- the source must first pass the supported-input inspection;
+- refuse an existing backup target;
+- create the backup using an engine-safe offline method, not an unsafe live
+  file copy;
+- validate that the backup is readable and represents the pre-migration
+  source before changing the source;
+- if backup creation/validation fails, leave the source untouched;
+- retain a successful backup even if the subsequent migration fails;
+- never select a default backup filename or generate repeated backup files.
+
+Do not add a general backup/restore product or cross-backend export/import.
+
+## Command-line interface
+
+Expose the same implementation through a small standard-library CLI with the
+unambiguous command shape:
+
+```text
+nygen-router storage inspect ...
+nygen-router storage create ...
+nygen-router storage migrate ...
+```
+
+Use the package's standard console-script mechanism and a small parser; add no
+CLI framework dependency. Require an explicit backend. Require a path for
+SQLite. For DuckDB, accept either an explicit path or an unambiguous option to
+select the router's standard default, never both.
+
+The CLI is an administrator interface, so useful terminal output is required.
+Keep library/runtime modules free of routine printing; format typed API results
+at the CLI boundary. Use stdout for successful information, stderr for errors,
+and stable nonzero exit codes for invalid arguments, incompatibility,
+dependency absence, lock/failure, and unexpected administration failure.
+
+Required output:
+
+- `inspect`: backend, resolved path, existence, default-path status, schema
+  state, component versions, compatibility, and recommended next action;
+- `create`: exact path created, latest metrics version, validation result, and
+  whether it is the router default;
+- `migrate`: source/current/target version, planned and completed steps,
+  no-op status, optional backup path, final validation, and recovery guidance
+  on failure.
+
+After non-default `create`, prominently state that `ProviderRouter` will not
+discover the database automatically and show a copyable example using the
+appropriate concrete store:
+
+```python
+metrics_store = DuckDBMetricsStore("/chosen/path/metrics.duckdb")
+# or
+metrics_store = SQLiteMetricsStore("/chosen/path/metrics.sqlite")
+
+router = ProviderRouter(..., metrics_store=metrics_store)
+```
+
+If created at DuckDB's standard default path, say that the default router store
+will reuse it without an explicit path. Never claim that the CLI edits source
+code, environment variables, configuration files, or a running router.
+
+When DuckDB is not installed, DuckDB administration must fail with a concise
+installation instruction and no import-time breakage or traceback in ordinary
+CLI use. SQLite administration must continue to work. Help output and root
+package imports must work without DuckDB.
+
+## Schema validation and error behavior
+
+Retain and improve the current exact-schema validation principle:
+
+- validate names, order, logical types, nullability, defaults, primary-key
+  identity, version metadata, and all current columns;
+- account only for deliberate DuckDB/SQLite physical type spellings;
+- do not accept extra columns as harmless;
+- do not infer compatibility solely from a version number;
+- do not alter anything while diagnosing a mismatch;
+- include backend, safe path, detected state/version, expected version, and a
+  safe next action in administration errors;
+- never echo event values, bound parameters, credentials, or future database
+  URL passwords.
+
+Keep direct store failures observable. The existing router and score-policy
+boundaries, not the store, own best-effort degradation and warning
+deduplication.
+
+## Required behavioral scenarios
+
+The implementation and tests must define and prove at least these outcomes:
+
+1. Root import succeeds without DuckDB installed.
+2. SQLite administration succeeds without DuckDB installed.
+3. Normal first use at an absent explicit DuckDB path creates exactly that
+   database at version 1.
+4. Normal first use with omitted DuckDB path creates/reuses only the stable
+   default path.
+5. Normal first use at an absent SQLite path creates exactly that database at
+   version 1.
+6. Reopening either backend reuses the same file and history without DDL or
+   extra database files.
+7. A current versioned database reads/writes/query-filters exactly as before.
+8. The exact unversioned baseline works without runtime stamping or mutation.
+9. An incompatible existing schema is rejected and remains unchanged.
+10. An existing path without the expected metrics schema is not initialized
+    behind the user's back.
+11. Router metrics-write failure still cannot replace a successful provider
+    response.
+12. Score-history read failure still returns the established tie-break order.
+13. `inspect` on an absent path creates nothing.
+14. `inspect` correctly distinguishes all supported schema/version states and
+    is read-only.
+15. `create` succeeds only for an absent target and prints/configures the
+    correct default-versus-non-default guidance.
+16. `create` refuses an existing current, empty, incompatible, or arbitrary
+    file without changing it.
+17. `migrate` stamps the exact implicit baseline while preserving every event.
+18. `migrate` on version 1 is a successful no-op.
+19. Unknown, malformed, gapped, and newer metrics versions are rejected
+    without modification.
+20. A separate valid component-version row is preserved and does not become
+    coupled to the metrics version.
+21. A busy/offline-contract violation fails safely without partial changes.
+22. Optional backup refuses an existing target, is validated before migration,
+    and preserves the pre-migration source.
+23. Failure before or during migration leaves the original database/version
+    usable to the strongest reliably testable extent on both engines.
+24. `inspect`, `create`, and `migrate` CLI success and failure output is
+    actionable, uses the correct streams/exit status, and contains no secrets.
+25. Non-default creation output clearly tells the user to update the concrete
+    store path; default DuckDB creation says no explicit path is needed.
+26. Event round trips, UTC timestamps, nullable streaming fields, all query
+    filters, chronological order, and idempotent cleanup remain identical
+    across both backends.
+27. No aggregation, reporting, retention, health persistence, remote backend,
+    or cross-backend copy API appears.
+
+## Tests
+
+Extend the existing shared `test_metrics_store.py` conformance coverage rather
+than replacing it. Add focused files with names such as:
+
+- `ProviderRouter/tests/test_pr13_schema_versioning.py`
+- `ProviderRouter/tests/test_pr13_storage_admin.py`
+- `ProviderRouter/tests/test_pr13_storage_cli.py`
+
+Parametrize shared behavior over real temporary SQLite and DuckDB databases.
+Skip only DuckDB-specific cases when its optional package is genuinely absent;
+the configured development/CI environment should install the existing DuckDB
+extra and exercise both backends.
+
+Use subprocess execution for public CLI behavior where appropriate. Use real
+database locks/connections and filesystem targets for contention and
+preservation tests. Do not sleep, access the network, require credentials, or
+patch internal driver functions. If deterministic failure coverage requires a
+new seam, expose the smallest honest public administration seam rather than
+reaching into module paths; do not expose native database connections merely
+for testing.
+
+Preserve and run every existing regression test. Update PR29 exact-schema tests
+only where the deliberately added version table changes the exact new-database
+expectation; keep their core guarantee that incompatible existing data is left
+untouched.
+
+## Dependency and import requirements
+
+- Pydantic remains the only mandatory runtime dependency.
+- Do not make DuckDB mandatory or import it at module scope.
+- SQLite remains Python-standard-library-only.
+- Add no SQLAlchemy, ORM, database migration toolkit, PostgreSQL driver, or CLI
+  framework.
+- The console command and its help must load without optional database
+  packages.
+- Merely exporting administration types/functions from the storage package
+  must not connect to a database or import DuckDB.
+- Preserve the current supported Python-version policy after inspecting
+  `pyproject.toml` and CI.
+
+## Documentation synchronization
+
+After implementation and focused tests pass, review and synchronize all
+affected explanatory material. At minimum inspect and update where applicable:
+
+- root `README.md`;
+- `ProviderRouter/README.md`;
+- root `AGENTS.md`;
+- `ProviderRouter/AGENTS.md`;
+- `Projectplan/Newprojectplan.md`;
+- `Projectplan/sharedstorage.md`;
+- relevant historical notes in `Projectplan/OldProjectPlan.md` only when a
+  clarification is needed without rewriting history;
+- `CODEBASE_AUDIT.md` storage delivery status and PR30/PR14 dependencies;
+- package exports, docstrings, CLI help, examples, and inline comments;
+- setup/dependency guidance and any usage files that discuss metrics paths or
+  schema compatibility.
+
+Documentation must clearly explain:
+
+- PR13 is shipped and what it provides;
+- the difference between normal first-use initialization and explicit
+  administrator migration;
+- stable default DuckDB path versus explicitly configured paths;
+- a newly created non-default database is not automatically selected by the
+  router;
+- `inspect`, `create`, and `migrate` meanings and examples;
+- `create` never overwrites and no delete/replace command exists;
+- how to choose between migrating, manually archiving an old local file and
+  creating fresh, or choosing/configuring another path;
+- the offline/transaction/backup guarantees;
+- versioning is component-specific, beginning with `metrics = 1`;
+- existing incompatible data is never silently altered;
+- storage failures remain best-effort at router boundaries;
+- PostgreSQL/Supabase remains PR14 and uses the standard PostgreSQL protocol;
+- storage-side score aggregation remains PR30;
+- no new metrics-reporting or `request_size_bucket` behavior was added.
+
+Mark PR13 shipped in the current roadmap and remove stale statements that it is
+entirely unimplemented. Preserve later PR scopes and recommended order. Do not
+introduce new runtime behavior during documentation synchronization.
+
+## Git safety, commits, and required tags
+
+Perform read-only inspection first:
+
+1. Inspect `git status --short --branch`, current HEAD, existing tags, and
+   relevant recent history.
+2. Understand and preserve every unrelated pre-existing change. Never absorb,
+   discard, overwrite, or commit unrelated user work.
+3. Confirm the approved execution prompt exists at
+   `Projectplan/prompt_pr13.txt`.
+4. A Git tag cannot capture uncommitted state. Establish a clean prompt-only
+   baseline in the repository's normal history before implementation. If the
+   worktree contains unrelated changes or authority is insufficient to form
+   that baseline safely, stop and ask the user rather than guessing.
+5. Confirm neither `pr13-start` nor `pr13-complete` exists. If either exists,
+   stop and report the conflict; never move, delete, or force-replace it.
+6. Immediately before the first PR13 implementation-related change, create:
+
+   `git tag pr13-start`
+
+The start tag must identify the exact clean pre-implementation commit that
+contains the approved prompt but none of the PR13 runtime/test/documentation
+implementation.
+
+Create sensible local commit(s) so the completed implementation and synchronized
+documentation are captured. Do not put `pr13-complete` on a commit that omits
+uncommitted PR13 changes.
+
+Only after every completion criterion is satisfied, the final diff/status is
+understood, and all PR13 changes are committed, create:
+
+`git tag pr13-complete`
+
+Leave commits and tags local and ready to push. Do not push anything.
+
+## Validation
+
+Inspect `ProviderRouter/pyproject.toml`, the CI workflow, and current repository
+conventions before running commands. From the correct package directory, run
+the configured equivalents of:
+
+- focused PR13 tests during development;
+- the full offline pytest suite;
+- coverage with branch reporting according to project configuration;
+- `ruff format --check`;
+- `ruff check`;
+- strict `mypy` over `src`;
+- lightweight-import checks in environments/processes where DuckDB and all
+  future remote packages are unavailable;
+- CLI help plus SQLite administration without DuckDB installed.
+
+Do not weaken lint, type, coverage, or test settings to make the change pass.
+Report exact commands and results in the final handoff.
+
+## Completion criteria
+
+PR13 is complete only when all of the following are true:
+
+- fresh DuckDB and SQLite databases contain the exact current metrics schema
+  and component-version metadata;
+- repeated application runs reuse one configured database rather than
+  generating new paths;
+- existing paths are never silently initialized, migrated, replaced, deleted,
+  redirected, or copied;
+- exact implicit-baseline compatibility works without runtime mutation;
+- incompatible schemas remain untouched with actionable errors;
+- version metadata independently tracks `metrics = 1` and permits future
+  independent components;
+- named event conversion preserves every current field and UTC/filter/order
+  semantics across both backends;
+- `MetricsStore` still contains only `record_attempt` and `query_recent`;
+- the typed administration API and `nygen-router storage inspect|create|migrate`
+  CLI satisfy the agreed contracts;
+- `inspect` is demonstrably read-only;
+- `create` refuses every existing target and gives correct path-selection
+  guidance;
+- `migrate` is explicit, offline, route-validated, transactional, rollback-safe,
+  version-last, idempotent, and optionally backup-protected;
+- provider calls and score ordering retain existing storage-failure degradation;
+- DuckDB remains optional/lazy and SQLite remains standard-library-only;
+- no PostgreSQL/Supabase implementation or new dependency was added;
+- no aggregation/reporting/request-size/health/concurrency/async/buffering work
+  leaked into PR13;
+- focused tests cover both backends and all existing tests remain regression
+  coverage;
+- the full test, coverage, formatting, lint, type, import, and CLI validation
+  passes;
+- documentation is synchronized and PR13 is marked shipped;
+- the final diff contains no unrelated work;
+- `pr13-start` points to the clean approved-prompt baseline immediately before
+  implementation; and
+- `pr13-complete` points to the committed, fully validated PR13 result.
+
+## Final handoff
+
+At completion, report concisely:
+
+- the public administration API and CLI added;
+- runtime schema/version behavior and migration guarantees;
+- important files changed;
+- exact validation commands and results;
+- documentation synchronized;
+- commit(s) created;
+- `pr13-start` and `pr13-complete` targets;
+- any limitations or deliberately deferred work.
+
+Do not claim PostgreSQL readiness, online migration, replay safety, aggregation
+performance, or data recovery behavior that PR13 does not implement.
