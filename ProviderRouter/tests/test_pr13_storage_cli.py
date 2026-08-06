@@ -38,7 +38,7 @@ def test_cli_main_directly_formats_inspect_create_migrate_and_errors(
     assert main(["storage", "inspect", "--backend", "sqlite", "--path", str(path)]) == 0
     assert "Schema state: missing" in capsys.readouterr().out
     assert main(["storage", "create", "--backend", "sqlite", "--path", str(path)]) == 0
-    assert "Latest metrics version: 1" in capsys.readouterr().out
+    assert "Latest metrics version: 2" in capsys.readouterr().out
     assert (
         main(
             [
@@ -102,7 +102,7 @@ def test_sqlite_inspect_and_create_output_is_actionable(tmp_path: Path) -> None:
     assert not inspected.stderr
     assert created.returncode == 0
     assert f"Created sqlite database: {path.resolve()}" in created.stdout
-    assert "Latest metrics version: 1" in created.stdout
+    assert "Latest metrics version: 2" in created.stdout
     assert "ProviderRouter will not discover" in created.stdout
     assert f"SQLiteMetricsStore({str(path.resolve())!r})" in created.stdout
     assert created.stderr == ""
@@ -149,8 +149,8 @@ def test_cli_migrate_reports_steps_backup_and_final_validation(tmp_path: Path) -
     )
 
     assert result.returncode == 0
-    assert "Source metrics version: 1" in result.stdout
-    assert "Target metrics version: 1" in result.stdout
+    assert "Source metrics version: 2" in result.stdout
+    assert "Target metrics version: 2" in result.stdout
     assert "Planned steps: <none>" in result.stdout
     assert "Completed steps: <none>" in result.stdout
     assert "No-op: yes" in result.stdout
@@ -194,7 +194,7 @@ raise SystemExit(main(['storage', 'create', '--backend', 'sqlite', '--path', {st
 
     assert result.returncode == 0, result.stderr
     assert path.exists()
-    assert "Latest metrics version: 1" in result.stdout
+    assert "Latest metrics version: 2" in result.stdout
     assert "duckdb" not in result.stderr.lower()
 
 

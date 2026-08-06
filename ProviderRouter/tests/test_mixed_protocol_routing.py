@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 import pytest
+from metrics_store_helpers import zero_score_aggregates
 
 from nygen_router import (
     ApiProtocol,
@@ -24,6 +25,8 @@ from nygen_router import (
     ProviderTimeoutError,
     RouterExhaustedError,
     RoutingContext,
+    ScoreAggregate,
+    ScoreAggregateQuery,
     StreamFailurePolicy,
     UnsupportedOperationError,
     UnsupportedProtocolError,
@@ -56,6 +59,9 @@ class _Store:
         call_type: CallType | None = None,
     ) -> list[MetricsEvent]:
         return list(self.events)
+
+    def query_score_aggregates(self, query: ScoreAggregateQuery) -> list[ScoreAggregate]:
+        return zero_score_aggregates(query)
 
 
 class _FakeStream(NormalizedStream):

@@ -167,7 +167,7 @@ def test_create_builds_current_schema_and_refuses_a_second_create(
 
     assert result.path == path.resolve()
     assert result.validation.schema.state is SchemaState.CURRENT
-    assert result.validation.schema.metrics_version == 1
+    assert result.validation.schema.metrics_version == 2
     with pytest.raises(StorageTargetError, match="already exists"):
         create_database(backend, path)
     assert path.read_bytes() == before
@@ -201,46 +201,41 @@ def test_inspect_is_read_only_for_current_schema_and_rows(
     assert path.read_bytes() == before
 
 
-def test_migrate_stamps_exact_implicit_baseline_preserves_events_and_is_idempotent(
+def test_migrate_refuses_exact_implicit_baseline_without_modification(
     target: tuple[LocalBackend, Path],
 ) -> None:
     backend, path = target
     event = _create_implicit(backend, path)
+    before = path.read_bytes()
 
-    migrated = migrate_database(backend, path)
-    repeated = migrate_database(backend, path)
+    with pytest.raises(StorageCompatibilityError, match="no approved route"):
+        migrate_database(backend, path)
 
-    assert migrated.source_version is None
-    assert [step.name for step in migrated.planned_steps] == [
-        "stamp exact implicit metrics baseline as version 1"
-    ]
-    assert migrated.completed_steps == migrated.planned_steps
-    assert migrated.no_op is False
-    assert repeated.no_op is True
     assert _read_event_ids(backend, path) == [event.id]
-    assert inspect_database(backend, path).schema.state is SchemaState.CURRENT
+    assert inspect_database(backend, path).schema.state is SchemaState.IMPLICIT_BASELINE
+    assert path.read_bytes() == before
 
 
 def test_optional_backup_is_validated_and_remains_pre_migration_source(
     target: tuple[LocalBackend, Path],
 ) -> None:
     backend, path = target
-    event = _create_implicit(backend, path)
+    create_database(backend, path)
     backup = path.with_name(f"backup{path.suffix}")
 
     result = migrate_database(backend, path, backup_path=backup)
 
     assert result.backup_path == backup.resolve()
-    assert inspect_database(backend, backup).schema.state is SchemaState.IMPLICIT_BASELINE
+    assert result.no_op is True
+    assert inspect_database(backend, backup).schema.state is SchemaState.CURRENT
     assert inspect_database(backend, path).schema.state is SchemaState.CURRENT
-    assert _read_event_ids(backend, backup) == [event.id]
 
 
 def test_backup_refuses_existing_destination_before_source_changes(
     target: tuple[LocalBackend, Path],
 ) -> None:
     backend, path = target
-    _create_implicit(backend, path)
+    create_database(backend, path)
     backup = path.with_name(f"backup{path.suffix}")
     backup.write_bytes(b"keep this backup target")
 
@@ -248,7 +243,7 @@ def test_backup_refuses_existing_destination_before_source_changes(
         migrate_database(backend, path, backup_path=backup)
 
     assert backup.read_bytes() == b"keep this backup target"
-    assert inspect_database(backend, path).schema.state is SchemaState.IMPLICIT_BASELINE
+    assert inspect_database(backend, path).schema.state is SchemaState.CURRENT
 
 
 def test_missing_metrics_component_is_rejected_without_modification(
@@ -282,7 +277,7 @@ def test_newer_version_is_rejected_without_modification(
     _execute(
         backend,
         path,
-        f"UPDATE {SCHEMA_VERSIONS_TABLE} SET version = 2 WHERE component = ?",
+        f"UPDATE {SCHEMA_VERSIONS_TABLE} SET version = 3 WHERE component = ?",
         (METRICS_COMPONENT,),
     )
     before = path.read_bytes()
@@ -310,7 +305,7 @@ def test_valid_unrelated_component_survives_current_no_op_migration(
     assert result.no_op is True
     assert [(item.component, item.version) for item in result.validation.schema.components] == [
         ("health", 9),
-        ("metrics", 1),
+        ("metrics", 2),
     ]
 
 

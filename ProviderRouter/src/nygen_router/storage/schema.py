@@ -7,7 +7,8 @@ from typing import Any
 
 SCHEMA_VERSIONS_TABLE = "nygen_router_schema_versions"
 METRICS_COMPONENT = "metrics"
-METRICS_SCHEMA_VERSION = 1
+IMPLICIT_METRICS_SCHEMA_VERSION = 1
+METRICS_SCHEMA_VERSION = 2
 
 CREATE_PROVIDER_ATTEMPTS_TABLE_SQL = """
 CREATE TABLE provider_attempts (
@@ -57,6 +58,48 @@ SELECT_SCHEMA_VERSIONS_SQL = (
 )
 INSERT_METRICS_VERSION_SQL = (
     f"INSERT INTO {SCHEMA_VERSIONS_TABLE} (component, version) VALUES (?, ?)"
+)
+
+
+@dataclass(frozen=True)
+class IndexDefinition:
+    """Normalized definition of one project-owned persistent metrics index."""
+
+    name: str
+    table: str
+    unique: bool
+    columns: tuple[str, ...]
+
+    @property
+    def create_sql(self) -> str:
+        unique = "UNIQUE " if self.unique else ""
+        columns = ", ".join(self.columns)
+        return f"CREATE {unique}INDEX {self.name} ON {self.table} ({columns})"
+
+
+# The 60,000-row/9-result/7-repetition PR30 benchmark showed SQLite using this
+# index for both current- and all-scope joins (1.240208/2.090667 ms medians,
+# versus 43.191167/43.610417 ms unindexed). Keeping scope out of the leading
+# columns lets one index serve both plans. A second scope-leading index reached
+# 0.556125 ms for current scope but was rejected for write/storage cost.
+# DuckDB 1.5.5 used sequential scans with no indexes (8.648875/9.006959 ms) and
+# two ART candidates (8.202791/9.003167 ms), with higher indexed seed/storage
+# cost, so its smallest measured set is empty. Timings are one-machine evidence,
+# not a universal latency guarantee.
+SQLITE_REQUIRED_METRICS_INDEXES = (
+    IndexDefinition(
+        name="provider_attempts_partition_timestamp_idx",
+        table="provider_attempts",
+        unique=False,
+        columns=("provider_id", "model", "protocol", "call_type", "timestamp"),
+    ),
+)
+DUCKDB_REQUIRED_METRICS_INDEXES: tuple[IndexDefinition, ...] = ()
+CREATE_SQLITE_REQUIRED_METRICS_INDEX_SQL = tuple(
+    definition.create_sql for definition in SQLITE_REQUIRED_METRICS_INDEXES
+)
+CREATE_DUCKDB_REQUIRED_METRICS_INDEX_SQL = tuple(
+    definition.create_sql for definition in DUCKDB_REQUIRED_METRICS_INDEXES
 )
 
 _EXPECTED_PROVIDER_SCHEMA = (
@@ -144,6 +187,8 @@ def inspect_schema_rows(
     provider_schema_rows: Sequence[Sequence[Any]],
     version_schema_rows: Sequence[Sequence[Any]],
     version_rows: Sequence[Sequence[Any]],
+    index_definitions: Sequence[IndexDefinition],
+    required_indexes: Sequence[IndexDefinition],
 ) -> SchemaReport:
     """Classify catalog data gathered read-only by a concrete backend."""
     tables = {str(name[0] if isinstance(name, (tuple, list)) else name) for name in table_names}
@@ -157,13 +202,16 @@ def inspect_schema_rows(
                 state=SchemaState.IMPLICIT_BASELINE,
                 metadata_state=MetadataState.ABSENT,
                 components=(),
-                metrics_version=METRICS_SCHEMA_VERSION,
-                compatible=True,
+                metrics_version=IMPLICIT_METRICS_SCHEMA_VERSION,
+                compatible=False,
                 next_action=(
-                    "Normal runtime may reuse this exact baseline without changing it; run the "
-                    "offline migrate command to stamp metrics version 1 explicitly."
+                    "Archive/delete this disposable version-1 target while the application is "
+                    "stopped, or configure a different absent path for a fresh version-2 database."
                 ),
-                detail="The exact metrics version-1 schema exists without version metadata.",
+                detail=(
+                    "The exact unversioned PR29 metrics schema is an implicit version-1 baseline; "
+                    "PR30 provides no migration route to version 2."
+                ),
             )
         detail = (
             "The provider_attempts table is missing."
@@ -220,10 +268,13 @@ def inspect_schema_rows(
             components=components,
             metrics_version=metrics_version,
             compatible=False,
-            next_action="Stop all writers and run the explicit offline migrate command.",
+            next_action=(
+                "Archive/delete this disposable version-1 target while the application is "
+                "stopped, or configure a different absent path for a fresh version-2 database."
+            ),
             detail=(
                 f"The database records supported metrics version {metrics_version}; installed "
-                f"version is {METRICS_SCHEMA_VERSION}."
+                f"version is {METRICS_SCHEMA_VERSION}, and no approved migration route exists."
             ),
         )
     if not has_provider or provider_error is not None:
@@ -236,6 +287,17 @@ def inspect_schema_rows(
             )
         )
         return _unknown_report(MetadataState.VALID, components, metrics_version, detail)
+    index_error = _required_index_error(index_definitions, required_indexes)
+    if index_error is not None:
+        return _unknown_report(
+            MetadataState.VALID,
+            components,
+            metrics_version,
+            (
+                "Version metadata claims the current metrics version, but required "
+                f"project-owned indexes are incompatible: {index_error}."
+            ),
+        )
     return SchemaReport(
         state=SchemaState.CURRENT,
         metadata_state=MetadataState.VALID,
@@ -248,8 +310,8 @@ def inspect_schema_rows(
 
 
 def validate_runtime_schema(report: SchemaReport, *, backend: str, path: str) -> None:
-    """Permit only current or exact implicit-v1 databases during normal runtime."""
-    if report.state in {SchemaState.CURRENT, SchemaState.IMPLICIT_BASELINE}:
+    """Permit only a fully validated current version-2 database at runtime."""
+    if report.state is SchemaState.CURRENT:
         return
     detected = (
         report.state.value
@@ -289,6 +351,29 @@ def _unknown_report(
         ),
         detail=detail,
     )
+
+
+def _required_index_error(
+    index_definitions: Sequence[IndexDefinition],
+    required_indexes: Sequence[IndexDefinition],
+) -> str | None:
+    by_name: dict[str, IndexDefinition] = {}
+    for definition in index_definitions:
+        if definition.name in by_name:
+            return f"catalog inspection returned duplicate index {definition.name!r}"
+        by_name[definition.name] = definition
+    for expected in required_indexes:
+        actual = by_name.get(expected.name)
+        if actual is None:
+            return f"missing required index {expected.name!r}"
+        if actual != expected:
+            return (
+                f"index {expected.name!r} has table={actual.table!r}, "
+                f"unique={actual.unique!r}, columns={actual.columns!r}; expected "
+                f"table={expected.table!r}, unique={expected.unique!r}, "
+                f"columns={expected.columns!r}"
+            )
+    return None
 
 
 def _component_versions(

@@ -126,7 +126,7 @@ def parse_options(description: str) -> WorkflowOptions:
     parser.add_argument(
         "--reset-history",
         action="store_true",
-        help="Delete the shared workflow DuckDB before the run.",
+        help="Delete the exact disposable workflow DuckDB so first use creates metrics v2.",
     )
     args = parser.parse_args()
     return WorkflowOptions(topic=args.topic, reset_history=args.reset_history)
@@ -174,6 +174,7 @@ def require_api_keys(providers: list[ProviderConfig]) -> None:
 
 
 def open_metrics_store(*, reset_history: bool) -> DuckDBMetricsStore:
+    """Open the shared v2 store, optionally performing the explicit demo-only reset."""
     if reset_history:
         DATABASE_PATH.unlink(missing_ok=True)
         Path(f"{DATABASE_PATH}.wal").unlink(missing_ok=True)

@@ -27,6 +27,13 @@ from nygen_router.storage.schema import (
     SchemaReport,
     SchemaState,
 )
+from nygen_router.storage.score_aggregation import (
+    ExponentialScoreWeighting,
+    FlatScoreWeighting,
+    ScoreAggregate,
+    ScoreAggregateProvider,
+    ScoreAggregateQuery,
+)
 from nygen_router.storage.sqlite import SQLiteMetricsStore
 
 __all__ = [
@@ -35,6 +42,8 @@ __all__ = [
     "DatabaseInspection",
     "DatabaseMigration",
     "DuckDBMetricsStore",
+    "ExponentialScoreWeighting",
+    "FlatScoreWeighting",
     "LocalBackend",
     "METRICS_SCHEMA_VERSION",
     "MetricsStore",
@@ -44,6 +53,9 @@ __all__ = [
     "SCHEMA_VERSIONS_TABLE",
     "SchemaReport",
     "SchemaState",
+    "ScoreAggregate",
+    "ScoreAggregateProvider",
+    "ScoreAggregateQuery",
     "SQLiteMetricsStore",
     "StorageAdministrationError",
     "StorageBackupError",

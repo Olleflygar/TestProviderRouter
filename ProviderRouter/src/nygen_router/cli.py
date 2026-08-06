@@ -33,12 +33,18 @@ EXIT_UNEXPECTED = 7
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="nygen-router")
     commands = parser.add_subparsers(dest="command", required=True)
-    storage = commands.add_parser("storage", help="inspect and administer local metrics storage")
+    storage = commands.add_parser(
+        "storage",
+        help="inspect/administer local metrics v2 storage; v1 has no PR30 migration",
+    )
     operations = storage.add_subparsers(dest="storage_command", required=True)
     for operation, help_text in (
         ("inspect", "inspect a database without changing it"),
-        ("create", "create a new current database; never overwrite"),
-        ("migrate", "upgrade a supported database while all writers are stopped"),
+        ("create", "create a new metrics v2 database; never overwrite"),
+        (
+            "migrate",
+            "run a registered offline route; no v1/implicit-v1 to v2 route exists",
+        ),
     ):
         subparser = operations.add_parser(operation, help=help_text)
         subparser.add_argument(

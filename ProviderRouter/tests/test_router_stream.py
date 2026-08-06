@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 import pytest
+from metrics_store_helpers import zero_score_aggregates
 
 from nygen_router import (
     ApiProtocol,
@@ -21,6 +22,8 @@ from nygen_router import (
     ProviderTimeoutError,
     RouterExhaustedError,
     RoutingContext,
+    ScoreAggregate,
+    ScoreAggregateQuery,
     StreamFailurePolicy,
     StreamRestart,
 )
@@ -148,6 +151,9 @@ class _FakeStore:
         call_type: CallType | None = None,
     ) -> list[MetricsEvent]:
         return list(self.events)
+
+    def query_score_aggregates(self, query: ScoreAggregateQuery) -> list[ScoreAggregate]:
+        return zero_score_aggregates(query)
 
 
 def _config(name: str) -> ProviderConfig:

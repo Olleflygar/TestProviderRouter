@@ -8,11 +8,16 @@ from nygen_router.config import ApiProtocol
 from nygen_router.metrics import MetricsEvent
 from nygen_router.storage.schema import COLUMN_NAMES
 from nygen_router.storage.schema import MetricsSchemaMismatchError as MetricsSchemaMismatchError
+from nygen_router.storage.score_aggregation import ScoreAggregate, ScoreAggregateQuery
 from nygen_router.types import CallType
 
 
 class MetricsStore(Protocol):
-    """The minimum interface every metrics backend implements."""
+    """Mandatory event, raw-history, and bounded score-aggregate backend contract.
+
+    ``query_recent`` remains the direct raw-event API. ScoreBasedPolicy always
+    uses ``query_score_aggregates`` and has no legacy two-method fallback.
+    """
 
     def record_attempt(self, event: MetricsEvent) -> None: ...
 
@@ -26,6 +31,8 @@ class MetricsStore(Protocol):
         protocol: ApiProtocol | None = None,
         call_type: CallType | None = None,
     ) -> list[MetricsEvent]: ...
+
+    def query_score_aggregates(self, query: ScoreAggregateQuery) -> list[ScoreAggregate]: ...
 
 
 _COLUMNS_SQL = ", ".join(COLUMN_NAMES)
@@ -102,7 +109,7 @@ def build_query_recent_sql(
     protocol: ApiProtocol | None,
     call_type: CallType | None,
 ) -> tuple[str, list[object]]:
-    """Build a parameterized recent-history query for every identity dimension."""
+    """Build the raw chronological query retained for direct callers and diagnosis."""
     if since.tzinfo is None:
         raise ValueError("since must be timezone-aware")
     query = _SELECT_PROVIDER_ATTEMPTS_SQL

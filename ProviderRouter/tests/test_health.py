@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 import pytest
+from metrics_store_helpers import zero_score_aggregates
 from pydantic import ValidationError
 
 from nygen_router import (
@@ -24,6 +25,8 @@ from nygen_router import (
     ProviderTimeoutError,
     RouterExhaustedError,
     RoutingContext,
+    ScoreAggregate,
+    ScoreAggregateQuery,
     UnsupportedOperationError,
 )
 from nygen_router.errors import ErrorCategory, categorize_error
@@ -67,6 +70,9 @@ class _FakeStore:
         call_type: CallType | None = None,
     ) -> list[MetricsEvent]:
         return list(self.events)
+
+    def query_score_aggregates(self, query: ScoreAggregateQuery) -> list[ScoreAggregate]:
+        return zero_score_aggregates(query)
 
 
 class _Script:

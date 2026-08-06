@@ -5,6 +5,7 @@ from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from metrics_store_helpers import aggregate_events_for_score_query
 
 from nygen_router import (
     ApiProtocol,
@@ -16,17 +17,20 @@ from nygen_router import (
     ProviderTimeoutError,
     RoundRobinPolicy,
     RoutingContext,
+    ScoreAggregate,
+    ScoreAggregateQuery,
     ScoreBasedPolicy,
     filter_eligible_providers,
 )
 
 
 class _FakeStore:
-    """In-memory MetricsStore that honors query_recent's filtering contract."""
+    """In-memory MetricsStore that honors the aggregate query contract."""
 
     def __init__(self, events: list[MetricsEvent] | None = None) -> None:
         self.events = [] if events is None else list(events)
-        self.queries: list[datetime] = []
+        self.queries: list[ScoreAggregateQuery] = []
+        self.raw_query_calls = 0
 
     def record_attempt(self, event: MetricsEvent) -> None:
         self.events.append(event)
@@ -41,17 +45,12 @@ class _FakeStore:
         protocol: ApiProtocol | None = None,
         call_type: CallType | None = None,
     ) -> list[MetricsEvent]:
-        self.queries.append(since)
-        return [
-            event
-            for event in self.events
-            if event.timestamp >= since
-            and (metrics_scope is None or event.metrics_scope == metrics_scope)
-            and (provider_id is None or event.provider_id == provider_id)
-            and (model is None or event.model == model)
-            and (protocol is None or event.protocol == protocol)
-            and (call_type is None or event.call_type == call_type)
-        ]
+        self.raw_query_calls += 1
+        raise AssertionError("ScoreBasedPolicy must not query raw history")
+
+    def query_score_aggregates(self, query: ScoreAggregateQuery) -> list[ScoreAggregate]:
+        self.queries.append(query)
+        return aggregate_events_for_score_query(self.events, query)
 
 
 class _FailingStore:
@@ -68,6 +67,9 @@ class _FailingStore:
         protocol: ApiProtocol | None = None,
         call_type: CallType | None = None,
     ) -> list[MetricsEvent]:
+        raise AssertionError("ScoreBasedPolicy must not query raw history")
+
+    def query_score_aggregates(self, query: ScoreAggregateQuery) -> list[ScoreAggregate]:
         raise RuntimeError("history database is unavailable")
 
 
@@ -263,6 +265,7 @@ def test_empty_eligible_list_returns_without_querying_history() -> None:
         == []
     )
     assert store.queries == []
+    assert store.raw_query_calls == 0
 
 
 def test_query_failure_degrades_to_tie_break_order_and_deduplicates_warning(
@@ -398,7 +401,8 @@ def test_event_older_than_lookback_has_zero_effect() -> None:
         RoutingContext(metrics_scope="test", call_type=CallType.REGULAR, metrics_store=store),
     )
 
-    assert store.queries == [fixed_now - timedelta(hours=24)]
+    assert [query.since for query in store.queries] == [fixed_now - timedelta(hours=24)]
+    assert store.raw_query_calls == 0
     assert [provider.name for provider in ordered] == ["provider_b", "provider_a"]
 
 

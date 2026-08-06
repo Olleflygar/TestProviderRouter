@@ -4,6 +4,7 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
+from metrics_store_helpers import zero_score_aggregates
 
 from nygen_router import (
     ApiProtocol,
@@ -20,6 +21,8 @@ from nygen_router import (
     ProviderTimeoutError,
     RouterExhaustedError,
     RoutingContext,
+    ScoreAggregate,
+    ScoreAggregateQuery,
     StickyRoutingPolicy,
     StreamFailurePolicy,
 )
@@ -331,6 +334,9 @@ class _MemoryStore:
 
     def query_recent(self, **kwargs: Any) -> list[MetricsEvent]:
         return list(self.events)
+
+    def query_score_aggregates(self, query: ScoreAggregateQuery) -> list[ScoreAggregate]:
+        return zero_score_aggregates(query)
 
 
 def test_interrupted_preferred_stream_restarts_without_rewriting_preference() -> None:

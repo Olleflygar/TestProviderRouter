@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from nygen_router.config import ApiProtocol
+from nygen_router.errors import ErrorCategory
 from nygen_router.metrics import MetricsEvent
 from nygen_router.storage.base import (
     INSERT_PROVIDER_ATTEMPT_SQL,
@@ -15,14 +16,22 @@ from nygen_router.storage.base import (
     row_to_event,
 )
 from nygen_router.storage.schema import (
+    DUCKDB_REQUIRED_METRICS_INDEXES,
     SCHEMA_VERSIONS_TABLE,
     SELECT_SCHEMA_VERSIONS_SQL,
     TABLE_INFO_PROVIDER_ATTEMPTS_SQL,
     TABLE_INFO_SCHEMA_VERSIONS_SQL,
+    IndexDefinition,
     MetricsSchemaMismatchError,
     SchemaReport,
     inspect_schema_rows,
     validate_runtime_schema,
+)
+from nygen_router.storage.score_aggregation import (
+    ExponentialScoreWeighting,
+    ScoreAggregate,
+    ScoreAggregateQuery,
+    validate_score_aggregates,
 )
 from nygen_router.types import CallType
 
@@ -38,6 +47,9 @@ class DuckDBMetricsStore:
     Single-process by design: DuckDB allows one writing process per file. Do
     not build cross-process coordination here -- users who need several local
     processes sharing one store should use SQLiteMetricsStore instead.
+    Metrics v2 keeps raw query_recent for direct callers and executes one
+    backend aggregate query for scoring. Measured DuckDB plans stayed
+    sequential with or without candidate ART indexes, so v2 retains none.
     """
 
     def __init__(
@@ -91,6 +103,20 @@ class DuckDBMetricsStore:
         connection = self._connect()
         rows: list[Any] = connection.execute(query, params).fetchall()
         return [row_to_event(row) for row in rows]
+
+    def query_score_aggregates(self, query: ScoreAggregateQuery) -> list[ScoreAggregate]:
+        """Return one validated intermediate-total row per requested provider."""
+        sql, params = _build_score_aggregate_sql(query)
+        rows: list[Any] = self._connect().execute(sql, list(params)).fetchall()
+        aggregates = [_row_to_score_aggregate(row) for row in rows]
+        validated = validate_score_aggregates(query, aggregates)
+        return [validated[provider.provider_id] for provider in query.providers]
+
+    def _explain_score_aggregates(self, query: ScoreAggregateQuery) -> tuple[str, ...]:
+        """Return private, engine-neutral plan text for deterministic validation."""
+        sql, params = _build_score_aggregate_sql(query)
+        rows: list[Any] = self._connect().execute(f"EXPLAIN {sql}", list(params)).fetchall()
+        return tuple(" | ".join(str(value) for value in row) for row in rows)
 
     def close(self) -> None:
         if self._connection is not None:
@@ -151,9 +177,141 @@ def _inspect_connection(connection: duckdb.DuckDBPyConnection) -> SchemaReport:
         if {"component", "version"}.issubset(version_columns)
         else []
     )
+    index_definitions: list[IndexDefinition] = []
+    expected_names = tuple(definition.name for definition in DUCKDB_REQUIRED_METRICS_INDEXES)
+    if "provider_attempts" in tables and expected_names:
+        placeholders = ", ".join("?" for _ in expected_names)
+        index_rows: list[Any] = connection.execute(
+            "SELECT index_name, table_name, is_unique, expressions "
+            f"FROM duckdb_indexes() WHERE index_name IN ({placeholders}) ORDER BY index_name",
+            list(expected_names),
+        ).fetchall()
+        index_definitions = [
+            IndexDefinition(
+                name=str(row[0]),
+                table=str(row[1]),
+                unique=bool(row[2]),
+                columns=_duckdb_index_columns(row[3]),
+            )
+            for row in index_rows
+        ]
     return inspect_schema_rows(
         table_names=table_names,
         provider_schema_rows=provider_rows,
         version_schema_rows=version_schema_rows,
         version_rows=version_rows,
+        index_definitions=index_definitions,
+        required_indexes=DUCKDB_REQUIRED_METRICS_INDEXES,
+    )
+
+
+def _duckdb_index_columns(expressions: object) -> tuple[str, ...]:
+    """Normalize DuckDB's catalog expression list for project-owned simple indexes."""
+    if isinstance(expressions, (tuple, list)):
+        return tuple(_duckdb_index_column(value) for value in expressions)
+    text = str(expressions).strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    if not text:
+        return ()
+    return tuple(_duckdb_index_column(value) for value in text.split(","))
+
+
+def _duckdb_index_column(value: object) -> str:
+    return str(value).strip().strip("'").strip('"')
+
+
+def _build_score_aggregate_sql(query: ScoreAggregateQuery) -> tuple[str, tuple[object, ...]]:
+    if not isinstance(query, ScoreAggregateQuery):
+        raise TypeError("query must be a ScoreAggregateQuery")
+    requested_values = ", ".join("(?, ?, ?, ?)" for _ in query.providers)
+    params: list[object] = []
+    for position, provider in enumerate(query.providers):
+        params.extend((position, provider.provider_id, provider.model, provider.protocol.value))
+
+    if isinstance(query.weighting, ExponentialScoreWeighting):
+        weight_sql = (
+            "CASE WHEN p.id IS NULL THEN 0.0 ELSE "
+            "POWER(0.5, (EPOCH(CAST(? AS TIMESTAMPTZ)) "
+            "- EPOCH(CAST(p.timestamp AS TIMESTAMPTZ))) / 3600.0 / ?) END"
+        )
+        params.extend((query.reference_time.isoformat(), query.weighting.half_life_hours))
+    else:
+        weight_sql = "CASE WHEN p.id IS NULL THEN 0.0 ELSE 1.0 END"
+
+    scope_sql = ""
+    join_params: list[object] = [
+        query.since.isoformat(),
+        query.call_type.value,
+    ]
+    if query.metrics_scope is not None:
+        scope_sql = " AND p.metrics_scope = ?"
+        join_params.append(query.metrics_scope)
+    params.extend(join_params)
+    params.extend((ErrorCategory.RATE_LIMIT.value, ErrorCategory.TIMEOUT.value))
+
+    sql = f"""
+WITH requested(position, provider_id, model, protocol) AS (
+    VALUES {requested_values}
+),
+matched AS (
+    SELECT
+        requested.position,
+        requested.provider_id AS requested_provider_id,
+        p.id IS NOT NULL AS has_event,
+        p.success,
+        p.latency_ms,
+        p.error_type,
+        {weight_sql} AS event_weight
+    FROM requested
+    LEFT JOIN provider_attempts AS p
+        ON p.provider_id = requested.provider_id
+        AND p.model = requested.model
+        AND p.protocol = requested.protocol
+        AND p.timestamp >= ?
+        AND p.call_type = ?{scope_sql}
+)
+SELECT
+    requested_provider_id,
+    COALESCE(SUM(CASE WHEN has_event THEN event_weight ELSE 0.0 END), 0.0),
+    COALESCE(SUM(CASE WHEN has_event AND success = 1 THEN event_weight ELSE 0.0 END), 0.0),
+    COALESCE(SUM(
+        CASE
+            WHEN has_event AND success = 1 AND latency_ms IS NOT NULL THEN event_weight
+            ELSE 0.0
+        END
+    ), 0.0),
+    COALESCE(SUM(
+        CASE
+            WHEN has_event AND success = 1 AND latency_ms IS NOT NULL
+                THEN event_weight * latency_ms
+            ELSE 0.0
+        END
+    ), 0.0),
+    COALESCE(SUM(CASE WHEN has_event AND success = 0 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(
+        CASE WHEN has_event AND success = 0 AND error_type = ? THEN 1 ELSE 0 END
+    ), 0),
+    COALESCE(SUM(
+        CASE WHEN has_event AND success = 0 AND error_type = ? THEN 1 ELSE 0 END
+    ), 0)
+FROM matched
+GROUP BY position, requested_provider_id
+ORDER BY position
+"""
+    return sql, tuple(params)
+
+
+def _row_to_score_aggregate(row: Any) -> ScoreAggregate:
+    if len(row) != 8:
+        raise ValueError(f"score aggregate row has {len(row)} values; expected 8")
+    return ScoreAggregate(
+        provider_id=str(row[0]),
+        attempt_weight=float(row[1]),
+        success_weight=float(row[2]),
+        successful_latency_weight=float(row[3]),
+        successful_latency_total_ms=float(row[4]),
+        recent_error_count=row[5],
+        rate_limit_count=row[6],
+        timeout_count=row[7],
     )

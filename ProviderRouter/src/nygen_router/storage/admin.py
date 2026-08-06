@@ -11,8 +11,10 @@ from typing import Any
 from urllib.parse import quote
 
 from nygen_router.storage.schema import (
+    CREATE_DUCKDB_REQUIRED_METRICS_INDEX_SQL,
     CREATE_PROVIDER_ATTEMPTS_TABLE_SQL,
     CREATE_SCHEMA_VERSIONS_TABLE_SQL,
+    CREATE_SQLITE_REQUIRED_METRICS_INDEX_SQL,
     INSERT_METRICS_VERSION_SQL,
     METRICS_COMPONENT,
     METRICS_SCHEMA_VERSION,
@@ -93,15 +95,9 @@ class StorageBackupError(StorageAdministrationError):
     """An explicitly requested pre-migration backup could not be validated."""
 
 
-_STAMP_IMPLICIT_BASELINE = MigrationStep(
-    source_version=None,
-    target_version=METRICS_SCHEMA_VERSION,
-    name="stamp exact implicit metrics baseline as version 1",
-)
-
-# Future schema changes append real consecutive steps here. None means the exact
-# unversioned baseline, not a fabricated schema version zero.
-_MIGRATION_REGISTRY: tuple[MigrationStep, ...] = (_STAMP_IMPLICIT_BASELINE,)
+# PR30 deliberately ships no version-1/implicit-v1 migration. Future schema
+# changes append real consecutive, executable steps here.
+_MIGRATION_REGISTRY: tuple[MigrationStep, ...] = ()
 
 
 def default_duckdb_path() -> Path:
@@ -159,7 +155,7 @@ def inspect_database(backend: LocalBackend, path: str | Path | None = None) -> D
 
 
 def create_database(backend: LocalBackend, path: str | Path | None = None) -> DatabaseCreation:
-    """Create and validate a brand-new current database, refusing every existing target."""
+    """Create and validate a brand-new metrics-v2 database, refusing existing targets."""
     before = inspect_database(backend, path)
     if before.exists:
         raise StorageTargetError(
@@ -217,7 +213,7 @@ def migrate_database(
     *,
     backup_path: str | Path | None = None,
 ) -> DatabaseMigration:
-    """Upgrade a supported existing target while every application writer is stopped."""
+    """Run a registered offline route; PR30 provides no v1/implicit-v1 route."""
     before = inspect_database(backend, path)
     if not before.exists:
         raise StorageTargetError(
@@ -338,6 +334,8 @@ def _create_sqlite(path: Path) -> None:
     try:
         connection.execute("BEGIN EXCLUSIVE")
         connection.execute(CREATE_PROVIDER_ATTEMPTS_TABLE_SQL)
+        for sql in CREATE_SQLITE_REQUIRED_METRICS_INDEX_SQL:
+            connection.execute(sql)
         connection.execute(CREATE_SCHEMA_VERSIONS_TABLE_SQL)
         connection.execute(INSERT_METRICS_VERSION_SQL, (METRICS_COMPONENT, METRICS_SCHEMA_VERSION))
         validate_created_schema(_inspect_connection(connection))
@@ -357,6 +355,8 @@ def _create_duckdb(path: Path) -> None:
     try:
         connection.execute("BEGIN TRANSACTION")
         connection.execute(CREATE_PROVIDER_ATTEMPTS_TABLE_SQL)
+        for sql in CREATE_DUCKDB_REQUIRED_METRICS_INDEX_SQL:
+            connection.execute(sql)
         connection.execute(CREATE_SCHEMA_VERSIONS_TABLE_SQL)
         connection.execute(INSERT_METRICS_VERSION_SQL, [METRICS_COMPONENT, METRICS_SCHEMA_VERSION])
         validate_created_schema(_inspect_connection(connection))
@@ -375,8 +375,6 @@ def _build_route(inspection: DatabaseInspection) -> tuple[MigrationStep, ...]:
     schema = inspection.schema
     if schema.state is SchemaState.CURRENT:
         return ()
-    if schema.state is SchemaState.IMPLICIT_BASELINE:
-        return (_STAMP_IMPLICIT_BASELINE,)
     if schema.state is SchemaState.NEWER:
         raise StorageCompatibilityError(
             f"Cannot migrate {inspection.backend.value} database at {str(inspection.path)!r}: "
@@ -390,9 +388,9 @@ def _build_route(inspection: DatabaseInspection) -> tuple[MigrationStep, ...]:
             return route
     raise StorageCompatibilityError(
         f"Cannot migrate {inspection.backend.value} database at {str(inspection.path)!r}: "
-        f"detected {schema.state.value}; expected an exact implicit baseline or a known version "
-        f"through metrics={METRICS_SCHEMA_VERSION}. {schema.detail} The database was left "
-        f"untouched. Next safe action: {schema.next_action}"
+        f"detected {schema.state.value}; no approved route reaches "
+        f"metrics={METRICS_SCHEMA_VERSION}. {schema.detail} The database was left untouched. "
+        f"Next safe action: {schema.next_action}"
     )
 
 
@@ -484,20 +482,13 @@ def _migrate_duckdb(
 def _execute_steps(
     connection: Any, planned: tuple[MigrationStep, ...]
 ) -> tuple[MigrationStep, ...]:
-    completed: list[MigrationStep] = []
-    for step in planned:
-        if step is _STAMP_IMPLICIT_BASELINE:
-            connection.execute(CREATE_SCHEMA_VERSIONS_TABLE_SQL)
-            connection.execute(
-                INSERT_METRICS_VERSION_SQL, (METRICS_COMPONENT, METRICS_SCHEMA_VERSION)
-            )
-        else:
-            raise StorageCompatibilityError(
-                f"No executable migration is registered for {step.source_version} -> "
-                f"{step.target_version}."
-            )
-        completed.append(step)
-    return tuple(completed)
+    if planned:
+        step = planned[0]
+        raise StorageCompatibilityError(
+            f"No executable migration is registered for {step.source_version} -> "
+            f"{step.target_version}."
+        )
+    return ()
 
 
 def _database_signature(

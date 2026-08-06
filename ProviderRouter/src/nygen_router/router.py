@@ -6,7 +6,7 @@ from collections import Counter
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
 from nygen_router.adapters.base import NormalizedStream, ProviderAdapter
 from nygen_router.adapters.openai_compatible import OpenAICompatibleAdapter
@@ -187,9 +187,10 @@ class ProviderRouter:
         self._health: dict[str, ProviderHealthState] = {}
         # metrics_store=None disables persistence entirely; not passing it at
         # all defaults to a DuckDBMetricsStore pointed at its own default path.
-        self._metrics_store: MetricsStore | None = (
+        selected_metrics_store: object | None = (
             DuckDBMetricsStore() if isinstance(metrics_store, _UnsetType) else metrics_store
         )
+        self._metrics_store = self._validate_metrics_store(selected_metrics_store)
         # A missing DuckDB dependency was already reported by the store at
         # construction, so the first failed write must not repeat the warning.
         self._metrics_warning_emitted = (
@@ -629,6 +630,28 @@ class ProviderRouter:
         if not value:
             raise ConfigError("metrics_scope must not be empty")
         return value
+
+    @staticmethod
+    def _validate_metrics_store(metrics_store: object | None) -> MetricsStore | None:
+        """Require the complete public structural storage contract at construction."""
+        if metrics_store is None:
+            return None
+        missing_or_noncallable: list[str] = []
+        for method_name in ("record_attempt", "query_recent", "query_score_aggregates"):
+            try:
+                method = getattr(metrics_store, method_name)
+            except Exception:
+                missing_or_noncallable.append(method_name)
+                continue
+            if not callable(method):
+                missing_or_noncallable.append(method_name)
+        if missing_or_noncallable:
+            methods = ", ".join(missing_or_noncallable)
+            raise ConfigError(
+                "metrics_store must implement callable record_attempt, query_recent, and "
+                f"query_score_aggregates methods; invalid method(s): {methods}."
+            )
+        return cast(MetricsStore, metrics_store)
 
     @staticmethod
     def _arguments_for(variant: CallVariant, provider: ProviderConfig) -> dict[str, object]:

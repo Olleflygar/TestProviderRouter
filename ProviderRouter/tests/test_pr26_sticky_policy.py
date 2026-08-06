@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
+from metrics_store_helpers import aggregate_events_for_score_query
 
 from nygen_router import (
     ApiProtocol,
@@ -14,6 +15,8 @@ from nygen_router import (
     ProviderConfig,
     ProviderRouter,
     RoutingContext,
+    ScoreAggregate,
+    ScoreAggregateQuery,
     ScoreBasedPolicy,
     StickyRoutingPolicy,
 )
@@ -209,6 +212,9 @@ class _MemoryStore:
 
     def query_recent(self, **kwargs: Any) -> list[MetricsEvent]:
         return list(self.events)
+
+    def query_score_aggregates(self, query: ScoreAggregateQuery) -> list[ScoreAggregate]:
+        return aggregate_events_for_score_query(self.events, query)
 
 
 def test_score_based_policy_ranks_only_the_non_sticky_tail() -> None:

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from metrics_store_helpers import aggregate_events_for_score_query
 
 from nygen_router import (
     ApiProtocol,
@@ -25,6 +26,8 @@ from nygen_router import (
     RouterExhaustedError,
     RoutingContext,
     SameProviderRetryPolicy,
+    ScoreAggregate,
+    ScoreAggregateQuery,
     ScoreBasedPolicy,
     StickyRoutingPolicy,
     UnsupportedOperationError,
@@ -165,6 +168,9 @@ class _MemoryStore:
 
     def query_recent(self, **kwargs: Any) -> list[MetricsEvent]:
         return list(self.events)
+
+    def query_score_aggregates(self, query: ScoreAggregateQuery) -> list[ScoreAggregate]:
+        return aggregate_events_for_score_query(self.events, query)
 
 
 class _FailingStore(_MemoryStore):

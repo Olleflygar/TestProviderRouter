@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from metrics_store_helpers import aggregate_events_for_score_query
 
 from nygen_router import (
     ApiProtocol,
@@ -10,6 +11,8 @@ from nygen_router import (
     MetricsEvent,
     ProviderConfig,
     RoutingContext,
+    ScoreAggregate,
+    ScoreAggregateQuery,
     ScoreBasedPolicy,
     ScoreWeights,
     aggregate_stats,
@@ -18,11 +21,12 @@ from nygen_router import (
 
 
 class _FakeStore:
-    """In-memory store that records bounds and honors query_recent filtering."""
+    """In-memory store that records and honors aggregate requests."""
 
     def __init__(self, events: list[MetricsEvent] | None = None) -> None:
         self.events = [] if events is None else list(events)
-        self.queries: list[datetime] = []
+        self.queries: list[ScoreAggregateQuery] = []
+        self.raw_query_calls = 0
 
     def record_attempt(self, event: MetricsEvent) -> None:
         self.events.append(event)
@@ -37,17 +41,12 @@ class _FakeStore:
         protocol: ApiProtocol | None = None,
         call_type: CallType | None = None,
     ) -> list[MetricsEvent]:
-        self.queries.append(since)
-        return [
-            event
-            for event in self.events
-            if event.timestamp >= since
-            and (metrics_scope is None or event.metrics_scope == metrics_scope)
-            and (provider_id is None or event.provider_id == provider_id)
-            and (model is None or event.model == model)
-            and (protocol is None or event.protocol == protocol)
-            and (call_type is None or event.call_type == call_type)
-        ]
+        self.raw_query_calls += 1
+        raise AssertionError("ScoreBasedPolicy must not query raw history")
+
+    def query_score_aggregates(self, query: ScoreAggregateQuery) -> list[ScoreAggregate]:
+        self.queries.append(query)
+        return aggregate_events_for_score_query(self.events, query)
 
 
 class _StaticPolicy:
@@ -137,8 +136,11 @@ def test_explicit_none_is_identical_to_not_passing_half_life() -> None:
     )
 
     assert omitted_result == explicit_result
-    assert omitted_store.queries == explicit_store.queries
-    assert omitted_store.queries == [fixed_now - timedelta(hours=336)]
+    assert [query.since for query in omitted_store.queries] == [
+        query.since for query in explicit_store.queries
+    ]
+    assert [query.since for query in omitted_store.queries] == [fixed_now - timedelta(hours=336)]
+    assert omitted_store.raw_query_calls == explicit_store.raw_query_calls == 0
 
 
 def test_five_half_life_old_event_has_a_small_but_nonzero_effect() -> None:
@@ -267,7 +269,8 @@ def test_decay_query_bound_is_exactly_six_half_lives_and_ignores_lookback() -> N
         RoutingContext(metrics_scope="test", call_type=CallType.REGULAR, metrics_store=store),
     )
 
-    assert store.queries == [fixed_now - timedelta(hours=6 * 72)]
+    assert [query.since for query in store.queries] == [fixed_now - timedelta(hours=6 * 72)]
+    assert store.raw_query_calls == 0
 
 
 def test_event_older_than_six_half_lives_is_not_considered() -> None:

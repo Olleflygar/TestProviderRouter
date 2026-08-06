@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
 from nygen_router.config import ProviderConfig
-from nygen_router.metrics import MetricsEvent
 from nygen_router.policies.base import Policy, RoutingContext
 from nygen_router.policies.round_robin import RoundRobinPolicy
 from nygen_router.scoring import ScoreWeights, calculate_provider_score
-from nygen_router.stats import aggregate_stats
+from nygen_router.storage.score_aggregation import (
+    ExponentialScoreWeighting,
+    FlatScoreWeighting,
+    ScoreAggregateProvider,
+    ScoreAggregateQuery,
+    provider_stats_from_score_aggregate,
+    validate_score_aggregates,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +32,7 @@ class HistoryScope(StrEnum):
 
 
 class ScoreBasedPolicy:
-    """Rank eligible providers from recent observations, with stable tie-breaking."""
+    """Rank providers through one bounded store aggregate, with stable tie-breaking."""
 
     def __init__(
         self,
@@ -39,8 +46,12 @@ class ScoreBasedPolicy:
     ) -> None:
         if lookback_hours <= 0:
             raise ValueError("lookback_hours must be positive")
+        if not math.isfinite(lookback_hours):
+            raise ValueError("lookback_hours must be finite")
         if half_life_hours is not None and half_life_hours <= 0:
             raise ValueError("half_life_hours must be positive")
+        if half_life_hours is not None and not math.isfinite(half_life_hours):
+            raise ValueError("half_life_hours must be finite")
         self._weights = ScoreWeights() if weights is None else weights
         self._lookback_hours = lookback_hours
         self._half_life_hours = half_life_hours
@@ -54,31 +65,60 @@ class ScoreBasedPolicy:
     def order(
         self, eligible: list[ProviderConfig], context: RoutingContext
     ) -> list[ProviderConfig]:
-        """Return providers best-first, degrading to the tie-break order on no history."""
+        """Return providers best-first; aggregate failure/invalidity preserves the baseline."""
         rotated = self._tie_break_policy.order(list(eligible), context)
         if context.metrics_store is None or not rotated:
             return rotated
 
-        weight_fn: Callable[[MetricsEvent], float] | None = None
+        reference_time = self._now()
         half_life_hours = self._half_life_hours
+        weighting: FlatScoreWeighting | ExponentialScoreWeighting
         if half_life_hours is None:
-            since = self._now() - timedelta(hours=self._lookback_hours)
+            since = reference_time - timedelta(hours=self._lookback_hours)
+            weighting = FlatScoreWeighting()
         else:
-            since = self._now() - timedelta(hours=_QUERY_HALF_LIVES * half_life_hours)
+            since = reference_time - timedelta(hours=_QUERY_HALF_LIVES * half_life_hours)
+            weighting = ExponentialScoreWeighting(half_life_hours=half_life_hours)
 
-            def decay_weight(event: MetricsEvent) -> float:
-                age_hours = (self._now() - event.timestamp).total_seconds() / 3600.0
-                return float(0.5 ** (age_hours / half_life_hours))
-
-            weight_fn = decay_weight
+        requested: list[ScoreAggregateProvider] = []
+        providers_by_id: dict[str, ProviderConfig] = {}
+        for provider in rotated:
+            if provider.provider_id in providers_by_id:
+                continue
+            providers_by_id[provider.provider_id] = provider
+            requested.append(
+                ScoreAggregateProvider(
+                    provider_id=provider.provider_id,
+                    model=provider.model,
+                    protocol=provider.protocol,
+                )
+            )
 
         try:
-            events = context.metrics_store.query_recent(
-                since=since,
+            query = ScoreAggregateQuery(
+                providers=tuple(requested),
                 metrics_scope=(
                     context.metrics_scope if self._history_scope is HistoryScope.CURRENT else None
                 ),
+                call_type=context.call_type,
+                since=since,
+                reference_time=reference_time,
+                weighting=weighting,
             )
+            aggregates = context.metrics_store.query_score_aggregates(query)
+            aggregates_by_id = validate_score_aggregates(query, aggregates)
+            scores = {
+                provider_id: calculate_provider_score(
+                    provider_stats_from_score_aggregate(
+                        aggregates_by_id[provider_id],
+                        provider,
+                        context.call_type,
+                    ),
+                    self._weights,
+                    call_type=context.call_type,
+                ).total
+                for provider_id, provider in providers_by_id.items()
+            }
         except Exception:
             logger.log(
                 logging.DEBUG if self._metrics_warning_emitted else logging.WARNING,
@@ -88,18 +128,4 @@ class ScoreBasedPolicy:
             self._metrics_warning_emitted = True
             return rotated
 
-        stats = aggregate_stats(
-            events,
-            rotated,
-            context.call_type,
-            weight_fn=weight_fn,
-        )
-        scores = {
-            provider.provider_id: calculate_provider_score(
-                stats[provider.provider_id],
-                self._weights,
-                call_type=context.call_type,
-            ).total
-            for provider in rotated
-        }
         return sorted(rotated, key=lambda provider: scores[provider.provider_id], reverse=True)

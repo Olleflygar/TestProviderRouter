@@ -156,20 +156,24 @@ def test_reopen_reuses_one_file_and_preserves_history(
     assert files_after_first_use == (path.name,)
 
 
-def test_exact_implicit_baseline_is_reused_without_runtime_stamping(
+def test_exact_implicit_baseline_is_rejected_by_runtime_without_modification(
     backend_case: tuple[LocalBackend, StoreFactory, Path],
 ) -> None:
     backend, factory, path = backend_case
     original = _event()
     _create_implicit_baseline(backend, path, original)
     assert inspect_database(backend, path).schema.state is SchemaState.IMPLICIT_BASELINE
+    before = path.read_bytes()
 
     store = factory(path)
     second = _event(event_id="event-2")
-    store.record_attempt(second)
-    assert store.query_recent(since=original.timestamp - timedelta(seconds=1)) == [original, second]
+    with pytest.raises(MetricsSchemaMismatchError, match="expected metrics=2"):
+        store.record_attempt(second)
+    with pytest.raises(MetricsSchemaMismatchError, match="expected metrics=2"):
+        store.query_recent(since=original.timestamp - timedelta(seconds=1))
     store.close()
 
+    assert path.read_bytes() == before
     assert inspect_database(backend, path).schema.state is SchemaState.IMPLICIT_BASELINE
     assert _table_names(backend, path) == ("provider_attempts",)
 
@@ -202,7 +206,7 @@ def test_newer_metadata_is_rejected_without_modification(
     _execute(
         backend,
         path,
-        f"UPDATE {SCHEMA_VERSIONS_TABLE} SET version = 2 WHERE component = 'metrics'",
+        f"UPDATE {SCHEMA_VERSIONS_TABLE} SET version = 3 WHERE component = 'metrics'",
     )
     before = path.read_bytes()
 
@@ -212,7 +216,7 @@ def test_newer_metadata_is_rejected_without_modification(
     assert path.read_bytes() == before
     inspection = inspect_database(backend, path)
     assert inspection.schema.state is SchemaState.NEWER
-    assert inspection.schema.metrics_version == 2
+    assert inspection.schema.metrics_version == 3
 
 
 def test_other_component_version_is_tolerated_and_preserved(
@@ -235,7 +239,7 @@ def test_other_component_version_is_tolerated_and_preserved(
     assert inspection.schema.state is SchemaState.CURRENT
     assert [(item.component, item.version) for item in inspection.schema.components] == [
         ("health", 7),
-        ("metrics", 1),
+        ("metrics", 2),
     ]
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from metrics_store_helpers import aggregate_events_for_score_query
 from pydantic import ValidationError
 
 from nygen_router import (
@@ -18,6 +19,8 @@ from nygen_router import (
     ProviderTimeoutError,
     RouterExhaustedError,
     RoutingContext,
+    ScoreAggregate,
+    ScoreAggregateQuery,
     ScoreBasedPolicy,
     ScoreWeights,
     aggregate_stats,
@@ -27,7 +30,8 @@ from nygen_router import (
 class _Store:
     def __init__(self, events: list[MetricsEvent] | None = None) -> None:
         self.events = [] if events is None else list(events)
-        self.queries: list[dict[str, object]] = []
+        self.queries: list[ScoreAggregateQuery] = []
+        self.raw_query_calls = 0
 
     def record_attempt(self, event: MetricsEvent) -> None:
         self.events.append(event)
@@ -42,26 +46,12 @@ class _Store:
         protocol: ApiProtocol | None = None,
         call_type: CallType | None = None,
     ) -> list[MetricsEvent]:
-        self.queries.append(
-            {
-                "since": since,
-                "metrics_scope": metrics_scope,
-                "provider_id": provider_id,
-                "model": model,
-                "protocol": protocol,
-                "call_type": call_type,
-            }
-        )
-        return [
-            event
-            for event in self.events
-            if event.timestamp >= since
-            and (metrics_scope is None or event.metrics_scope == metrics_scope)
-            and (provider_id is None or event.provider_id == provider_id)
-            and (model is None or event.model == model)
-            and (protocol is None or event.protocol == protocol)
-            and (call_type is None or event.call_type == call_type)
-        ]
+        self.raw_query_calls += 1
+        raise AssertionError("ScoreBasedPolicy must not query raw history")
+
+    def query_score_aggregates(self, query: ScoreAggregateQuery) -> list[ScoreAggregate]:
+        self.queries.append(query)
+        return aggregate_events_for_score_query(self.events, query)
 
 
 class _Adapter:
@@ -327,7 +317,8 @@ def test_history_scope_current_and_all_make_one_query_and_can_rank_differently()
 
     assert [provider.provider_id for provider in current] == ["second", "first"]
     assert [provider.provider_id for provider in all_scopes] == ["first", "second"]
-    assert [query["metrics_scope"] for query in store.queries] == ["current", None]
+    assert [query.metrics_scope for query in store.queries] == ["current", None]
+    assert store.raw_query_calls == 0
 
 
 def test_streaming_failure_before_open_has_streaming_classification_and_duration() -> None:
