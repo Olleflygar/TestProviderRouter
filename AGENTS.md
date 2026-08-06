@@ -37,3 +37,17 @@ record every physical attempt in health, metrics, and exhaustion diagnostics.
 Do not describe transient error categories as replay-safe: native arguments are
 opaque, and retries can duplicate work, side effects, background/stored
 operations, or charges.
+
+## Storage schema administration
+
+PR13's local schema foundation is shipped. `MetricsStore` remains a runtime-only
+two-method protocol; schema inspection, creation, and migration live on the
+separate typed `nygen_router.storage.admin` surface and the
+`nygen-router storage ...` CLI. Normal DuckDB/SQLite use may create version 1
+only when the configured file path is absent. An existing file is inspected
+read-only and is never silently initialized, stamped, migrated, replaced,
+renamed, deleted, redirected, copied, or switched. The exact unversioned PR29
+schema remains a readable implicit version-1 baseline until an administrator
+explicitly stamps it offline. Keep future component revisions independent in
+`nygen_router_schema_versions`, and keep migration steps explicit,
+transactional, offline, consecutive, and version-last.

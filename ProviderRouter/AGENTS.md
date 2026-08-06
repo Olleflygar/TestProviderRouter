@@ -132,11 +132,11 @@ score-based routing has real history to work from:
 
 - `MetricsStore` (`storage/base.py`) is a `typing.Protocol` with exactly two
   methods -- `record_attempt` and `query_recent`. Do not add aggregation,
-  delete, or migration methods to it in unrelated work; identity filters are
+  delete, inspection, version, or migration methods to it; identity filters are
   scope, provider ID, model, protocol, and call type. Aggregation happens
-  in Python over `query_recent`'s output, never in per-backend SQL. The planned
-  storage-foundation work in PR13 may deliberately evolve the storage
-  interfaces and migration design.
+  in Python over `query_recent`'s output until PR30 deliberately introduces a
+  separate aggregate capability. PR13's shipped administration API remains
+  separate from router/policy construction and custom runtime stores.
 - `DuckDBMetricsStore` (`storage/duckdb.py`) is the default, pointed at
   `~/.nygen_router/metrics.duckdb`. It lazy-imports `duckdb` inside its
   methods only -- never at module level -- so the core import stays clean
@@ -157,17 +157,20 @@ score-based routing has real history to work from:
 - Every event carries the router's required nonblank `metrics_scope`, required
   `provider_id`, model, protocol, and declared call type. `provider_name` is
   display metadata and never an identity/filter key.
-- Do not add cross-process coordination for DuckDB, async/batched writes,
-  schema versioning, or queries beyond `query_recent` as unrelated work.
-  Schema migrations, remote connection handling, and reporting queries belong
-  to the explicitly scoped PR13 storage-foundation work in the current
-  roadmap.
-- PR29 deliberately removed automatic additive migration. A missing table is
-  created with the exact current schema. An existing incompatible table is
-  inspected read-only and left completely untouched; direct store users get an
-  actionable mismatch error and router calls degrade safely. Runtime code must
-  never alter, backfill, rename, delete, or replace a legacy database. PR13
-  owns future explicit schema-versioning and migration design.
+- Do not add cross-process coordination for DuckDB, async/batched writes, or
+  queries beyond `query_recent` as unrelated work. PR13 shipped local component
+  schema versioning and explicit administration only. PR30 owns storage-side
+  score aggregates, PR28 reporting queries, PR31 concurrency/lifecycle, and
+  PR14 PostgreSQL/Supabase.
+- PR29 deliberately removed automatic additive migration, and shipped PR13
+  preserves that boundary. Only an absent configured file may be initialized
+  on first use, with the exact metrics schema and component metadata at
+  `metrics = 1`. An exact unversioned PR29 table remains readable without
+  runtime stamping. Every other existing target is inspected read-only and
+  left untouched; direct store users get an actionable mismatch error and
+  router calls degrade safely. Only the explicit offline administration API or
+  CLI may stamp/migrate a supported target through a complete transactional
+  route. It never overwrites an existing create/backup target.
 - PR11 is descoped and the formerly reserved `request_size_bucket` column has
   been removed from the schema: do not inspect opaque call arguments to
   estimate request size or add bucket-aware aggregation/scoring. Use

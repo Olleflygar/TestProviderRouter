@@ -2,10 +2,10 @@
 
 ## Status and purpose
 
-This document records the current design direction for PR13 (storage
-versioning/shared-backend foundations), PR25 (durable local health), and PR14
-(shared PostgreSQL organizational state). It is context for future planning and
-implementation prompts, not a substitute for inspecting the source and tests.
+This document records the shipped PR13 local storage foundation and the current
+design direction for PR25 (durable local health) and PR14 (shared PostgreSQL
+organizational state). It is context for future planning and implementation
+prompts, not a substitute for inspecting the source and tests.
 
 Use sources in this order when they disagree:
 
@@ -194,6 +194,41 @@ affinity, or durable health state in the metrics table. Health remains separate
 in-memory state until PR25 deliberately introduces its own storage-neutral
 interface.
 
+### Shipped local schema administration (PR13)
+
+DuckDB and SQLite now share one named event conversion and one authoritative
+logical schema definition. A fresh absent path receives `provider_attempts` and
+the component-specific metadata table:
+
+```text
+nygen_router_schema_versions
+component TEXT PRIMARY KEY
+version   INTEGER NOT NULL
+```
+
+The first row is `metrics = 1`; future health storage uses an independent
+component revision. Normal runtime creates this schema only when its configured
+file path is absent. A current database is validated and reused without DDL.
+The exact unversioned PR29 table is an implicit version-1 baseline that remains
+usable without runtime stamping. Every other existing target is diagnosed
+read-only and left untouched.
+
+Administration is deliberately separate from `MetricsStore`:
+
+```text
+inspect_database(LocalBackend, path)  # strictly read-only
+create_database(LocalBackend, path)   # absent targets only
+migrate_database(LocalBackend, path)  # explicit offline known routes only
+```
+
+The same implementation is available through `nygen-router storage
+inspect|create|migrate`. Creation never overwrites. Migration takes an
+exclusive offline transaction, validates the full route before writing,
+updates versions in the same transaction after each real step, and can create
+one explicitly named, engine-safe, validated pre-migration backup. The only
+PR13 migration is stamping the exact implicit baseline; unknown historical
+layouts are not guessed or transformed.
+
 ### Current routing use of history
 
 `ScoreBasedPolicy` calls `query_recent` during provider ordering, aggregates
@@ -344,7 +379,7 @@ contract, and conformance tests.
   limitation.
 - SQLite retains its standard-library-only guarantee and current cross-process
   local role.
-- A missing local table may be created on first use.
+- An absent configured local database path may be created on first use.
 - An incompatible local file is never silently deleted, rewritten, or altered.
 
 ### Optional `PostgresMetricsStore`
@@ -497,17 +532,20 @@ Cross-backend data migration:
     DuckDB history -> PostgreSQL history
 ```
 
-PR13 needs the first. Automatic cross-backend copying is a non-goal.
+Shipped PR13 establishes the first for local backends. Automatic cross-backend
+copying remains a non-goal.
 
 ### Local schema expectations
 
 For embedded stores:
 
-- Create a missing current schema on first use.
+- Create a current versioned schema only when the configured file path is absent.
 - Inspect an existing schema before writing.
 - Never silently check-and-alter, delete, replace, or backfill an incompatible
   user database.
-- Any future local migration must be an explicit versioned operation.
+- Preserve the exact unversioned PR29 baseline without runtime stamping.
+- Run every future local migration as an explicit offline, consecutive,
+  transactional administration operation.
 
 ### Managed PostgreSQL expectations
 
@@ -768,14 +806,14 @@ universal ORM.
 
 ## Suggested PR boundaries
 
-### PR13: storage versioning/shared-backend foundation
+### PR13: storage versioning/shared-backend foundation — shipped
 
-- Pin the logical storage contract and dependency/import boundaries.
-- Introduce explicit schema-version and migration conventions.
-- Define local versus managed schema ownership.
-- Refactor shared named event conversion if useful.
-- Add remote connection/error/timeout expectations.
-- Do not need to ship PostgreSQL merely to create a general ORM framework.
+- Pinned the two-method runtime storage contract and dependency/import boundaries.
+- Added independent component versions beginning with `metrics = 1`.
+- Added exact local runtime validation and shared named event conversion.
+- Added typed read-only/create/offline-migrate administration and the standard CLI.
+- Documented managed-backend connection/error/timeout expectations for PR14.
+- Shipped no PostgreSQL, ORM/toolkit, reporting query, or aggregate query.
 
 ### PR25: durable local health
 
@@ -802,18 +840,17 @@ resolve these details from current source, tests, and measured behavior:
    justify it concretely.
 2. Exact dependency version ranges and supported PostgreSQL versions.
 3. The public constructor's timeout, pooling, TLS, and advanced-engine seams.
-4. The schema-version mechanism and migration command/deployment interface.
-5. Exact PostgreSQL physical types and whether timestamp representation changes
+4. Exact PostgreSQL physical types and whether timestamp representation changes
    from the local ISO-text representation.
-6. How schema validation is triggered without adding an unbounded network call
+5. How schema validation is triggered without adding an unbounded network call
    to every router invocation.
-7. Whether Supabase is the live scoring source or only a reporting destination.
-8. Acceptable remote read/write latency and timeout budgets.
-9. Data-retention expectations for an append-only global event table.
-10. The event-volume threshold that would require server-side aggregation,
+6. Whether Supabase is the live scoring source or only a reporting destination.
+7. Acceptable remote read/write latency and timeout budgets.
+8. Data-retention expectations for an append-only global event table.
+9. The event-volume threshold that would require server-side aggregation,
     rollups, or caching.
-11. Whether PostgreSQL metrics and health migrations share one revision stream
-    after PR25/PR14 or remain explicitly separated.
+10. How PostgreSQL maps PR13's independent metrics/health components onto its
+    deployment migration tooling without coupling their revision streams.
 
 ## External references
 
@@ -822,4 +859,3 @@ resolve these details from current source, tests, and measured behavior:
 - [Alembic migration documentation](https://alembic.sqlalchemy.org/en/latest/)
 - [Supabase PostgreSQL connection modes](https://supabase.com/docs/guides/database/connecting-to-postgres)
 - [`duckdb-engine` SQLAlchemy dialect notes](https://pypi.org/project/duckdb-engine/)
-

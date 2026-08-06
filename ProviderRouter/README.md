@@ -817,19 +817,108 @@ streaming attempts; it remains `NULL` when no first chunk arrived. Failed
 attempts never enter latency averages. `total_duration_ms` spans streaming
 completion or failure, including a failure before opening.
 
-PR29 intentionally has no legacy-schema migration. A newly absent table is
-created with the complete schema. If `provider_attempts` already exists with
-any incompatible shape, it is inspected read-only and left untouched—no
-`ALTER`, backfill, rename, delete, or replacement. Direct store calls raise an
-actionable schema-mismatch error; router calls degrade safely and keep serving
-provider responses. The database owner must move or replace obsolete local
-history manually. Runtime code never deletes a user database.
+PR13 adds component-specific schema versions without weakening PR29's
+no-runtime-migration rule. A fresh absent DuckDB or SQLite path is created
+transactionally with the complete `provider_attempts` table and
+`nygen_router_schema_versions` containing `metrics = 1`. Later components such
+as durable health get their own row and revision stream. Reopening a current
+database validates column names/order, logical types, nullability, defaults,
+primary-key identity, metadata shape, and the metrics version without DDL.
+
+The exact unversioned PR29 `provider_attempts` schema remains an implicit
+version-1 baseline. Normal `record_attempt()` and `query_recent()` reuse it
+without stamping or otherwise changing its schema. Every other existing path—
+including an empty database, a missing/partial/extra/reordered table, malformed
+metadata, a missing metrics row, or a newer metrics revision—is inspected
+read-only and left untouched. Direct store calls raise an actionable
+schema-mismatch error; router writes and score-history reads retain their
+best-effort degradation. Runtime code never initializes, alters, backfills,
+renames, deletes, replaces, redirects, copies, or switches an existing target.
 
 PR11's request-size buckets are descoped because estimating size would require
 the router to interpret opaque native arguments; the formerly reserved
 `request_size_bucket` column has been removed from the schema. Use separate
 `metrics_scope` values when materially different workloads need separate
 routing history.
+
+### Inspecting, creating, and migrating local databases
+
+Schema administration is separate from `MetricsStore`, `ProviderRouter`, and
+routing policies. The frozen typed Python API accepts only the explicit
+`LocalBackend.DUCKDB` or `LocalBackend.SQLITE` selector:
+
+```python
+from nygen_router import (
+    LocalBackend,
+    create_database,
+    inspect_database,
+    migrate_database,
+)
+
+state = inspect_database(LocalBackend.SQLITE, "metrics.sqlite")
+created = create_database(LocalBackend.DUCKDB)  # stable default path
+migrated = migrate_database(
+    LocalBackend.SQLITE,
+    "metrics.sqlite",
+    backup_path="metrics.before-migration.sqlite",
+)
+```
+
+`inspect_database` opens an existing engine read-only and creates neither a
+missing file nor its parent directory. Its typed result reports the resolved
+path, default-path status, metadata state, every valid component revision,
+compatibility, detected schema state, and next safe action.
+
+`create_database` means “create a completely new current database.” It
+atomically refuses every existing filesystem target, including empty,
+incompatible, arbitrary, or current files. There is no `force`, overwrite,
+delete, replace, archive, or alternate-name behavior. If a target is occupied,
+inspect it; migrate it only when supported; manually move/archive it while the
+application is stopped; or choose a different path and configure that concrete
+store.
+
+`migrate_database` is an administrator-triggered offline operation. Stop the
+application, every router, and every other database writer first. It acquires
+the backend's exclusive transaction/lock, builds the complete consecutive
+route before writing, applies each step transactionally, updates its component
+version in the same transaction after the corresponding step, rolls back on
+failure, and is idempotent once current. PR13's only migration stamps the exact
+implicit version-1 baseline; no arbitrary or experimental schema is guessed.
+An optional explicitly named backup uses the engine's safe database-copy
+operation, must target an absent path, is validated against the pre-migration
+source before any source change, and remains available if later migration
+fails. Backups are never automatic.
+
+The same implementation is exposed by the standard-library CLI:
+
+```sh
+nygen-router storage inspect --backend duckdb --default
+nygen-router storage inspect --backend sqlite --path ./metrics.sqlite
+nygen-router storage create --backend duckdb --path ./metrics.duckdb
+nygen-router storage migrate --backend sqlite --path ./metrics.sqlite \
+  --backup ./metrics.before-migration.sqlite
+```
+
+DuckDB commands require the existing `duckdb` extra and fail with a concise
+installation instruction when it is absent. CLI help and every SQLite command
+remain available without DuckDB. Successful information goes to stdout; safe,
+actionable failures go to stderr with stable nonzero exit statuses and no
+traceback for ordinary administration errors.
+
+Only DuckDB's standard `~/.nygen_router/metrics.duckdb` path is selected by an
+otherwise unconfigured router. Creating any non-default file does not edit
+source, environment variables, configuration, or a running router and does not
+make that router discover it. Pass the concrete path explicitly:
+
+```python
+from nygen_router import DuckDBMetricsStore, ProviderRouter, SQLiteMetricsStore
+
+metrics_store = DuckDBMetricsStore("/chosen/path/metrics.duckdb")
+# or
+metrics_store = SQLiteMetricsStore("/chosen/path/metrics.sqlite")
+
+router = ProviderRouter(..., metrics_store=metrics_store)
+```
 
 `metrics_store` is a `ProviderRouter` constructor parameter with three forms:
 
@@ -863,7 +952,12 @@ per file. If several local processes need to share one store, use
 extra install) and handles cross-process file locking natively. For shared,
 multi-machine routing history, a Postgres/Supabase-backed store remains planned
 in [`../Projectplan/NewProjectPlan.md`](../Projectplan/NewProjectPlan.md)
-(PR13, PR25, and PR14).
+(PR25 and PR14). It will use the standard PostgreSQL protocol, optional lazy
+dependencies, explicit deployment migrations, least-privilege runtime
+connections, credential-safe errors, bounded connect/statement/pool timeouts,
+explicit TLS and pooling mode, clear connection ownership, and idempotent
+cleanup. It will not silently switch, mirror, replicate, or dual-write local
+history.
 
 Storage writes are best-effort and never replace or modify a provider response.
 The router logs one short warning when a configured store first fails, continues
@@ -896,6 +990,11 @@ pass an instance as `metrics_store=...` -- no router code changes needed. To
 check your implementation against the same conformance suite the bundled
 backends run, point `tests/test_metrics_store.py`'s parametrized `store`
 fixture at a factory for your backend.
+
+PR13 added no aggregation or reporting method to this protocol. Storage-side
+score aggregation belongs wholly to PR30; dashboard/reporting queries belong
+to PR28. PostgreSQL/Supabase remains PR14. No retention, health persistence,
+cross-backend copy, or `request_size_bucket` behavior was added.
 
 ## Metrics aggregation
 

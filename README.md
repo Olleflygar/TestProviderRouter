@@ -132,6 +132,50 @@ partitions the shared history file by application/environment. Changing only a
 display name preserves history, while changing model, protocol, call type, or
 provider ID selects a different scoring partition.
 
+## Local metrics database administration
+
+Fresh DuckDB and SQLite databases use a component-versioned schema beginning
+with `metrics = 1`. Normal router use creates that schema only when the selected
+file path is absent. An existing database is validated read-only: the exact
+unversioned PR29 schema remains usable without being stamped, while every
+incompatible, malformed, or newer target is left untouched and metrics degrade
+safely at the router boundary.
+
+Use the separate administrator CLI to inspect, create, or explicitly migrate a
+local target:
+
+```sh
+nygen-router storage inspect --backend duckdb --default
+nygen-router storage create --backend sqlite --path ./router_metrics.sqlite
+nygen-router storage migrate --backend sqlite --path ./router_metrics.sqlite \
+  --backup ./router_metrics.before-pr13.sqlite
+```
+
+`inspect` never creates or changes a file. `create` accepts only an absent
+target and has no force/delete/replace mode. `migrate` is offline: stop the
+application, routers, and every other writer first. It accepts only complete
+known migration routes, runs them transactionally, and stamps the exact
+implicit version-1 baseline without inventing a historical transform. A backup
+is optional, explicitly named, engine-safe, validated before migration, and
+never overwrites an existing destination.
+
+The default router automatically reuses only
+`~/.nygen_router/metrics.duckdb`. A database created at any other path is not
+discovered automatically; configure it explicitly:
+
+```python
+from nygen_router import DuckDBMetricsStore, ProviderRouter, SQLiteMetricsStore
+
+metrics_store = DuckDBMetricsStore("/chosen/path/metrics.duckdb")
+# Or: metrics_store = SQLiteMetricsStore("/chosen/path/metrics.sqlite")
+router = ProviderRouter(..., metrics_store=metrics_store)
+```
+
+PostgreSQL/Supabase remains a future PR14 backend using the standard PostgreSQL
+protocol. PR30 owns storage-side scoring aggregates; PR28 owns reporting
+queries. PR13 added none of those features and did not restore the removed
+`request_size_bucket` metric.
+
 ## OpenAI Responses API
 
 `OPENAI_RESPONSES` is also built in. Use the native Responses `input` field and

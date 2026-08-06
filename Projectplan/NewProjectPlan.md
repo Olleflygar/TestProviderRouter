@@ -14,11 +14,12 @@ optional layers and must not become core import dependencies.
 ## Current implementation status
 
 Git tags, repository history, and source confirm that PR1–5, PR7–10, PR12,
-PR23, PR26, PR27, and the PR3R `CallVariant` redesign have shipped. PR29 was added
+PR13, PR23, PR26, PR27, and the PR3R `CallVariant` redesign have shipped. PR29 was added
 later as an unplanned corrective prerequisite for the remaining
-metrics/storage roadmap. The old project plan contains 11 remaining roadmap
-PRs: PR6 and PR13–22. PR11 and PR24 have been descoped and are recorded under
-Scrapped PRs.
+metrics/storage roadmap. PR13 has now shipped; the old project plan's remaining
+roadmap IDs are PR6 and PR14–22. PR11 and PR24 have been descoped and are
+recorded under Scrapped PRs, while PR30 is the next corrective storage-track
+step from the codebase audit.
 
 The roadmap below preserves those PR identifiers, revises overlapping scopes
 where necessary, and adds four candidate PRs. It is ordered by recommended
@@ -126,10 +127,42 @@ health, metrics, and exhaustion accounting.
 Made `provider_id` and `metrics_scope` explicit, partitioned history by stable
 call identity, and replaced implicit schema mutation with exact-schema checks.
 
+### [shipped] PR13 — Versioned local schema and administration foundation
+
+Added component-specific schema metadata, exact runtime validation, shared
+named event conversion, typed read-only/create/migrate administration, and the
+`nygen-router storage` CLI for DuckDB and SQLite. Normal runtime initializes
+only an absent configured path; explicit offline migration stamps the exact
+implicit PR29 baseline and never guesses at unknown layouts.
+
 ## Recently shipped
 
 This section gives additional implementation detail for the newest shipped
 work. Older shipped PR details remain in `OldProjectPlan.md`.
+
+### PR13 — Versioned local schema and administration foundation
+
+**Shipped:** Fresh DuckDB and SQLite files now transactionally receive the exact
+`provider_attempts` schema plus `nygen_router_schema_versions` with the
+independent `metrics = 1` component. Reopening a current database performs
+read-only exact validation before normal I/O. The exact unversioned PR29 schema
+remains an implicit version-1 baseline that runtime can read and write without
+stamping; every incompatible, malformed, missing-table, or newer existing
+target is left untouched with an actionable error.
+
+The frozen typed administration records and `inspect_database`,
+`create_database`, and `migrate_database` functions are separate from the
+two-method `MetricsStore` protocol. The standard-library CLI exposes the same
+implementation as `nygen-router storage inspect|create|migrate`. Inspection is
+read-only, create atomically refuses every existing target, and migration is
+offline, exclusive, route-validated, transactional, idempotent, and optionally
+protected by an explicit engine-safe validated backup. The only PR13 migration
+step is honest stamping of the exact implicit baseline; no historical schema
+was invented.
+
+PR13 added no remote backend, ORM/toolkit, reporting query, aggregate query,
+retention, health persistence, or request-size metric. PostgreSQL/Supabase
+remains PR14, score aggregation PR30, reporting PR28, and concurrency PR31.
 
 ### PR26 — Configurable fixed provider preference
 
@@ -263,52 +296,24 @@ These are the remaining active proposals, ordered by recommended implementation
 sequence rather than by PR number. Their scopes are directional until each PR
 receives its own implementation prompt.
 
-### 1. PR13 — Storage versioning and shared-backend foundation
+### 1. PR30 — Storage-side score aggregation
 
-**Summary:** Prepare the storage layer for evolving schemas and managed
-databases.
+**Summary:** Bound score-history reads by eligible-provider cardinality before
+shared PostgreSQL history becomes a production hot path.
 
-Add explicit schema migrations, remote connection handling, and reporting
-queries while preserving storage-neutral public protocols. Database engines,
-sessions, and raw SQL rows remain private implementation details.
-Start from PR29's exact-schema/no-modification behavior; any future migration
-must be explicitly versioned rather than reviving implicit check-and-ALTER.
+Add a deliberately separate aggregate-query capability without expanding the
+two-method compatibility requirement for custom `MetricsStore`
+implementations. Bundled stores should return only the weighted counts,
+successful-latency totals/weights, and exact diagnostic tallies needed to build
+one `ProviderStats` per eligible provider. Preserve flat and exponential
+recency weighting, identity partitions, and semantic equivalence with the
+current Python aggregation fallback.
 
-The storage foundation must preserve the router's lightweight and transparent
-runtime contract:
-
-- `MetricsStore` remains the boundary used by the router and routing policies;
-  database drivers, SQL toolkits/ORMs, connections, sessions, and row models do
-  not enter core APIs or the `MetricsEvent` domain model.
-- DuckDB remains the zero-configuration local default and the native SQLite
-  store remains the standard-library alternative. A database toolkit/ORM and
-  every remote database driver must be optional, backend-specific dependencies
-  that are imported only when that backend is selected.
-- One router uses the one store supplied at construction. The storage layer
-  does not silently switch backends, mirror or dual-write events, or copy
-  history between local and remote databases. Cross-backend data import/export
-  is a separate, explicitly requested feature.
-- A new local database may still create its current schema on first use. A
-  managed/remote database is provisioned and upgraded through explicit,
-  versioned deployment migrations; ordinary router startup must not acquire
-  schema-owner privileges or silently alter a production database.
-- A selected backend verifies schema compatibility and reports actionable
-  errors without deleting or rewriting user data. Router-owned storage reads
-  and writes remain best-effort: failures and bounded timeouts degrade to the
-  documented non-metrics routing behavior and never replace a provider result.
-- Remote stores define connection ownership, pooling, SSL, connect/statement
-  timeouts, and idempotent cleanup explicitly. Credentials and bound values
-  must not appear in logs or error messages.
-- Every bundled backend runs the shared `MetricsStore` conformance suite,
-  including field-for-field event round trips, query filters, UTC timestamps,
-  ordering, schema compatibility, cleanup, and safe failure behavior. A remote
-  backend additionally receives real-engine integration coverage in CI.
-
-Migration tooling may be an optional deployment/admin extra, but schema
-compatibility is not optional for a backend that is selected. SQLAlchemy Core,
-a full ORM, or another toolkit is an internal implementation choice rather
-than a public architectural requirement; choose the smallest abstraction that
-meets the concrete multi-database need and keep it out of lightweight installs.
+Acceptance requires cross-backend equivalence tests, bounded
+`O(eligible providers)` result cardinality, measured indexes/query plans, and a
+large-history benchmark. PR30 adds no dashboard/reporting API, rollup cache,
+retention behavior, or remote backend. It builds on PR13's versioned schema and
+must land before PR14 is treated as production-ready for live score routing.
 
 ### 2. PR22 — Pre-flight `CallVariant` validation
 
@@ -461,11 +466,14 @@ must import the router rather than the router importing LangChain.
 These decisions explain dependencies, sequencing, and scope boundaries that are
 not obvious from the numbered roadmap alone.
 
-- PR29 is the shipped prerequisite for all remaining metrics/shared-storage
-  work; later PRs preserve its scope and provider-partition identity.
-- PR22 and PR21 follow PR13 in the implementation sequence.
-- PR13, PR25, and PR14 form a staged persistence path: storage foundation,
-  durable local health, then true shared organizational state.
+- PR29 and PR13 are shipped prerequisites for the remaining metrics/shared-
+  storage work; later PRs preserve their partition identity, version metadata,
+  explicit administration, and no-runtime-migration boundaries.
+- PR30 is the next storage-track step and precedes production PostgreSQL score
+  reads. PR31 separately owns concurrency and connection lifecycle.
+- PR22 and PR21 follow the shipped PR13 foundation in the broader sequence.
+- PR13, PR25, and PR14 form a staged persistence path: shipped storage
+  foundation, durable local health, then true shared organizational state.
 - PR15 is narrowed to profiles supported by the existing scoring model.
 - Shipped fixed-preference routing and same-provider retries remain
   separate because they solve different problems and have different failure

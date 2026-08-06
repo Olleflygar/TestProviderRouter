@@ -1567,6 +1567,14 @@ remote/managed SQL-compatible backends -- Supabase, Postgres, and others --
 plus schema versioning as the provider_attempts shape evolves (e.g. PR6's
 estimated_cost_usd column).
 
+Historical clarification (PR13 shipped, 2026-08-06): the approved execution
+scope preserved the two-method `MetricsStore` protocol and shipped only the
+local versioned-schema/administration foundation for DuckDB and SQLite. The
+older remote-backend wording below remains rationale, not shipped behavior.
+PostgreSQL/Supabase stays in PR14, storage-side score aggregation in PR30, and
+dashboard/reporting queries in PR28. PR13 introduced no ORM, driver, remote
+connection, or speculative historical migration.
+
 Revision note (design discussion, 2026-07-15): two decisions pinned for
 this PR. First, the SQL implementation layer must stay agnostic:
 MetricsStore (PR 4) remains the only abstraction the router and routing
