@@ -15,7 +15,8 @@ optional layers and must not become core import dependencies.
 
 Repository history and existing tags establish the earlier release sequence;
 current source and tests additionally confirm that PR1–5, PR7–10, PR12, PR13,
-PR23, PR26, PR27, PR29, PR30, and the PR3R `CallVariant` redesign have shipped.
+PR23, PR26, PR27, PR29, PR30, PR31, and the PR3R `CallVariant` redesign have
+shipped.
 PR29 and PR30 were added later as corrective prerequisites for the remaining
 metrics/storage roadmap. The old project plan's remaining active roadmap IDs
 are PR6 and PR14–20. PR11, PR21, PR22, and PR24 have been descoped and are
@@ -146,10 +147,64 @@ shared Python `ProviderStats` and final-score calculation, and shipped fresh
 metrics schema version 2 with measured backend-specific index choices. Raw
 `query_recent` remains public but is no longer a score-policy path.
 
+### [shipped] PR31 — Baseline thread safety and connection lifecycle
+
+Made one router and both bundled stores safe to share across threads in one
+process, gave `ProviderRouter` an idempotent, terminal `close()` with
+context-manager support that closes only the store the router created, and
+published the concurrency support matrix in `ProviderRouter/README.md`.
+
 ## Recently shipped
 
 This section gives additional implementation detail for the newest shipped
 work. Older shipped PR details remain in `OldProjectPlan.md`.
+
+### PR31 — Baseline thread safety and connection lifecycle
+
+**Shipped:** One `ProviderRouter` may now be shared by multiple threads in one
+process. A single router lock guards all mutable router state — the health
+dict, the default adapter cache, the metrics warning/drop counters, the closed
+flag — and is held around `policy.order()`, so built-in and custom policies
+are serialized per router without locks of their own (an `order()`
+implementation must not call back into the router). No lock is ever held
+across an adapter invocation or stream iteration: provider network calls run
+fully concurrently, and only the short bookkeeping sections at the edges of a
+call serialize.
+
+`DuckDBMetricsStore` and `SQLiteMetricsStore` each serialize every database
+operation — lazy connection creation with schema validation, reads, writes,
+close — behind one per-instance lock. SQLite connections now pass
+`check_same_thread=False`, safe precisely because of that lock; before PR31 a
+second thread raised `sqlite3.ProgrammingError` outright. Lock order is
+router-before-store everywhere, so deadlock is impossible. Store `close()`
+keeps its lazy-reconnect behavior unchanged.
+
+`ProviderRouter.close()` (and `with ProviderRouter(...) as router:`) is
+idempotent and terminal: a later `invoke()` raises the new exported
+`RouterClosedError`, while `health_report()` and `reset_health()` keep working
+on in-memory state. Close follows close-what-you-create: only the
+router-created unset-default DuckDB store is closed; a caller-provided
+`metrics_store` is never touched. Close never interrupts in-flight calls or
+streams; bookkeeping that reaches the metrics path after close is dropped
+through the existing dropped-events counter at DEBUG rather than written, so a
+stream draining past close cannot silently reopen — and re-lock — the database
+file close just released. A late stream loses exactly its one metrics row,
+never its content, and its in-memory health update still lands. Streams are
+declared single-consumer.
+
+The support matrix in `ProviderRouter/README.md` ("Concurrency and
+lifecycle") is the user-facing contract: threads in one process, concurrent
+network calls, thread-safe stores, SQLite for multi-process sharing, and
+terminal close are supported; multi-process DuckDB writing, cross-process
+health, multi-thread stream consumption, use after close, and
+buffered/batched/async writes are not. Focused red-then-green and
+exact-counting concurrency tests live in `tests/test_pr31_thread_safety.py`
+and `tests/test_pr31_lifecycle.py`.
+
+PR31 did not add buffered/batched or background writes (PR32), native async
+(PR33), cross-process coordination or shared/durable health (PR25/PR14),
+per-thread connections, terminal store close, or a close that waits for
+outstanding streams. Writes remain eager and synchronous.
 
 ### PR30 — Storage-side score aggregation
 
@@ -541,8 +596,8 @@ not obvious from the numbered roadmap alone.
   metrics/shared-storage work. Later PRs preserve exact partition identity,
   mandatory bounded aggregate reads, independent version metadata, explicit
   administration, and no-runtime-migration boundaries.
-- PR30 precedes production PostgreSQL score reads. PR31 separately owns
-  concurrency and connection lifecycle.
+- PR30 precedes production PostgreSQL score reads. PR31 shipped the baseline
+  concurrency and connection-lifecycle contract; PR32/PR33 build on it.
 - PR21 and PR22 are scrapped. Native arguments stay opaque, and operation or
   argument errors remain adapter-time fail-fast errors.
 - PR13, PR25, and PR14 form a staged persistence path: shipped storage

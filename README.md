@@ -231,9 +231,14 @@ recreated empty at metrics v2 and smoke-validated. The archived
 `WorkflowTests/workflow_history.pre-pr29.duckdb` was untouched. This was a
 one-time authorized setup action, not runtime behavior.
 
-PostgreSQL/Supabase remains PR14. Rollups/caching, reporting, concurrency and
-connection lifecycle, buffered writes, and native async execution remain
-deferred to PR28/PR31/PR32/PR33 or later focused work.
+PostgreSQL/Supabase remains PR14. Rollups/caching, reporting, buffered writes,
+and native async execution remain deferred to PR28/PR32/PR33 or later focused
+work. PR31 shipped baseline in-process thread safety and router lifecycle: one
+router and both bundled stores are safe to share across threads in one
+process, `ProviderRouter.close()` is idempotent and terminal, and the full
+support matrix lives in `ProviderRouter/README.md` under "Concurrency and
+lifecycle". Multiple processes must not write one DuckDB file; use SQLite for
+a shared local store.
 
 ## OpenAI Responses API
 

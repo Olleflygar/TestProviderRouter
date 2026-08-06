@@ -169,8 +169,9 @@ score-based routing has real history to work from:
 - Do not add cross-process coordination for DuckDB, async/batched writes,
   rollups, caches, retention, or reporting queries as unrelated work. PR30
   shipped only bounded score aggregates on top of PR13 administration. PR28
-  owns reporting, PR31 concurrency/lifecycle, PR32 buffering/batching, PR33
-  native async behavior, and PR14 PostgreSQL/Supabase.
+  owns reporting, PR32 buffering/batching, PR33 native async behavior, and
+  PR14 PostgreSQL/Supabase. PR31 shipped the baseline concurrency/lifecycle
+  contract -- see "Concurrency and lifecycle" below.
 - PR29 deliberately removed automatic additive migration, and shipped PR13
   preserves that boundary. PR30 creates the exact indexed metrics schema at
   `metrics = 2` only when the configured path is absent. Versioned v1 and the
@@ -190,6 +191,39 @@ score-based routing has real history to work from:
   estimate request size or add bucket-aware aggregation/scoring. Use
   caller-defined `metrics_scope` values to separate materially different
   workloads.
+
+## Concurrency and lifecycle
+
+PR31's baseline contract. The support matrix in `README.md` ("Concurrency and
+lifecycle") is the user-facing promise; these are the implementation rules
+that keep it true:
+
+- One router lock guards all mutable router state: the health dict, the
+  default adapter cache, the metrics warning/drop counters, the closed flag,
+  and the `policy.order()` call. Policies are therefore always invoked under
+  the router's lock -- built-in policies need no locks of their own, and a
+  policy's `order()` must never call back into the router.
+- Each bundled store serializes every database operation (lazy connect, reads,
+  writes, close) behind one per-instance `threading.Lock`. SQLite passes
+  `check_same_thread=False`, which is safe only because of that lock.
+- Lock order is router-before-store, everywhere, and no lock is ever held
+  across an adapter invocation or stream iteration. Do not add a code path
+  that takes the store lock and then the router lock, and do not move network
+  activity inside a critical section.
+- `ProviderRouter.close()` is idempotent and terminal: `invoke()` afterwards
+  raises `RouterClosedError`. It closes only the router-created default store
+  (close-what-you-create); a caller-provided `metrics_store` is never touched.
+  After close, the router's metrics path drops writes (counted, DEBUG) instead
+  of reaching the store, so a stream draining past close cannot lazily reopen
+  the connection close released. Store `close()` keeps its lazy-reconnect
+  behavior; do not make the stores terminal.
+- Streams are single-consumer; multi-thread consumption of one `RouterStream`
+  is unsupported and undefined. Health state remains in-memory and
+  process-local. Multiple processes must not write one DuckDB file.
+- Still deferred, do not pull forward: buffered/batched/background writes
+  (PR32), native async (PR33), cross-process coordination or shared health
+  (PR25/PR14), per-thread or pooled connections, and a close that waits for
+  outstanding streams.
 
 ## Metrics aggregation
 

@@ -1022,6 +1022,62 @@ to PR28; PostgreSQL/Supabase remains PR14. No retention, health persistence,
 cross-backend copy, rollup/cache, buffering, async behavior, or
 `request_size_bucket` behavior was added.
 
+## Concurrency and lifecycle
+
+PR31 gives one router a defined concurrency contract and a defined end of
+life. The matrix below is the whole promise; anything not listed as supported
+is not supported.
+
+Supported:
+
+- **One `ProviderRouter` shared by multiple threads in one process.** Health
+  reads and writes, policy ordering, adapter reuse, and metrics recording are
+  serialized behind one router lock, so no attempt, bench, or rotation step is
+  lost to a race.
+- **Provider network calls running fully concurrently.** No lock is ever held
+  across an adapter invocation or while a stream is being consumed; only the
+  short bookkeeping sections at the edges of a call serialize. Writes remain
+  eager and synchronous -- each attempt still pays one small local write.
+- **`DuckDBMetricsStore` and `SQLiteMetricsStore` from multiple threads in one
+  process.** Each store serializes every database operation (lazy connection
+  creation, reads, writes, close) behind one per-instance lock. When the
+  router lock and a store lock are both needed, the router's is always taken
+  first; nothing takes them in the other order.
+- **Several processes sharing one metrics database via `SQLiteMetricsStore`.**
+  SQLite handles cross-process file locking natively.
+- **`close()` and `with ProviderRouter(...) as router:`.** Close is idempotent
+  and terminal, and closes only the store the router itself created (the
+  unset-default DuckDB store). A caller-provided `metrics_store` is the
+  caller's to close.
+- **Custom policies without their own locks.** The router always calls
+  `policy.order()` while holding its lock, so per-router mutable policy state
+  is serialized automatically. The flip side: `order()` must not call back
+  into the router, or it deadlocks on that lock.
+
+Not supported:
+
+- **Multiple processes writing one DuckDB file.** DuckDB allows one writing
+  process per file; use `SQLiteMetricsStore` for a shared local file, or
+  PostgreSQL (PR14) for shared organizational state.
+- **Sharing health state across processes.** Health is in-memory by design
+  and lives and dies with the router instance. Durable local health is PR25;
+  shared organizational state is PR14.
+- **One stream consumed by more than one thread.** A `RouterStream` is
+  single-consumer: hand it to exactly one thread.
+- **Using the router after `close()`.** `invoke()` raises `RouterClosedError`.
+  `health_report()` and `reset_health()` keep working on the in-memory state.
+- **Buffered/batched writes and native async.** Eager per-attempt writes
+  remain; buffering is PR32 and native async is PR33.
+
+The shutdown rule: finish calls and fully drain or close streams *before*
+closing the router, and nothing is ever lost. Close never interrupts in-flight
+work -- calls and streams complete normally -- but bookkeeping that reaches the
+metrics path after close is dropped rather than written, precisely so a late
+write cannot silently reopen (and re-lock) the database file close just
+released. A stream finishing after close therefore loses exactly its one
+metrics row, never its content; the drop is counted and logged at DEBUG, and
+the in-memory health update still lands.
+
 ## Metrics aggregation
 
 `aggregate_stats` remains the public, pure raw-history reference that turns
@@ -1231,10 +1287,11 @@ at metrics v2 after smoke checks.
 `../WorkflowTests/workflow_history.pre-pr29.duckdb` remained untouched. Normal
 runtime has no equivalent reset or overwrite behavior.
 
-PostgreSQL/Supabase remains PR14. Reporting remains PR28;
-concurrency/lifecycle PR31; buffered/batched writes PR32; and native async
-routing/storage PR33. Rollups, caches, retention, and materialized scores are
-also deferred.
+PostgreSQL/Supabase remains PR14. Reporting remains PR28; buffered/batched
+writes PR32; and native async routing/storage PR33. Baseline in-process thread
+safety and router lifecycle shipped as PR31 -- see "Concurrency and
+lifecycle". Rollups, caches, retention, and materialized scores are also
+deferred.
 
 ### Stable provider identity and display names
 
