@@ -2,10 +2,11 @@
 
 ## Status and purpose
 
-This document records the shipped PR13 local storage foundation and the current
-design direction for PR25 (durable local health) and PR14 (shared PostgreSQL
-organizational state). It is context for future planning and implementation
-prompts, not a substitute for inspecting the source and tests.
+This document records the shipped PR13 local storage foundation, shipped PR30
+storage-side score aggregation, and the current design direction for PR25
+(durable local health) and PR14 (shared PostgreSQL organizational state). It is
+context for future planning and implementation prompts, not a substitute for
+inspecting the source and tests.
 
 Use sources in this order when they disagree:
 
@@ -113,7 +114,7 @@ of that package.
 ### Public storage boundary
 
 [`MetricsStore`](../ProviderRouter/src/nygen_router/storage/base.py) is a
-structural `typing.Protocol` with exactly two storage operations:
+structural `typing.Protocol` with exactly three mandatory storage operations:
 
 ```python
 class MetricsStore(Protocol):
@@ -129,11 +130,21 @@ class MetricsStore(Protocol):
         protocol: ApiProtocol | None = None,
         call_type: CallType | None = None,
     ) -> list[MetricsEvent]: ...
+
+    def query_score_aggregates(
+        self,
+        query: ScoreAggregateQuery,
+    ) -> list[ScoreAggregate]: ...
 ```
 
-This is already the correct database abstraction. The router and routing
-policies do not need an ORM type, SQLAlchemy engine, connection, session, or
-raw row.
+This is the shipped PR30 contract, not an optional capability. Router
+construction rejects path strings, legacy two-method implementations, and
+missing/non-callable methods before provider contact. `query_recent` remains
+the raw chronological event operation for direct callers, diagnosis,
+conformance, and Python-reference comparisons; `ScoreBasedPolicy` always uses
+`query_score_aggregates` and never falls back to raw history. The router and
+routing policies do not need an ORM type, SQLAlchemy engine, connection,
+session, expression, or raw row.
 
 Applications select one store when constructing a router. The alternatives are
 choices, not a pipeline:
@@ -206,12 +217,22 @@ component TEXT PRIMARY KEY
 version   INTEGER NOT NULL
 ```
 
-The first row is `metrics = 1`; future health storage uses an independent
-component revision. Normal runtime creates this schema only when its configured
-file path is absent. A current database is validated and reused without DDL.
-The exact unversioned PR29 table is an implicit version-1 baseline that remains
-usable without runtime stamping. Every other existing target is diagnosed
-read-only and left untouched.
+Fresh databases now record `metrics = 2`; future health storage uses an
+independent component revision. Normal runtime creates this schema only when
+its configured file path is absent. A current database is validated and reused
+without DDL. The exact unversioned PR29 table is still recognized as an
+implicit version-1 baseline, but PR30 runtime rejects it unchanged, as it does
+an explicitly versioned v1 target. PR30 provides no v1-to-v2 migration:
+administrators must stop writers and manually archive/delete a disposable old
+target or configure an absent path.
+
+Metrics v2 includes backend-specific measured index requirements. SQLite
+requires exactly one
+`(provider_id, model, protocol, call_type, timestamp)` index; its current- and
+all-scope query plans both use it. DuckDB requires no score-query index because
+its analytical plan is a sequential scan with or without the tested ART
+indexes. Missing or malformed required project-owned indexes make a claimed v2
+database incompatible without changing it.
 
 Administration is deliberately separate from `MetricsStore`:
 
@@ -225,16 +246,37 @@ The same implementation is available through `nygen-router storage
 inspect|create|migrate`. Creation never overwrites. Migration takes an
 exclusive offline transaction, validates the full route before writing,
 updates versions in the same transaction after each real step, and can create
-one explicitly named, engine-safe, validated pre-migration backup. The only
-PR13 migration is stamping the exact implicit baseline; unknown historical
-layouts are not guessed or transformed.
+one explicitly named, engine-safe, validated pre-migration backup. There is
+currently no executable migration step: the PR13 implicit-v1 stamping route was
+superseded by PR30's fresh-only v2 decision. Unknown historical layouts and
+v1/implicit-v1 targets are not guessed, transformed, stamped, or reindexed.
 
 ### Current routing use of history
 
-`ScoreBasedPolicy` calls `query_recent` during provider ordering, aggregates
-the returned `MetricsEvent` objects in Python, and scores only success and
-speed. It deliberately falls back to its tie-break policy when metrics are
-disabled or history cannot be read.
+`ScoreBasedPolicy` applies its tie-break policy once, captures one reference
+time, and makes exactly one `query_score_aggregates` call per non-empty,
+metrics-enabled ordering. DuckDB and SQLite each execute one parameterized
+aggregate query for every requested provider at once; there is no
+per-provider query or raw-history fallback.
+
+The aggregate query matches the lower time bound, optional exact metrics scope,
+provider ID, model, protocol, and caller-declared call type. It returns bounded
+intermediate totals: weighted attempts and successes, successful
+non-NULL-latency weight and weighted total, plus exact unweighted
+error/rate-limit/timeout tallies. Shared Python derives success rates and
+latency/TTFT averages, constructs `ProviderStats` from the current provider
+configuration, and calculates the final score. SQL does not own the final
+score.
+
+Flat mode weights every event 1.0 over `lookback_hours`. Exponential mode
+queries exactly six half-lives and computes
+`0.5 ** (age_hours / half_life_hours)` from the same policy-captured reference
+time for every row. An explicitly returned all-zero provider has genuine empty
+history and receives the optimistic-start score, then self-corrects as attempts
+arrive. A missing, duplicate, unexpected, or malformed row invalidates the
+whole read; it is never converted to optimistic evidence. Aggregate exception
+or invalid data returns the exact baseline order (round robin by default) and
+does not prevent provider invocation.
 
 The router records each provider attempt synchronously. Storage exceptions are
 caught so they never replace a provider response, but a remote store can still
@@ -246,6 +288,36 @@ query global history -> choose provider -> provider call -> write event globally
 ```
 
 This hot-path cost is a larger transparency concern than Core-versus-ORM.
+
+### Measured PR30 local evidence
+
+Run from the package root:
+
+```sh
+.venv/bin/python benchmarks/pr30_score_aggregation.py --rows 60000 --repetitions 7
+```
+
+The benchmark generated 60,000 logical events, requested 9 provider
+partitions, returned exactly 9 rows per query, and timed 7 repetitions after a
+warm-up. SQLite's retained single index produced medians of 1.240208 ms for the
+current-scope query and 2.090667 ms for all scopes, compared with
+43.191167/43.610417 ms unindexed. A second scope-leading index reduced the
+current-scope median to 0.556125 ms but was rejected because one index already
+served both plans and the second increased write/storage cost.
+
+DuckDB used sequential scans with no index and with two candidate ART indexes.
+No-index medians were 8.648875/9.006959 ms; two-index medians were
+8.202791/9.003167 ms, with higher seed/storage cost. Therefore no decorative
+DuckDB score-query index is part of v2. These figures are one-machine evidence,
+not a universal latency guarantee; bounded result cardinality and captured
+plans are the durable acceptance criteria.
+
+The authorized demo reset discarded 2 rows from the default
+`~/.nygen_router/metrics.duckdb` and 46 rows from
+`WorkflowTests/workflow_history.duckdb`, recreated both empty at metrics v2
+after smoke validation, and left
+`WorkflowTests/workflow_history.pre-pr29.duckdb` untouched. This was a one-time
+repository setup action, never runtime overwrite behavior.
 
 ## Goals
 
@@ -280,17 +352,20 @@ This hot-path cost is a larger transparency concern than Core-versus-ORM.
 
 ### The reusable database behavior is tiny
 
-The metrics database has one append-only event table and two operations:
+The metrics database has one append-only event table and three runtime
+operations:
 
 ```text
 INSERT one attempt
 SELECT recent attempts with optional equality filters
+SELECT bounded scoring totals for requested provider partitions
 ```
 
-There are no relationships, joins, cascading operations, mutable entity
-graphs, or coordinated CRUD workflows. The principal reusable code is a table
-description, one insert, one select, and row conversion. That does not justify
-imposing a general ORM architecture on all local users and backends.
+There are no persisted entity relationships, cascading operations, mutable
+entity graphs, or coordinated CRUD workflows. PR30's aggregate query does use a
+backend-private requested-provider relation and left join, but that still does
+not justify imposing a general ORM architecture on all local users and
+backends.
 
 ### The project already has the correct abstraction
 
@@ -349,12 +424,13 @@ networked PostgreSQL, and MySQL operationally equivalent.
 Schema history must still be versioned, reviewed, deployed, and tested.
 Alembic can consume SQLAlchemy Core `MetaData`; full ORM mapping is not required.
 
-### An ORM does not solve global-history scale or latency
+### An ORM does not solve global-history latency
 
-The current score policy queries raw recent events on every call and aggregates
-them in Python. A remote ORM still performs a network query and transfers those
-events. Each recorded attempt is another network transaction. Pooling helps
-connection setup but does not eliminate network latency or unbounded history.
+PR30 bounded the score-policy result to one aggregate row per requested
+provider, but a remote implementation still performs a network query on
+selection and another transaction for each synchronously recorded attempt.
+Pooling helps connection setup but does not eliminate network transit,
+database execution time, or the write hot path.
 
 ### The portability advantage is modest for one remote engine
 
@@ -391,6 +467,9 @@ class PostgresMetricsStore:
     def __init__(self, database_url: str, ...) -> None: ...
     def record_attempt(self, event: MetricsEvent) -> None: ...
     def query_recent(self, *, since: datetime, ...) -> list[MetricsEvent]: ...
+    def query_score_aggregates(
+        self, query: ScoreAggregateQuery
+    ) -> list[ScoreAggregate]: ...
     def close(self) -> None: ...
 ```
 
@@ -422,12 +501,16 @@ MetricsEvent
 The read path reverses this:
 
 ```text
-PostgreSQL rows
-    -> SQLAlchemy RowMapping
-    -> record_to_event(row)
-    -> list[MetricsEvent]
-    -> existing Python aggregation and scoring
+ScoreAggregateQuery
+    -> one parameterized PostgreSQL aggregate query
+    -> bounded SQLAlchemy RowMapping values
+    -> list[ScoreAggregate]
+    -> shared Python ProviderStats and final score
 ```
+
+Raw `query_recent` separately continues to convert PostgreSQL rows through
+`record_to_event` for direct callers and conformance. It is never the
+`ScoreBasedPolicy` fallback.
 
 The PostgreSQL store should use short-lived connections/transactions obtained
 from one process-level engine owned by the store. It should not keep one ORM
@@ -484,24 +567,18 @@ CREATE TABLE provider_attempts (
     error_type TEXT
 );
 
-CREATE INDEX provider_attempts_scope_timestamp_idx
-    ON provider_attempts (metrics_scope, timestamp);
-
-CREATE INDEX provider_attempts_timestamp_idx
-    ON provider_attempts (timestamp);
+-- PR14 must add only PostgreSQL indexes justified by its own measured plans.
 ```
 
 Do not initially use PostgreSQL-specific enum types. Storing `protocol`,
 `call_type`, and `error_type` as strings makes enum evolution and later SQL
 engine support simpler.
 
-The first indexes match the dominant queries:
-
-- Default history scope: `metrics_scope` plus a timestamp lower bound.
-- All-scope history: timestamp lower bound.
-
-Do not add an index for every possible filter without measured need; indexes
-increase write cost and storage.
+PR30's SQLite index is evidence for the logical filter shape, not a PostgreSQL
+index prescription. PR14 must benchmark exact current- and all-scope aggregate
+plans against realistic PostgreSQL data, retain the smallest useful index set,
+and validate those project-owned definitions in its schema. Do not add an index
+for every possible filter; indexes increase write cost and storage.
 
 ### Cross-engine physical differences
 
@@ -543,7 +620,8 @@ For embedded stores:
 - Inspect an existing schema before writing.
 - Never silently check-and-alter, delete, replace, or backfill an incompatible
   user database.
-- Preserve the exact unversioned PR29 baseline without runtime stamping.
+- Recognize versioned v1 and the exact unversioned PR29 implicit-v1 baseline
+  read-only, but reject both unchanged because PR30 has no v1-to-v2 route.
 - Run every future local migration as an explicit offline, consecutive,
   transactional administration operation.
 
@@ -691,6 +769,14 @@ logical behavior:
 - Apply every requested filter.
 - Return chronological ascending results.
 - Preserve canonical identity partitioning.
+- Implement one `query_score_aggregates` operation that returns exactly one
+  validated `ScoreAggregate` per distinct requested provider, including
+  explicit zeros for genuine empty history.
+- Match scope (unless all-scope), provider ID, model, protocol, call type, and
+  lower time bound; implement flat and exponential weighting from the supplied
+  one reference time.
+- Return intermediate totals only. Keep `ProviderStats` and final scoring in
+  shared Python, and never substitute raw-history fallback.
 - Raise real storage errors so router-owned degradation remains observable.
 
 ## Testing requirements
@@ -734,7 +820,8 @@ Users should be able to expect:
 - One explicit backend per router.
 - No hidden dependency installation or imports.
 - No hidden backend switching or data copying.
-- Stable `MetricsEvent` and query semantics.
+- Stable raw `MetricsEvent` semantics plus mandatory bounded aggregate
+  cardinality, partition, weighting, explicit-zero, and validation semantics.
 - Backend-specific setup and compatibility documentation.
 - Safe, bounded degradation when storage is unavailable.
 - No database error replacing a successful provider result.
@@ -743,26 +830,23 @@ Users should be able to expect:
 
 Switching from a local store to PostgreSQL begins using the history present in
 PostgreSQL. It does not automatically import the local file. With empty or
-unavailable global history, score-based routing uses its documented optimistic
-start and tie-break behavior.
+unavailable global history, score-based routing remains available: a valid
+empty aggregate supplies explicit zero rows and optimistic equal scores, while
+an unavailable or invalid aggregate preserves the exact tie-break baseline.
 
 ## Performance and transparency risks
 
 ### Remote reads on provider selection
 
-The current score policy fetches recent raw events on every call. With global
-history, a large scope can create significant network transfer and Python
-aggregation work. Initial mitigation:
+PR30 already requires server-side score aggregation and bounds result
+cardinality by requested providers. A PostgreSQL implementation must preserve
+that operation and add measured PostgreSQL-specific indexes, bounded connection
+and statement timeouts, appropriate connection reuse, exact baseline fallback,
+and returned-row/query-latency measurements.
 
-- Index `(metrics_scope, timestamp)` and `timestamp`.
-- Use bounded connection and statement timeouts.
-- Reuse connections appropriately.
-- Preserve tie-break fallback on query failure.
-- Measure returned row counts and query latency.
-
-Do not silently add caching because it changes history freshness. If scale
-requires server-side aggregates, rollups, or caching, specify those semantics
-in a later PR and evolve the storage interface deliberately.
+Do not silently add caching, rollups, or materialized scores because they
+change history freshness. If measured scale requires them, specify their
+freshness and invalidation semantics in a separate change.
 
 ### Remote writes before returning
 
@@ -801,19 +885,33 @@ Reconsider when one or more of these becomes true:
 - Mapped entities remove more conversion/transaction code than they add.
 - The package accepts the dependency and semantic cost for all affected users.
 
-Until then, one immutable event table and two operations do not justify a
+Until then, one immutable event table and three runtime operations do not justify a
 universal ORM.
 
 ## Suggested PR boundaries
 
 ### PR13: storage versioning/shared-backend foundation — shipped
 
-- Pinned the two-method runtime storage contract and dependency/import boundaries.
+- Historically pinned the then-two-method runtime storage contract and
+  dependency/import boundaries; PR30 later superseded only that method count.
 - Added independent component versions beginning with `metrics = 1`.
 - Added exact local runtime validation and shared named event conversion.
 - Added typed read-only/create/offline-migrate administration and the standard CLI.
 - Documented managed-backend connection/error/timeout expectations for PR14.
 - Shipped no PostgreSQL, ORM/toolkit, reporting query, or aggregate query.
+
+### PR30: storage-side score aggregation — shipped
+
+- Made `query_score_aggregates` the mandatory third runtime operation.
+- Added one bounded backend SQL query with exact partition/call-type semantics,
+  explicit zero rows, one-reference-time flat/exponential weighting, and no raw
+  fallback.
+- Kept intermediate totals storage-neutral and `ProviderStats`/final scoring in
+  shared Python.
+- Shipped metrics v2 fresh-only, one measured SQLite index, no decorative
+  DuckDB indexes, and no v1 migration/runtime overwrite path.
+- Deferred PostgreSQL/Supabase, reporting, rollups/caching, retention,
+  concurrency/lifecycle, buffering, and async work.
 
 ### PR25: durable local health
 
@@ -847,8 +945,8 @@ resolve these details from current source, tests, and measured behavior:
 6. Whether Supabase is the live scoring source or only a reporting destination.
 7. Acceptable remote read/write latency and timeout budgets.
 8. Data-retention expectations for an append-only global event table.
-9. The event-volume threshold that would require server-side aggregation,
-    rollups, or caching.
+9. The event-volume and freshness thresholds that would justify rollups or
+   caching beyond the mandatory PR30 server-side aggregate query.
 10. How PostgreSQL maps PR13's independent metrics/health components onto its
     deployment migration tooling without coupling their revision streams.
 

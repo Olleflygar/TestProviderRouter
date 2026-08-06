@@ -46,11 +46,24 @@ accept `--reset-history` to delete the shared metrics database before the run:
 python WorkflowTests/pydantic/workflow.py --reset-history
 ```
 
-History is preserved by default. Because DuckDB permits only one process to
-write a database file, do not run these scripts concurrently.
-PR29 does not migrate legacy schemas: if this file predates PR29, its owner
-must pass `--reset-history` (or move it aside manually) before using these
-development-only workflows. Router runtime code never deletes it automatically.
+History is preserved by default. `--reset-history` deletes only the exact
+workflow metrics file and its DuckDB WAL sidecar while the script owns the
+reset; normal first use then creates the current metrics v2 schema. Because
+DuckDB permits only one process to write a database file, do not run these
+scripts concurrently.
+
+PR30 provides no migration from versioned v1 or the exact implicit PR29/v1
+schema. If inspection reports either, stop every writer and explicitly pass
+`--reset-history` for this disposable development history, manually archive or
+delete it, or configure a fresh path. Router runtime never deletes, overwrites,
+stamps, migrates, redirects, or reindexes an existing target automatically.
+
+During the authorized PR30 repository synchronization this exact workflow file
+discarded 46 rows, was recreated empty at metrics v2, smoke-validated, and left
+ready for future demos. The separate archive
+`workflow_history.pre-pr29.duckdb` was not touched. The default router database
+also discarded 2 rows and was recreated empty at v2; neither one-time action is
+normal product behavior.
 
 ## Score-based decision demonstration
 
@@ -60,16 +73,21 @@ development-only workflows. Router runtime code never deletes it automatically.
    each provider two opportunities to lead.
 2. Build a new router over the same metrics store with
    `ScoreBasedPolicy()`. The regular `CallType` comes from each invocation's
-   `RoutingContext` automatically.
+   `RoutingContext` automatically. The policy makes one storage-side aggregate
+   SQL call for both providers and never fetches raw events for scoring.
 3. Run three short model steps: plan, draft, and revision.
 4. Concisely print the ranked provider order, each persisted attempt's outcome
    and latency, and the provider that ultimately served the step.
 
-The final comparison table pools all matching regular attempts in the shared
-DuckDB across executions. It compares attempts, successes, success rate,
-average successful-call latency, error tallies, and score components per
-provider. The current metrics schema has no run identifier, so these are pooled
-history averages rather than an average of separately identified runs.
+The final diagnostic comparison table deliberately uses the public
+`query_recent` plus pure `aggregate_stats` reference path to show individual
+events. That direct-reporting use does not change the score policy: persisted
+scoring always uses one `query_score_aggregates` call. The table pools all
+matching regular attempts in the shared DuckDB across executions and compares
+attempts, successes, success rate, average successful-call latency, error
+tallies, and score components per provider. The current metrics schema has no
+run identifier, so these are pooled history averages rather than an average of
+separately identified runs.
 
 ## Sticky retry decision demonstration
 

@@ -668,6 +668,14 @@ streaming call is recorded with latency measured around adapter.invoke()
 (roughly time-to-stream-open) and success meaning "stream started" -- a
 documented approximation PR 23 replaces.
 
+Historical clarification (PR30 shipped, 2026-08-06): the PR4 scope below
+accurately records the original two-method/raw-history design, but it is not the
+current runtime contract. PR30 deliberately superseded only that boundary:
+`MetricsStore` now requires `record_attempt`, `query_recent`, and
+`query_score_aggregates`; `ScoreBasedPolicy` always uses one backend aggregate
+call and has no raw-history fallback. The original PR4 text is retained as
+history rather than rewritten.
+
 Scope:
 - storage/base.py: MetricsStore protocol -- record_attempt(event:
   MetricsEvent) -> None and query_recent(*, since, provider_name=None,
@@ -1581,6 +1589,14 @@ older remote-backend wording below remains rationale, not shipped behavior.
 PostgreSQL/Supabase stays in PR14, storage-side score aggregation in PR30, and
 dashboard/reporting queries in PR28. PR13 introduced no ORM, driver, remote
 connection, or speculative historical migration.
+
+Later historical clarification (PR30 shipped, 2026-08-06): PR30 intentionally
+superseded PR13's then-current two-method/version-1 runtime assumptions without
+rewriting PR13's shipped history. The current `MetricsStore` has three mandatory
+methods, fresh DuckDB/SQLite databases use metrics v2, and versioned v1 plus
+exact implicit PR29/v1 targets are rejected unchanged with no PR30 migration.
+PR13's separate administration surface, independent component versions, and
+no-runtime-overwrite guarantees remain in force.
 
 Revision note (design discussion, 2026-07-15): two decisions pinned for
 this PR. First, the SQL implementation layer must stay agnostic:

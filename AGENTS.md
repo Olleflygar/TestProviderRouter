@@ -40,14 +40,21 @@ operations, or charges.
 
 ## Storage schema administration
 
-PR13's local schema foundation is shipped. `MetricsStore` remains a runtime-only
-two-method protocol; schema inspection, creation, and migration live on the
-separate typed `nygen_router.storage.admin` surface and the
-`nygen-router storage ...` CLI. Normal DuckDB/SQLite use may create version 1
-only when the configured file path is absent. An existing file is inspected
-read-only and is never silently initialized, stamped, migrated, replaced,
-renamed, deleted, redirected, copied, or switched. The exact unversioned PR29
-schema remains a readable implicit version-1 baseline until an administrator
-explicitly stamps it offline. Keep future component revisions independent in
-`nygen_router_schema_versions`, and keep migration steps explicit,
-transactional, offline, consecutive, and version-last.
+PR13's local administration foundation and PR30's storage-side score aggregation
+are shipped. `MetricsStore` is a mandatory runtime-only three-method protocol:
+`record_attempt`, raw-history `query_recent`, and bounded
+`query_score_aggregates`. `ScoreBasedPolicy` always makes exactly one aggregate
+call when history is enabled and never falls back to `query_recent`; backend SQL
+returns intermediate totals, while `ProviderStats` and the final score remain
+shared Python.
+
+Schema inspection, creation, and migration stay on the separate typed
+`nygen_router.storage.admin` surface and the `nygen-router storage ...` CLI.
+Normal DuckDB/SQLite use may create metrics version 2 only when the configured
+file path is absent. Existing version-1 and exact implicit PR29 targets are
+recognized read-only but are not runtime-compatible and have no PR30 migration
+route. An existing file is never silently initialized, stamped, migrated,
+reindexed, replaced, renamed, deleted, redirected, copied, or switched. Keep
+future component revisions independent in `nygen_router_schema_versions`, and
+keep any future migration steps explicit, transactional, offline, consecutive,
+and version-last.

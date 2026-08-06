@@ -134,12 +134,21 @@ provider ID selects a different scoring partition.
 
 ## Local metrics database administration
 
-Fresh DuckDB and SQLite databases use a component-versioned schema beginning
-with `metrics = 1`. Normal router use creates that schema only when the selected
-file path is absent. An existing database is validated read-only: the exact
-unversioned PR29 schema remains usable without being stamped, while every
-incompatible, malformed, or newer target is left untouched and metrics degrade
-safely at the router boundary.
+Fresh DuckDB and SQLite databases use component-versioned `metrics = 2`.
+Normal router use creates that schema only when the selected file path is
+absent. Every existing database is inspected read-only before use. Versioned v1
+and the exact unversioned PR29 implicit-v1 baseline are recognized but are not
+runtime-compatible, and PR30 deliberately provides no v1-to-v2 migration.
+While all writers are stopped, manually archive/delete a disposable old target
+or configure an absent path. Runtime never stamps, reindexes, migrates,
+overwrites, renames, deletes, redirects, copies, or switches an existing
+database.
+
+SQLite v2 contains one measured score-query index on
+`(provider_id, model, protocol, call_type, timestamp)`, used by both current-
+and all-scope plans. DuckDB v2 contains no score-query ART index: measured
+plans were sequential scans with or without the candidates, so decorative
+indexes were rejected.
 
 Use the separate administrator CLI to inspect, create, or explicitly migrate a
 local target:
@@ -147,17 +156,15 @@ local target:
 ```sh
 nygen-router storage inspect --backend duckdb --default
 nygen-router storage create --backend sqlite --path ./router_metrics.sqlite
-nygen-router storage migrate --backend sqlite --path ./router_metrics.sqlite \
-  --backup ./router_metrics.before-pr13.sqlite
 ```
 
 `inspect` never creates or changes a file. `create` accepts only an absent
-target and has no force/delete/replace mode. `migrate` is offline: stop the
-application, routers, and every other writer first. It accepts only complete
-known migration routes, runs them transactionally, and stamps the exact
-implicit version-1 baseline without inventing a historical transform. A backup
-is optional, explicitly named, engine-safe, validated before migration, and
-never overwrites an existing destination.
+target and has no force/delete/replace mode. `migrate` is offline and accepts
+only complete registered routes; there is currently no route from v1 or
+implicit v1 to v2, so it refuses those targets unchanged. Any future route must
+run transactionally while the application, routers, and every other writer are
+stopped. An optional backup is explicitly named, engine-safe, validated before
+migration, and never overwrites an existing destination.
 
 The default router automatically reuses only
 `~/.nygen_router/metrics.duckdb`. A database created at any other path is not
@@ -172,9 +179,61 @@ router = ProviderRouter(..., metrics_store=metrics_store)
 ```
 
 PostgreSQL/Supabase remains a future PR14 backend using the standard PostgreSQL
-protocol. PR30 owns storage-side scoring aggregates; PR28 owns reporting
-queries. PR13 added none of those features and did not restore the removed
-`request_size_bucket` metric.
+protocol. PR30 storage-side scoring aggregates are shipped; PR28 still owns
+reporting queries. The removed `request_size_bucket` metric was not restored.
+
+## Bounded score-history reads
+
+PR30 changed `MetricsStore` into a mandatory three-method contract:
+`record_attempt`, raw-history `query_recent`, and
+`query_score_aggregates`. Legacy two-method custom stores are rejected during
+router construction. `query_recent` remains useful for direct diagnosis and
+Python-reference analysis, but `ScoreBasedPolicy` always makes exactly one
+aggregate call when metrics are enabled and never falls back to raw history.
+DuckDB and SQLite select their backend SQL automatically; there is no
+aggregation setting.
+
+That one query returns one row per distinct requested provider and matches the
+exact lower time bound, optional metrics scope, provider ID, model, protocol,
+and caller-declared call type. SQL returns only intermediate weighted
+attempt/success evidence, successful non-NULL-latency weight/total, and exact
+unweighted diagnostic tallies. Shared Python derives rates and averages,
+builds the regular or streaming `ProviderStats` bucket, and calculates the
+final score.
+
+Flat history assigns every event weight 1.0 over `lookback_hours`.
+Exponential history reads the latest six half-lives and uses
+`0.5 ** (age_hours / half_life_hours)`. Both use one reference time captured
+for the whole ordering. A genuinely new provider receives an explicit all-zero
+row, keeps the optimistic-start score, and self-corrects after later success or
+failure. A missing or malformed row is invalid, never treated as zero history.
+An aggregate exception or invalid result returns the exact tie-break baseline
+(round robin by default), so a metrics failure cannot prevent a provider call.
+
+Reproduce the standalone local benchmark from the package directory:
+
+```sh
+.venv/bin/python benchmarks/pr30_score_aggregation.py --rows 60000 --repetitions 7
+```
+
+The measured run used 60,000 rows, requested and returned 9 provider rows, and
+timed 7 repetitions. SQLite's retained-index medians were
+1.240208 ms current-scope and 2.090667 ms all-scope versus
+43.191167/43.610417 ms unindexed; an optional second index reached
+0.556125 ms current-scope but was rejected for write/storage cost. DuckDB used
+sequential scans: no-index medians were 8.648875/9.006959 ms versus
+8.202791/9.003167 ms with two ART candidates, which also raised seed/storage
+cost. These are one-machine observations, not universal latency promises.
+
+For the PR30 demo reset, the default DuckDB discarded 2 rows and
+`WorkflowTests/workflow_history.duckdb` discarded 46 rows before both were
+recreated empty at metrics v2 and smoke-validated. The archived
+`WorkflowTests/workflow_history.pre-pr29.duckdb` was untouched. This was a
+one-time authorized setup action, not runtime behavior.
+
+PostgreSQL/Supabase remains PR14. Rollups/caching, reporting, concurrency and
+connection lifecycle, buffered writes, and native async execution remain
+deferred to PR28/PR31/PR32/PR33 or later focused work.
 
 ## OpenAI Responses API
 

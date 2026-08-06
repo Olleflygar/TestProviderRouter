@@ -816,23 +816,32 @@ streaming attempts; it remains `NULL` when no first chunk arrived. Failed
 attempts never enter latency averages. `total_duration_ms` spans streaming
 completion or failure, including a failure before opening.
 
-PR13 adds component-specific schema versions without weakening PR29's
-no-runtime-migration rule. A fresh absent DuckDB or SQLite path is created
-transactionally with the complete `provider_attempts` table and
-`nygen_router_schema_versions` containing `metrics = 1`. Later components such
-as durable health get their own row and revision stream. Reopening a current
-database validates column names/order, logical types, nullability, defaults,
-primary-key identity, metadata shape, and the metrics version without DDL.
+PR13 added component-specific schema administration; shipped PR30 now creates a
+fresh absent DuckDB or SQLite path transactionally at `metrics = 2`, with the
+complete `provider_attempts` table, `nygen_router_schema_versions`, and every
+backend-required project index. Later components such as durable health retain
+their own row and revision stream. Reopening a current database validates
+column names/order, logical types, nullability, defaults, primary-key identity,
+metadata shape, metrics version, and required indexes without DDL.
 
-The exact unversioned PR29 `provider_attempts` schema remains an implicit
-version-1 baseline. Normal `record_attempt()` and `query_recent()` reuse it
-without stamping or otherwise changing its schema. Every other existing path—
-including an empty database, a missing/partial/extra/reordered table, malformed
-metadata, a missing metrics row, or a newer metrics revision—is inspected
-read-only and left untouched. Direct store calls raise an actionable
+SQLite v2 requires exactly one
+`(provider_id, model, protocol, call_type, timestamp)` score-query index. Both
+current- and all-scope benchmark plans used it. DuckDB v2 deliberately requires
+no score-query ART index because measured plans used sequential scans with and
+without the tested candidates.
+
+The exact unversioned PR29 `provider_attempts` schema is still recognized as an
+implicit version-1 baseline, but normal PR30 runtime rejects it unchanged, as
+it does an explicitly versioned v1 target. PR30 provides no v1-to-v2 migration.
+Stop all writers, then manually archive/delete a disposable old target or
+configure an absent path. Every existing path—including an empty database, a
+missing/partial/extra/reordered table, malformed metadata, a missing metrics
+row, a malformed required index, v1/implicit v1, or a newer revision—is
+inspected read-only and left untouched. Direct store calls raise an actionable
 schema-mismatch error; router writes and score-history reads retain their
-best-effort degradation. Runtime code never initializes, alters, backfills,
-renames, deletes, replaces, redirects, copies, or switches an existing target.
+best-effort degradation. Runtime code never initializes, alters, stamps,
+reindexes, backfills, renames, deletes, replaces, redirects, copies, or switches
+an existing target.
 
 PR11's request-size buckets are descoped because estimating size would require
 the router to interpret opaque native arguments; the formerly reserved
@@ -881,9 +890,10 @@ application, every router, and every other database writer first. It acquires
 the backend's exclusive transaction/lock, builds the complete consecutive
 route before writing, applies each step transactionally, updates its component
 version in the same transaction after the corresponding step, rolls back on
-failure, and is idempotent once current. PR13's only migration stamps the exact
-implicit version-1 baseline; no arbitrary or experimental schema is guessed.
-An optional explicitly named backup uses the engine's safe database-copy
+failure, and is idempotent once current. There is currently no executable
+migration: versioned v1 and implicit v1 are refused because PR30 deliberately
+ships no route to v2. No arbitrary or experimental schema is guessed. Any
+future optional explicitly named backup uses the engine's safe database-copy
 operation, must target an absent path, is validated against the pre-migration
 source before any source change, and remains available if later migration
 fails. Backups are never automatic.
@@ -967,7 +977,7 @@ persistence and produces no warning.
 
 ### Bring your own backend
 
-`MetricsStore` is a two-method `typing.Protocol`:
+`MetricsStore` is a mandatory three-method `typing.Protocol`:
 
 ```python
 class MetricsStore(Protocol):
@@ -982,24 +992,41 @@ class MetricsStore(Protocol):
         protocol: ApiProtocol | None = None,
         call_type: CallType | None = None,
     ) -> list[MetricsEvent]: ...
+
+    def query_score_aggregates(
+        self,
+        query: ScoreAggregateQuery,
+    ) -> list[ScoreAggregate]: ...
 ```
 
-Implement those two methods against any SQL-compatible (or other) backend and
-pass an instance as `metrics_store=...` -- no router code changes needed. To
-check your implementation against the same conformance suite the bundled
-backends run, point `tests/test_metrics_store.py`'s parametrized `store`
-fixture at a factory for your backend.
+Implement all three methods against any SQL-compatible (or other) backend and
+pass an instance as `metrics_store=...`—no router code changes are needed.
+Router construction rejects legacy two-method objects and missing/non-callable
+methods before any provider call. `query_recent` must retain raw chronological
+event/filter semantics. `query_score_aggregates` must make one bounded backend
+operation, match the exact scope/provider-ID/model/protocol/call-type/time
+partition, implement flat and exponential weighting from the supplied one
+reference time, and return exactly one validated `ScoreAggregate` for every
+distinct requested provider, including explicit zeros for genuine empty
+history. It returns intermediate totals, not `ProviderStats` or final scores.
+Raise real backend errors; `ScoreBasedPolicy` owns graceful baseline fallback
+and never retries through raw history.
 
-PR13 added no aggregation or reporting method to this protocol. Storage-side
-score aggregation belongs wholly to PR30; dashboard/reporting queries belong
-to PR28. PostgreSQL/Supabase remains PR14. No retention, health persistence,
-cross-backend copy, or `request_size_bucket` behavior was added.
+To check your implementation against the same conformance suite the bundled
+backends run, point `tests/test_metrics_store.py`'s parametrized `store`
+fixture at a factory for your backend and add aggregate-equivalence/cardinality
+coverage matching `tests/test_pr30_storage_source.py`.
+
+PR30 added only bounded scoring aggregation. Dashboard/reporting queries belong
+to PR28; PostgreSQL/Supabase remains PR14. No retention, health persistence,
+cross-backend copy, rollup/cache, buffering, async behavior, or
+`request_size_bucket` behavior was added.
 
 ## Metrics aggregation
 
-`aggregate_stats` turns recorded attempts into one `ProviderStats` per
-provider -- the input score-based routing uses, and a readable summary of
-what each provider has actually been doing:
+`aggregate_stats` remains the public, pure raw-history reference that turns
+recorded attempts into one `ProviderStats` per provider. It is useful for
+direct analysis and is the semantic oracle used to verify database aggregation:
 
 ```python
 from datetime import UTC, datetime, timedelta
@@ -1016,12 +1043,36 @@ stats = aggregate_stats(events, router.providers, CallType.REGULAR)
 print(stats["provider-a-production"].regular_success_rate)  # e.g. 0.95
 ```
 
-It is query-only: the store chooses the time/scope window, then aggregation
-requires exact provider ID, model, protocol, and invocation call type matches.
-Every configured provider gets an entry keyed by `provider_id`, including one
-with no history at all -- its counts are `0` and
-its rates and averages are `None`, so a brand-new provider is "no evidence",
-never a missing key.
+It is query-only: the direct caller chooses the raw time/scope window, then
+aggregation requires exact provider ID, model, protocol, and invocation call
+type matches. Every configured provider gets an entry keyed by `provider_id`,
+including one with no history at all—its counts are `0` and its rates and
+averages are `None`.
+
+`ScoreBasedPolicy` does not call this raw path. It always issues exactly one
+`query_score_aggregates` request for all distinct eligible provider partitions,
+and DuckDB/SQLite automatically execute one backend-specific parameterized SQL
+query. There is no aggregation option and no `query_recent` fallback. The
+database returns only:
+
+- `attempt_weight` and `success_weight`;
+- `successful_latency_weight` and
+  `successful_latency_total_ms`;
+- exact unweighted `recent_error_count`, `rate_limit_count`, and
+  `timeout_count`.
+
+Shared Python derives success rates and successful latency/TTFT averages,
+constructs the selected regular or streaming `ProviderStats` bucket using the
+current provider name, and runs the unchanged `calculate_provider_score`.
+Final success quality, speed quality, and total score never move into SQL.
+
+Every database result must contain exactly one row per distinct requested
+provider ID. An explicit all-zero row means genuine empty history: the provider
+receives the established optimistic-start score and later evidence
+self-corrects it. A missing, duplicate, unexpected, negative, inconsistent,
+NaN/infinite, or malformed row invalidates the complete read. Missing data is
+never filled with optimistic zeros, because that could make a failure-only
+provider repeatedly look new.
 
 **Regular and streaming calls are counted separately** -- `regular_*` versus
 `streaming_*` -- and never blended. They are not the same measurement: a
@@ -1034,7 +1085,8 @@ figures and empty streaming ones (or the reverse) is normal.
 Averages are computed over successful attempts only, so a provider that fails
 in 5ms never looks faster than one that answers in 500ms. `recent_error_count`,
 `rate_limit_count`, and `timeout_count` are exact tallies for the selected
-partition, for diagnostics.
+partition, for diagnostics. A successful event with NULL latency adds success
+evidence but no latency weight or total; failed latency never contributes.
 
 ## Score calculation
 
@@ -1107,10 +1159,17 @@ Its constructor settings are:
 The tie-break policy is applied first, then a stable score sort preserves that
 order wherever scores are equal. With the default, equal-scoring providers
 therefore rotate through round robin instead of one permanently winning every
-tie. The same order is returned unchanged when metrics are disabled, the store
-cannot be queried, or history produces equal scores. A metrics failure logs a
-warning and routing continues through round robin; it never breaks an LLM
-call.
+tie. The policy captures `now` once, deduplicates the baseline only for
+aggregate request construction, issues exactly one aggregate call, and stably
+sorts every original baseline occurrence. The query matches the lower time
+bound, optional exact scope, provider ID, model, protocol, and caller-declared
+call type.
+
+The same baseline order is returned unchanged when metrics are disabled, the
+aggregate query raises, aggregate rows are invalid, or scores are equal. The
+first unavailable-history event logs a warning and repeats log at DEBUG.
+Failure never calls `query_recent`, never uses partial rows, and never prevents
+the router from trying a provider.
 
 The router puts the invocation's declared `CallType` in `RoutingContext`, and
 `ScoreBasedPolicy` automatically scores that matching partition. There is no
@@ -1128,12 +1187,54 @@ The default is `half_life_hours=None`, which leaves recency weighting off and
 preserves the flat `lookback_hours=336` behavior above. Setting a positive
 half-life replaces `lookback_hours` entirely for that policy instance; the two
 windows are never combined. The router queries the latest six half-lives and
-applies exponential decay within them. Events older than that boundary are
-ignored after their influence has already fallen below about 1.6%.
+the backend applies exponential decay within them using
+`0.5 ** (age_hours / half_life_hours)`. Flat mode uses weight 1.0 for every
+event in its lookback. Both modes use the single timezone-aware reference time
+captured for the whole ordering; the database does not choose its own current
+timestamp. Events older than the exponential boundary are ignored after their
+influence has already fallen below about 1.6%.
 
 ```python
 policy = ScoreBasedPolicy(half_life_hours=72.0)
 ```
+
+### PR30 benchmark and schema rationale
+
+Run the separate benchmark from this package directory; it is intentionally
+not part of ordinary pytest:
+
+```sh
+.venv/bin/python benchmarks/pr30_score_aggregation.py --rows 60000 --repetitions 7
+```
+
+The validated run generated 60,000 logical event rows, requested 9 provider
+partitions, returned exactly 9 aggregate rows, and timed 7 repetitions after a
+warm-up. SQLite's one retained
+`(provider_id, model, protocol, call_type, timestamp)` index served both plans:
+medians were 1.240208 ms current-scope and 2.090667 ms all-scope, versus
+43.191167/43.610417 ms unindexed. An optional second scope-leading index
+reached 0.556125 ms for current scope, but was rejected because the write and
+storage cost did not justify an index that helped only that plan.
+
+DuckDB used sequential scans with no score index and with two candidate ART
+indexes. No-index medians were 8.648875/9.006959 ms; two-index medians were
+8.202791/9.003167 ms, with higher seed/storage cost. No decorative DuckDB
+indexes were retained. These timings are evidence from one machine, not a
+universal latency guarantee; the stable promises are one backend aggregate
+call, bounded returned cardinality, semantic equivalence, and inspectable query
+plans.
+
+The one-time PR30 demo recreation discarded 2 rows from the default
+`~/.nygen_router/metrics.duckdb` and 46 rows from
+`../WorkflowTests/workflow_history.duckdb`, then left both empty and validated
+at metrics v2 after smoke checks.
+`../WorkflowTests/workflow_history.pre-pr29.duckdb` remained untouched. Normal
+runtime has no equivalent reset or overwrite behavior.
+
+PostgreSQL/Supabase remains PR14. Reporting remains PR28;
+concurrency/lifecycle PR31; buffered/batched writes PR32; and native async
+routing/storage PR33. Rollups, caches, retention, and materialized scores are
+also deferred.
 
 ### Stable provider identity and display names
 

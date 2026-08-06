@@ -75,10 +75,12 @@ Implementation rules for this package:
 - Streaming calls are first-class: a stream that dies mid-generation falls back
   to the next provider, and its outcome is recorded when the stream ends rather
   than when it opens -- see "Streaming" below.
-- Recorded attempts are summarized into per-provider `ProviderStats` by
-  `aggregate_stats` (`stats.py`), split by call type -- see "Metrics
-  aggregation" below. `provider_id` is canonical; IDs must be unique within a
-  router, while duplicate display names are valid.
+- Recorded attempts can still be summarized directly by the public pure
+  `aggregate_stats` reference function. Shipped PR30 score routing instead asks
+  the selected store for bounded per-provider intermediate totals, builds
+  `ProviderStats` in shared Python, and then uses the unchanged pure score
+  calculator -- see "Metrics aggregation" below. `provider_id` is canonical;
+  IDs must be unique within a router, while duplicate display names are valid.
 
 ## Design principle (native pass-through, non-negotiable)
 
@@ -128,13 +130,22 @@ Avoid the "peel the onion" debugging that plagues comparable routers:
 `ProviderRouter` records one `MetricsEvent` per provider attempt so
 score-based routing has real history to work from:
 
-- `MetricsStore` (`storage/base.py`) is a `typing.Protocol` with exactly two
-  methods -- `record_attempt` and `query_recent`. Do not add aggregation,
-  delete, inspection, version, or migration methods to it; identity filters are
-  scope, provider ID, model, protocol, and call type. Aggregation happens
-  in Python over `query_recent`'s output until PR30 deliberately introduces a
-  separate aggregate capability. PR13's shipped administration API remains
-  separate from router/policy construction and custom runtime stores.
+- `MetricsStore` (`storage/base.py`) is a `typing.Protocol` with exactly three
+  mandatory methods: `record_attempt`, raw-history `query_recent`, and
+  `query_score_aggregates`. Router construction validates that all three are
+  callable; a path, a legacy two-method store, or a missing/non-callable method
+  raises `ConfigError` before provider contact. This was an intentional PR30
+  compatibility break. Do not add delete, inspection, version, migration,
+  reporting, or lifecycle methods to this runtime protocol. PR13's
+  administration API remains separate from router/policy construction and
+  custom runtime stores.
+- `query_recent` remains the raw chronological event API for direct callers,
+  diagnosis, conformance tests, and Python-reference comparisons.
+  `ScoreBasedPolicy` never uses it. DuckDB, SQLite, and every future valid
+  scoring backend implement `query_score_aggregates` and execute one
+  backend-specific parameterized aggregate query automatically; there is no
+  capability flag, configuration switch, per-provider query, or raw-history
+  fallback.
 - `DuckDBMetricsStore` (`storage/duckdb.py`) is the default, pointed at
   `~/.nygen_router/metrics.duckdb`. It lazy-imports `duckdb` inside its
   methods only -- never at module level -- so the core import stays clean
@@ -155,20 +166,25 @@ score-based routing has real history to work from:
 - Every event carries the router's required nonblank `metrics_scope`, required
   `provider_id`, model, protocol, and declared call type. `provider_name` is
   display metadata and never an identity/filter key.
-- Do not add cross-process coordination for DuckDB, async/batched writes, or
-  queries beyond `query_recent` as unrelated work. PR13 shipped local component
-  schema versioning and explicit administration only. PR30 owns storage-side
-  score aggregates, PR28 reporting queries, PR31 concurrency/lifecycle, and
-  PR14 PostgreSQL/Supabase.
+- Do not add cross-process coordination for DuckDB, async/batched writes,
+  rollups, caches, retention, or reporting queries as unrelated work. PR30
+  shipped only bounded score aggregates on top of PR13 administration. PR28
+  owns reporting, PR31 concurrency/lifecycle, PR32 buffering/batching, PR33
+  native async behavior, and PR14 PostgreSQL/Supabase.
 - PR29 deliberately removed automatic additive migration, and shipped PR13
-  preserves that boundary. Only an absent configured file may be initialized
-  on first use, with the exact metrics schema and component metadata at
-  `metrics = 1`. An exact unversioned PR29 table remains readable without
-  runtime stamping. Every other existing target is inspected read-only and
-  left untouched; direct store users get an actionable mismatch error and
-  router calls degrade safely. Only the explicit offline administration API or
-  CLI may stamp/migrate a supported target through a complete transactional
-  route. It never overwrites an existing create/backup target.
+  preserves that boundary. PR30 creates the exact indexed metrics schema at
+  `metrics = 2` only when the configured path is absent. Versioned v1 and the
+  exact unversioned PR29 implicit-v1 baseline are recognized read-only but are
+  no longer usable by normal runtime, and PR30 provides no v1-to-v2 migration.
+  They must be manually archived/deleted while stopped or replaced by an absent
+  configured path. Every existing target stays untouched; direct store users
+  get an actionable mismatch error and router calls degrade safely. Explicit
+  administration remains offline and never overwrites an existing
+  create/backup target. SQLite v2 requires the single measured
+  `(provider_id, model, protocol, call_type, timestamp)` index used by both
+  current- and all-scope plans. DuckDB v2 deliberately retains no score-query
+  index because measured plans use sequential scans even when candidate ART
+  indexes exist; do not add decorative indexes.
 - PR11 is descoped and the formerly reserved `request_size_bucket` column has
   been removed from the schema: do not inspect opaque call arguments to
   estimate request size or add bucket-aware aggregation/scoring. Use
@@ -178,32 +194,38 @@ score-based routing has real history to work from:
 ## Metrics aggregation
 
 `aggregate_stats(events, providers, call_type, *, weight_fn=None)` in `stats.py`
-turns recorded events into one `ProviderStats` per provider for scoring:
+remains public, pure, and the semantic oracle for direct raw-history callers and
+cross-backend tests. `ScoreBasedPolicy` no longer calls it for persisted
+scoring. Each valid store instead returns one `ScoreAggregate` for every
+distinct requested provider from one SQL call:
 
-- Pure and query-only: a function over a list of `MetricsEvent`, with no store,
-  router, or adapter involved and no window logic of its own. Callers filter
-  with `query_recent` first. Do not push aggregation into per-backend SQL.
-- Regular and streaming figures are separate fields and must never be blended:
-  a regular latency is time-to-complete, a streaming one is time-to-first-chunk
-  (see "Streaming" above), and they are decided successful at different
-  moments.
-- Averages cover successful attempts only -- a fast failure must never look
-  fast -- and a success carrying no latency at all contributes nothing rather
-  than a 0.0.
-- Every requested provider ID gets an entry, including one with no events (counts `0`,
-  rates and averages `None`), matching `health_report()`'s precedent: the
-  optimistic-start blend needs a real entry to fall back on.
-- The four count fields are typed `float` because recency weighting can make
-  them fractional; with the default flat weighting they remain whole numbers.
-  Do not "simplify" them to `int`. The three tallies stay `int`: exact,
-  unweighted, diagnostic, never scored and never decayed.
-- `weight_fn` controls how much each event contributes and is used by
-  `ScoreBasedPolicy` for exponential recency decay. It defaults to a flat 1.0
-  per event. Write every count, rate, and average through it; never create
-  separate weighted and unweighted aggregation paths.
-- Match every event exactly on provider ID, model, protocol, and invocation
-  call type. A former display name does not prevent a stable ID from matching.
-  Wrong-partition events affect no count, tally, average, or score.
+- SQL matches the lower time bound, optional exact metrics scope, provider ID,
+  model, protocol, and caller-declared invocation call type. `CURRENT` uses the
+  router scope; `ALL` omits only scope equality. Regular full-response latency
+  and streaming TTFT never blend.
+- The database returns only intermediate `attempt_weight`, `success_weight`,
+  successful non-NULL-latency weight/weighted total, and exact unweighted
+  error/rate-limit/timeout tallies. Shared Python derives rates and averages,
+  builds the selected `ProviderStats` bucket from the current `ProviderConfig`,
+  and calls the unchanged `calculate_provider_score`; final scores never move
+  into SQL.
+- Flat mode gives each matching event weight `1.0` inside
+  `reference_time - lookback_hours`. Exponential mode reads exactly six
+  half-lives and uses `0.5 ** (age_hours / half_life_hours)`. One
+  policy-captured, timezone-aware reference time governs the whole query; the
+  database never supplies its own current time.
+- Failed attempts contribute attempt/failure evidence but never latency. A
+  successful NULL latency contributes success evidence but no latency weight or
+  total. Weighted evidence fields remain floats; the three diagnostic tallies
+  remain exact non-boolean integers and never decay.
+- A genuinely new provider must have an explicit all-zero aggregate row. That
+  row produces the established optimistic-start score and later successes or
+  failures self-correct it. A missing, duplicate, unexpected, malformed,
+  negative, inconsistent, NaN, infinite, or non-integer-tally row invalidates
+  the entire read; missing data is never fabricated as optimistic zero history.
+- The pure `aggregate_stats` path retains its general callable `weight_fn` and
+  constructs entries for every requested provider. Keep it storage-free and
+  semantically equivalent to backend aggregation.
 - Cost statistics remain optional future work under PR6 and may depend only on
   usage supplied through an explicit public seam and user-supplied prices.
   PR24's router-owned token instrumentation is descoped.
@@ -241,23 +263,27 @@ ignores it.
 - Call its tie-break policy exactly once on a copy of the eligible list before
   reading history. This is both the stable tie order and the graceful fallback
   order.
-- Query the context's metrics store from `now - lookback_hours` on every call,
-  aggregate only the rotated providers, calculate their selected call-type
-  scores, and use one stable descending sort. Do not cache scores or add
-  tie-grouping logic.
-- If metrics are disabled, the eligible list is empty, or the history query
-  fails, return the tie-break order unchanged. Query failures warn once per
-  policy instance and log repeats at DEBUG.
+- Capture `now` once, deduplicate the baseline only for request construction,
+  make exactly one `query_score_aggregates` call, validate complete results,
+  calculate each selected call-type score in shared Python, and use one stable
+  descending sort over every original baseline occurrence. Do not call
+  `query_recent`, issue one query per provider, cache scores, remove deliberate
+  ordering duplicates, or add tie-grouping logic.
+- If metrics are disabled, the eligible list is empty, the aggregate query
+  raises, or any result is invalid, return the exact tie-break order unchanged.
+  No failure path fetches raw history or prevents the provider invocation.
+  Failures warn once per policy instance and log repeats at DEBUG.
 - `ScoreBasedPolicy` reads the call type from `RoutingContext`; there is no
   independently configurable `use_streaming` setting.
 - `HistoryScope.CURRENT` (default) queries only the router's scope;
   `HistoryScope.ALL` deliberately omits only the scope filter. Both make one
-  query and still match ID, model, protocol, and call type in Python.
+  aggregate query and still match ID, model, protocol, and call type in SQL.
 - `half_life_hours=None` preserves flat `lookback_hours` behavior exactly. A
-  positive half-life replaces that window entirely: query the
-  latest six half-lives and pass exponential event weights
-  `0.5 ** (age_hours / half_life_hours)` to aggregation. The multiplier six is
-  fixed, and the same half-life applies to every provider and metric.
+  positive half-life replaces that window entirely: query the latest six
+  half-lives and calculate exponential event weights
+  `0.5 ** (age_hours / half_life_hours)` in backend SQL from the one captured
+  reference time. The multiplier six is fixed, and the same half-life applies
+  to every provider and metric.
 - Decay affects scoring evidence only. The exact diagnostic error,
   rate-limit, and timeout counts remain unweighted.
 
