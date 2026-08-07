@@ -1,8 +1,22 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _close_shared_postgres_store() -> Iterator[None]:
+    """Release the PostgreSQL test pool before the interpreter tears down.
+
+    Closing it at exit instead races with interpreter shutdown and prints a
+    "couldn't stop thread" warning. No-op when no test database is configured.
+    """
+    yield
+    from postgres_helpers import forget_shared_store
+
+    forget_shared_store()
 
 
 @pytest.fixture(autouse=True)

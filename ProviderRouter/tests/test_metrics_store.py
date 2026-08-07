@@ -15,6 +15,14 @@ from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from postgres_helpers import (
+    clear_events,
+    ensure_schema,
+    postgres_available,
+    postgres_url,
+    shared_store,
+    skip_reason,
+)
 
 from nygen_router import ApiProtocol, CallType, MetricsEvent, MetricsStore, SQLiteMetricsStore
 
@@ -33,6 +41,17 @@ def _duckdb_factory(tmp_path: Path) -> MetricsStore:
     return DuckDBMetricsStore(tmp_path / "metrics.duckdb")
 
 
+def _postgres_factory(tmp_path: Path) -> MetricsStore:
+    # One shared remote database stands in for the local backends' fresh
+    # temporary file: the schema is provisioned once through the supported
+    # administration route and each test starts from an empty table.
+    url = postgres_url()
+    assert url is not None
+    ensure_schema(url)
+    clear_events(url)
+    return shared_store()  # type: ignore[return-value]
+
+
 @pytest.fixture(
     params=[
         pytest.param(_sqlite_factory, id="sqlite"),
@@ -40,6 +59,11 @@ def _duckdb_factory(tmp_path: Path) -> MetricsStore:
             _duckdb_factory,
             id="duckdb",
             marks=pytest.mark.skipif(not _DUCKDB_AVAILABLE, reason="duckdb is not installed"),
+        ),
+        pytest.param(
+            _postgres_factory,
+            id="postgres",
+            marks=pytest.mark.skipif(not postgres_available(), reason=skip_reason()),
         ),
     ]
 )

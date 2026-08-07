@@ -6,6 +6,8 @@ from nygen_router.storage.admin import (
     DatabaseMigration,
     LocalBackend,
     MigrationStep,
+    PostgresCreation,
+    PostgresInspection,
     StorageAdministrationError,
     StorageBackupError,
     StorageBusyError,
@@ -13,11 +15,19 @@ from nygen_router.storage.admin import (
     StorageDependencyError,
     StorageTargetError,
     create_database,
+    create_postgres_database,
     inspect_database,
+    inspect_postgres_database,
     migrate_database,
 )
 from nygen_router.storage.base import MetricsStore
 from nygen_router.storage.duckdb import DuckDBMetricsStore
+from nygen_router.storage.postgres import (
+    PostgresConfig,
+    PostgresMetricsStore,
+    PostgresPoolMode,
+    redact_postgres_url,
+)
 from nygen_router.storage.schema import (
     METRICS_SCHEMA_VERSION,
     SCHEMA_VERSIONS_TABLE,
@@ -50,6 +60,11 @@ __all__ = [
     "MetricsSchemaMismatchError",
     "MetadataState",
     "MigrationStep",
+    "PostgresConfig",
+    "PostgresCreation",
+    "PostgresInspection",
+    "PostgresMetricsStore",
+    "PostgresPoolMode",
     "SCHEMA_VERSIONS_TABLE",
     "SchemaReport",
     "SchemaState",
@@ -64,6 +79,9 @@ __all__ = [
     "StorageDependencyError",
     "StorageTargetError",
     "create_database",
+    "create_postgres_database",
     "inspect_database",
+    "inspect_postgres_database",
     "migrate_database",
+    "redact_postgres_url",
 ]

@@ -35,6 +35,34 @@ CREATE TABLE {SCHEMA_VERSIONS_TABLE} (
 )
 """
 
+# The same logical schema in PostgreSQL's native types. Operators who run their
+# own migration tooling can apply these two statements directly instead of
+# using the storage administration surface.
+CREATE_PROVIDER_ATTEMPTS_TABLE_POSTGRES_SQL = """
+CREATE TABLE provider_attempts (
+    id TEXT PRIMARY KEY,
+    timestamp TIMESTAMPTZ NOT NULL,
+    metrics_scope TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    provider_name TEXT NOT NULL,
+    model TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    call_type TEXT NOT NULL,
+    success BOOLEAN NOT NULL,
+    stream_opened BOOLEAN,
+    latency_ms DOUBLE PRECISION,
+    total_duration_ms DOUBLE PRECISION,
+    error_type TEXT
+)
+"""
+
+CREATE_SCHEMA_VERSIONS_TABLE_POSTGRES_SQL = f"""
+CREATE TABLE {SCHEMA_VERSIONS_TABLE} (
+    component TEXT PRIMARY KEY,
+    version INTEGER NOT NULL
+)
+"""
+
 COLUMN_NAMES = (
     "id",
     "timestamp",
@@ -100,6 +128,93 @@ CREATE_SQLITE_REQUIRED_METRICS_INDEX_SQL = tuple(
 )
 CREATE_DUCKDB_REQUIRED_METRICS_INDEX_SQL = tuple(
     definition.create_sql for definition in DUCKDB_REQUIRED_METRICS_INDEXES
+)
+
+# Measured against PostgreSQL 17.6 with 60,000 rows and 9 requested providers
+# over 7 repetitions; see benchmarks/pr14a_postgres_score_aggregation.py. Every
+# current-scope, all-scope, and exponential query moved from a sequential scan
+# to an index scan on this definition, with the planner's estimated scan cost
+# falling from about 2100-2250 to about 157-179. As with SQLite, keeping scope
+# out of the leading columns lets one index serve both scope plans.
+#
+# Wall-clock medians barely moved (161 -> 153 ms) because that run went to a
+# managed database whose network round trip is roughly 150 ms and therefore
+# dominates the measurement. The access path and the bounded 9-row result are
+# the durable evidence; the timings are one-machine context, not a promise.
+POSTGRES_REQUIRED_METRICS_INDEXES = (
+    IndexDefinition(
+        name="provider_attempts_partition_timestamp_idx",
+        table="provider_attempts",
+        unique=False,
+        columns=("provider_id", "model", "protocol", "call_type", "timestamp"),
+    ),
+)
+CREATE_POSTGRES_REQUIRED_METRICS_INDEX_SQL = tuple(
+    definition.create_sql for definition in POSTGRES_REQUIRED_METRICS_INDEXES
+)
+
+# PostgreSQL catalog reads. Every one is read-only and schema-qualified to the
+# connection's own search_path via current_schema(), so inspection never
+# reaches into another application's tables.
+SELECT_POSTGRES_TABLES_SQL = (
+    "SELECT table_name FROM information_schema.tables "
+    "WHERE table_schema = current_schema() ORDER BY table_name"
+)
+SELECT_POSTGRES_COLUMNS_SQL = """
+SELECT
+    ordinal_position - 1,
+    column_name,
+    data_type,
+    CASE WHEN is_nullable = 'NO' THEN 1 ELSE 0 END,
+    NULL,
+    CASE WHEN EXISTS (
+        SELECT 1
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+        WHERE tc.constraint_type = 'PRIMARY KEY'
+            AND tc.table_schema = c.table_schema
+            AND tc.table_name = c.table_name
+            AND kcu.column_name = c.column_name
+    ) THEN 1 ELSE 0 END
+FROM information_schema.columns c
+WHERE table_schema = current_schema() AND table_name = %s
+ORDER BY ordinal_position
+"""
+SELECT_POSTGRES_INDEXES_SQL = """
+SELECT
+    i.relname,
+    ix.indisunique,
+    a.attname,
+    k.ordinality
+FROM pg_class t
+JOIN pg_namespace n ON n.oid = t.relnamespace
+JOIN pg_index ix ON t.oid = ix.indrelid
+JOIN pg_class i ON i.oid = ix.indexrelid
+JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ordinality) ON TRUE
+JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+WHERE n.nspname = current_schema() AND t.relname = 'provider_attempts'
+ORDER BY i.relname, k.ordinality
+"""
+
+# PostgreSQL stores the same logical columns in its own native types, so the
+# expected physical shape differs from the local text/integer representation
+# even though the behavioral contract is identical.
+_EXPECTED_POSTGRES_PROVIDER_SCHEMA = (
+    ("id", "text", False, True),
+    ("timestamp", "timestamptz", True, False),
+    ("metrics_scope", "text", True, False),
+    ("provider_id", "text", True, False),
+    ("provider_name", "text", True, False),
+    ("model", "text", True, False),
+    ("protocol", "text", True, False),
+    ("call_type", "text", True, False),
+    ("success", "boolean", True, False),
+    ("stream_opened", "boolean", False, False),
+    ("latency_ms", "real", False, False),
+    ("total_duration_ms", "real", False, False),
+    ("error_type", "text", False, False),
 )
 
 _EXPECTED_PROVIDER_SCHEMA = (
@@ -189,15 +304,17 @@ def inspect_schema_rows(
     version_rows: Sequence[Sequence[Any]],
     index_definitions: Sequence[IndexDefinition],
     required_indexes: Sequence[IndexDefinition],
+    expected_provider_schema: Sequence[tuple[str, str, bool, bool]] = _EXPECTED_PROVIDER_SCHEMA,
+    allow_implicit_baseline: bool = True,
 ) -> SchemaReport:
     """Classify catalog data gathered read-only by a concrete backend."""
     tables = {str(name[0] if isinstance(name, (tuple, list)) else name) for name in table_names}
     has_provider = "provider_attempts" in tables
     has_versions = SCHEMA_VERSIONS_TABLE in tables
 
-    provider_error = _schema_error(provider_schema_rows, _EXPECTED_PROVIDER_SCHEMA)
+    provider_error = _schema_error(provider_schema_rows, expected_provider_schema)
     if not has_versions:
-        if has_provider and provider_error is None:
+        if has_provider and provider_error is None and allow_implicit_baseline:
             return SchemaReport(
                 state=SchemaState.IMPLICIT_BASELINE,
                 metadata_state=MetadataState.ABSENT,
@@ -431,10 +548,59 @@ def _schema_error(
 
 def _logical_type(value: str) -> str:
     normalized = value.upper()
-    if normalized in {"TEXT", "VARCHAR"}:
+    if normalized in {"TEXT", "VARCHAR", "CHARACTER VARYING"}:
         return "text"
     if normalized in {"INTEGER", "INT", "BIGINT"}:
         return "integer"
-    if normalized in {"REAL", "FLOAT", "DOUBLE"}:
+    if normalized in {"REAL", "FLOAT", "DOUBLE", "DOUBLE PRECISION"}:
         return "real"
+    if normalized in {"BOOLEAN", "BOOL"}:
+        return "boolean"
+    if normalized in {"TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ"}:
+        return "timestamptz"
     return normalized.lower()
+
+
+def inspect_postgres_schema_rows(
+    *,
+    table_names: Sequence[object],
+    provider_schema_rows: Sequence[Sequence[Any]],
+    version_schema_rows: Sequence[Sequence[Any]],
+    version_rows: Sequence[Sequence[Any]],
+    index_definitions: Sequence[IndexDefinition],
+) -> SchemaReport:
+    """Classify PostgreSQL catalog data against the native-type expectations.
+
+    PostgreSQL never had a version-1 schema, so a provider_attempts table with
+    no version metadata is a foreign or half-created table rather than an
+    implicit baseline.
+    """
+    tables = {str(name[0] if isinstance(name, (tuple, list)) else name) for name in table_names}
+    if not tables & {"provider_attempts", SCHEMA_VERSIONS_TABLE}:
+        # A reachable database with none of our tables is un-provisioned, not
+        # damaged: the safe next step is to create the schema, not to rescue
+        # data. The local backends reach this state by finding no file.
+        return SchemaReport(
+            state=SchemaState.MISSING,
+            metadata_state=MetadataState.ABSENT,
+            components=(),
+            metrics_version=None,
+            compatible=False,
+            next_action=(
+                "Provision the schema deliberately with a schema-owning role: run "
+                "nygen-router storage create --backend postgres, or apply the published "
+                "CREATE TABLE statements with your own migration tooling. The router never "
+                "creates a remote schema."
+            ),
+            detail="The database is reachable but holds no nygen-router metrics schema.",
+        )
+    return inspect_schema_rows(
+        table_names=table_names,
+        provider_schema_rows=provider_schema_rows,
+        version_schema_rows=version_schema_rows,
+        version_rows=version_rows,
+        index_definitions=index_definitions,
+        required_indexes=POSTGRES_REQUIRED_METRICS_INDEXES,
+        expected_provider_schema=_EXPECTED_POSTGRES_PROVIDER_SCHEMA,
+        allow_implicit_baseline=False,
+    )

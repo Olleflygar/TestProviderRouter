@@ -22,12 +22,18 @@ openai = [
 duckdb = [
     "duckdb>=0.10,<2",
 ]
+postgres = [
+    "psycopg[binary]>=3.2,<4",
+    "psycopg-pool>=3.2,<4",
+]
 dev = [
     "coverage>=7,<8",
     "duckdb>=0.10,<2",
     "httpx>=0.24,<1",
     "mypy>=1,<2",
     "openai>=1.66,<2",
+    "psycopg[binary]>=3.2,<4",
+    "psycopg-pool>=3.2,<4",
     "pytest>=7,<9",
     "python-dotenv>=1,<2",
     "ruff>=0.6,<1",

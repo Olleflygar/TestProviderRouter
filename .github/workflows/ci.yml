@@ -29,3 +29,45 @@ jobs:
         run: mypy src
       - name: Run offline test suite
         run: python -m pytest
+
+  # Separate from the matrix above: there is no reason to start a database to
+  # run formatting and type checks. This job proves the SQL itself against a
+  # real server, which no fake can do. It never reaches a hosted database or
+  # uses real credentials -- Supabase compatibility is documented and verified
+  # by hand, and CI proves standard PostgreSQL only.
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      # A service container speaks plaintext on localhost; the test helpers
+      # confirm that unencrypted use is deliberate rather than accidental.
+      NYGEN_ROUTER_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable
+      NYGEN_ROUTER_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    defaults:
+      run:
+        working-directory: ProviderRouter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install package with dev dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Provision the schema through the supported route
+        run: python -m nygen_router storage create --backend postgres
+      - name: Confirm the provisioned schema inspects clean
+        run: python -m nygen_router storage inspect --backend postgres
+      - name: Run the full suite against real PostgreSQL
+        run: python -m pytest

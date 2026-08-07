@@ -12,12 +12,17 @@ from urllib.parse import quote
 
 from nygen_router.storage.schema import (
     CREATE_DUCKDB_REQUIRED_METRICS_INDEX_SQL,
+    CREATE_POSTGRES_REQUIRED_METRICS_INDEX_SQL,
+    CREATE_PROVIDER_ATTEMPTS_TABLE_POSTGRES_SQL,
     CREATE_PROVIDER_ATTEMPTS_TABLE_SQL,
+    CREATE_SCHEMA_VERSIONS_TABLE_POSTGRES_SQL,
     CREATE_SCHEMA_VERSIONS_TABLE_SQL,
     CREATE_SQLITE_REQUIRED_METRICS_INDEX_SQL,
     INSERT_METRICS_VERSION_SQL,
     METRICS_COMPONENT,
     METRICS_SCHEMA_VERSION,
+    SCHEMA_VERSIONS_TABLE,
+    SELECT_POSTGRES_TABLES_SQL,
     MetadataState,
     SchemaReport,
     SchemaState,
@@ -273,6 +278,131 @@ def migrate_database(
         backup_path=resolved_backup,
         validation=validation,
     )
+
+
+# Administration is a deliberate, interactive act with no hot path to protect,
+# so it waits rather than failing fast. The store's shipped defaults are tuned
+# for the opposite case -- bookkeeping that must never delay a provider
+# response -- and would report a distant but healthy database as unreachable.
+_ADMIN_CONNECTION_CONFIG = {
+    "connect_timeout_seconds": 15.0,
+    "statement_timeout_seconds": 30.0,
+    "checkout_timeout_seconds": 15.0,
+}
+
+
+@dataclass(frozen=True)
+class PostgresInspection:
+    """Read-only diagnosis of one deliberately selected PostgreSQL target."""
+
+    target: str
+    exists: bool
+    schema: SchemaReport
+
+
+@dataclass(frozen=True)
+class PostgresCreation:
+    target: str
+    metrics_version: int
+    validation: PostgresInspection
+
+
+def _admin_connect(url: str) -> Any:
+    """Open one short-lived administrative connection.
+
+    Administration reads the catalog once and stops, so it uses a plain
+    connection rather than building a pool: a pool per command is pure churn
+    against a server's bounded connection budget.
+    """
+    psycopg = _require_psycopg()
+    return psycopg.connect(
+        url,
+        connect_timeout=int(_ADMIN_CONNECTION_CONFIG["connect_timeout_seconds"]),
+    )
+
+
+def inspect_postgres_database(url: str) -> PostgresInspection:
+    """Inspect a PostgreSQL metrics schema without writing anything."""
+    from nygen_router.storage.postgres import _inspect_connection, redact_postgres_url
+
+    target = redact_postgres_url(url)
+    try:
+        with _admin_connect(url) as connection:
+            report = _inspect_connection(connection)
+    except Exception as exc:
+        if isinstance(exc, StorageAdministrationError):
+            raise
+        raise StorageTargetError(
+            f"Could not inspect PostgreSQL metrics database at {target!r}. The existing target "
+            "was left untouched; verify the connection details, the role's read access, and the "
+            "search_path."
+        ) from exc
+    return PostgresInspection(
+        target=target,
+        exists=report.state is not SchemaState.MISSING,
+        schema=report,
+    )
+
+
+def create_postgres_database(url: str) -> PostgresCreation:
+    """Create the metrics schema in one transaction, refusing an occupied target.
+
+    This is a deliberate administrative act run with a schema-owning role. The
+    router never reaches this code: it neither creates nor alters a remote
+    schema at construction or during a call.
+    """
+    from nygen_router.storage.postgres import _inspect_connection, redact_postgres_url
+
+    target = redact_postgres_url(url)
+    try:
+        # Creating and validating share one connection: a second one would add
+        # another failure point and another round of connection setup for a
+        # check the same session can make immediately after committing.
+        with _admin_connect(url) as connection:
+            existing = {
+                str(row[0]) for row in connection.execute(SELECT_POSTGRES_TABLES_SQL).fetchall()
+            }
+            occupied = sorted({"provider_attempts", SCHEMA_VERSIONS_TABLE} & existing)
+            if occupied:
+                raise StorageTargetError(
+                    f"Refusing to create the metrics schema at {target!r}: "
+                    f"{', '.join(repr(name) for name in occupied)} already exists and was left "
+                    "untouched. Inspect the target, or choose a different database or schema."
+                )
+            with connection.transaction():
+                connection.execute(CREATE_PROVIDER_ATTEMPTS_TABLE_POSTGRES_SQL)
+                connection.execute(CREATE_SCHEMA_VERSIONS_TABLE_POSTGRES_SQL)
+                for statement in CREATE_POSTGRES_REQUIRED_METRICS_INDEX_SQL:
+                    connection.execute(statement)
+                connection.execute(
+                    INSERT_METRICS_VERSION_SQL.replace("?", "%s"),
+                    (METRICS_COMPONENT, METRICS_SCHEMA_VERSION),
+                )
+            report = _inspect_connection(connection)
+    except Exception as exc:
+        if isinstance(exc, StorageAdministrationError):
+            raise
+        raise StorageAdministrationError(
+            f"Could not create the metrics schema at {target!r}. The creating transaction was "
+            "rolled back, so no partial schema remains; verify the role's CREATE privilege and "
+            "retry."
+        ) from exc
+
+    validate_created_schema(report)
+    return PostgresCreation(
+        target=target,
+        metrics_version=METRICS_SCHEMA_VERSION,
+        validation=PostgresInspection(target=target, exists=True, schema=report),
+    )
+
+
+def _require_psycopg() -> Any:
+    try:
+        return importlib.import_module("psycopg")
+    except ImportError as exc:
+        raise StorageDependencyError(
+            'psycopg is not installed. Install it with pip install "nygen-router[postgres]".'
+        ) from exc
 
 
 def _resolve_target(backend: LocalBackend, path: str | Path | None) -> tuple[Path, bool]:
