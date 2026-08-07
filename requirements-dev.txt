@@ -1,8 +1,0 @@
-ruff
-mypy
-pytest
-pytest-cov
-python-dotenv
-pydantic
-openai
-httpx
