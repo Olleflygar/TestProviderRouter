@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import time
 from pathlib import Path
 
 TEST_URL_ENV = "NYGEN_ROUTER_TEST_POSTGRES_URL"
@@ -140,15 +141,28 @@ def restore_schema(url: str) -> None:
 
     Recreating unconditionally would build a fresh pool per test, and a managed
     pooler has a bounded client-connection budget that such churn exhausts.
+
+    Teardown is bookkeeping, not an assertion, so one transient connection
+    failure against a managed database over the internet is retried rather than
+    reported as a test error. Nothing under test is retried: the store's own
+    failure behavior is asserted deterministically elsewhere.
     """
     from nygen_router.storage.admin import inspect_postgres_database
     from nygen_router.storage.schema import SchemaState
 
-    state = inspect_postgres_database(url).schema.state
-    if state is SchemaState.CURRENT:
-        clear_events(url)
-        return
-    reset_schema(url)
+    for attempt in (1, 2):
+        try:
+            state = inspect_postgres_database(url).schema.state
+            if state is SchemaState.CURRENT:
+                clear_events(url)
+            else:
+                reset_schema(url)
+            return
+        except Exception:
+            forget_shared_store()
+            if attempt == 2:
+                raise
+            time.sleep(2.0)
 
 
 def reset_schema(url: str) -> None:
