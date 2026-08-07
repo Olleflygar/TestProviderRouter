@@ -15,16 +15,19 @@ optional layers and must not become core import dependencies.
 
 Repository history and existing tags establish the earlier release sequence;
 current source and tests additionally confirm that PR1–5, PR7–10, PR12, PR13,
-PR23, PR26, PR27, PR29, PR30, PR31, and the PR3R `CallVariant` redesign have
-shipped.
+PR14A, PR23, PR26, PR27, PR29, PR30, PR31, and the PR3R `CallVariant` redesign
+have shipped.
 PR29 and PR30 were added later as corrective prerequisites for the remaining
 metrics/storage roadmap. The old project plan's remaining active roadmap IDs
-are PR6 and PR14–20. PR11, PR21, PR22, and PR24 have been descoped and are
-recorded under Scrapped PRs.
+are PR6, PR14B, and PR15–20, plus the audit-track PR32 (buffered metrics
+writes) and PR33 (native async). PR11, PR21, PR22, and PR24 have been
+descoped and are recorded under Scrapped PRs.
 
 The roadmap below preserves those PR identifiers, revises overlapping scopes
-where necessary, and adds four candidate PRs. It is ordered by recommended
-implementation sequence rather than numerical PR order.
+where necessary, and folds in the unshipped storage/async PRs from
+`CODEBASE_AUDIT.md`. It is ordered by recommended implementation sequence
+rather than numerical PR order; async work (PR33, then PR32) is prioritized
+ahead of durable health and the remaining product layers.
 
 ## Core working principles
 
@@ -154,10 +157,43 @@ process, gave `ProviderRouter` an idempotent, terminal `close()` with
 context-manager support that closes only the store the router created, and
 published the concurrency support matrix in `ProviderRouter/README.md`.
 
+### [shipped] PR14A — PostgreSQL / Supabase metrics store
+
+Added optional `PostgresMetricsStore` as a live scoring source over the
+standard PostgreSQL protocol (`psycopg`), with explicit admin provisioning,
+pooling/TLS/timeouts, PR30-equivalent aggregates, and `record_attempts`
+bulk inserts. DuckDB remains the local default; durable health stayed out of
+scope (PR25 / PR14B).
+
 ## Recently shipped
 
 This section gives additional implementation detail for the newest shipped
 work. Older shipped PR details remain in `OldProjectPlan.md`.
+
+### PR14A — PostgreSQL / Supabase metrics store
+
+**Shipped 2026-08-07:** `PostgresMetricsStore` implements all three mandatory
+`MetricsStore` operations against PostgreSQL and is the live scoring source,
+selected through `metrics_store=` and installed through the `postgres` extra.
+It uses `psycopg` with hand-written SQL so all three backends' aggregate
+queries stay readable side by side; SQLAlchemy and Alembic were declined for
+one engine with one schema version.
+
+The router never creates or alters the remote schema. Provisioning is an
+explicit administrative act (`llm-provider-router storage create --backend
+postgres` or published DDL). The runtime role needs only INSERT/SELECT. The
+store validates the schema once per instance on first connection.
+
+Connection behavior is explicit: pooling mode never inferred (`direct`,
+`session_pooler`, `transaction_pooler`), latency-first timeouts, small pool,
+encryption required by default. Supabase is one PostgreSQL deployment target
+through the standard protocol, never the Data API. Writes stay eager and
+synchronous; `record_attempts(events)` provides one all-or-nothing multi-row
+insert for PR32 to batch into. Real PostgreSQL CI provisions through the
+supported route.
+
+PR14A adds no persistent health (PR25/PR14B), buffering (PR32), async (PR33),
+reporting (PR28), retention, rollups, caching, or cross-backend copying.
 
 ### PR31 — Baseline thread safety and connection lifecycle
 
@@ -455,9 +491,84 @@ See `../RequestSizeBuckets.md` for the compact design decision.
 
 These are the remaining active proposals, ordered by recommended implementation
 sequence rather than by PR number. Their scopes are directional until each PR
-receives its own implementation prompt.
+receives its own implementation prompt. PR33 and PR32 are promoted ahead of
+durable health because the audit's open concurrency story is now the baseline
+thread-safety half (PR31 shipped) plus async/buffering work still ahead of the
+product layers.
 
-### 1. PR25 — Durable local provider health
+### Index
+
+1. PR33 — Native async router and adapter path
+2. PR32 — Opt-in bounded buffered/batched metrics writer
+3. PR25 — Durable local provider health
+4. PR14B — PostgreSQL provider health
+5. PR15 — Routing profiles
+6. PR6 — Manual token-cost calculation
+7. PR28 — Optional local metrics dashboard
+8. PR16 — Environment and configuration factories
+9. PR19 — Configurable logging hooks
+10. PR20 — Optional observability hooks
+11. PR18 — Pydantic-AI adapter (very low priority)
+12. PR17 — LangChain adapter (very low priority)
+
+### 1. PR33 — Native async router and adapter path
+
+**Summary:** Add a first-class async invocation and streaming path without
+replacing the synchronous API.
+
+From `CODEBASE_AUDIT.md` Finding C: the router, adapters, SDK clients, streams,
+policies, and metrics stores are synchronous. Declaring `ainvoke()` while
+calling the same blocking methods would still block the event loop. Useful
+async I/O boundaries are provider network calls, PostgreSQL reads/writes,
+waiting for queue capacity/flush, and streaming iteration — not filtering,
+health arithmetic, or score calculation.
+
+- Add an explicit async protocol and `ainvoke()` / async-stream contract; do
+  not implicitly alter the sync API.
+- Use the provider SDK's async client and async iterators so cancellation,
+  timeouts, fallback, same-provider retry accounting, stream restart, health,
+  and raw-response identity have deliberate parity with the sync path.
+- Define an async storage contract for PostgreSQL, or a clearly bounded bridge
+  for sync-only local stores. Never run blocking DuckDB/SQLite work on the
+  event-loop thread.
+- Test cancellation before open and mid-stream, task concurrency, cleanup, and
+  metric durability. Retry safety stays unchanged: opaque native arguments are
+  not replay-safe merely because execution is async.
+
+**Dependency:** PR31 (shipped) is the concurrency/lifecycle gate. Prefer
+landing PR32 soon after or in parallel where buffering helps async Postgres
+writes, but async invocation is no longer deferred behind durable health.
+
+### 2. PR32 — Opt-in bounded buffered/batched metrics writer
+
+**Summary:** Move per-attempt metrics commits off the caller-visible hot path
+without changing default durability silently.
+
+From `CODEBASE_AUDIT.md` Finding B: `_record_metrics()` still calls
+`record_attempt()` before returning a regular response. SQLite commits every
+event individually; a remote store adds a network round trip per physical
+attempt. Failures remain best-effort, but a slow write can delay the result
+until the storage timeout expires.
+
+- Add a wrapper or explicit public seam; synchronous writes remain the
+  compatibility default until the caller opts in.
+- Use a bounded in-process queue and one owned writer. Specify batch size,
+  flush interval, queue-full policy, retry limit, ordering, duplicate handling,
+  and whether process crashes may lose accepted-but-unflushed events.
+- Use PR14A's `PostgresMetricsStore.record_attempts()` for real multi-row
+  transactions. Falling back to repeated `record_attempt()` calls must not be
+  described as database batching.
+- Provide explicit `flush()` and idempotent `close()`, deterministic shutdown,
+  context-manager support, dropped-event counters, and warning/recovery
+  consistent with current best-effort writes.
+- Test slow/failing stores, queue saturation, partial batch failure, shutdown,
+  read-after-flush visibility, and process-exit behavior through public
+  injection seams. Benchmark caller-visible latency and transaction count.
+
+**Dependency:** PR31 (connection/thread ownership) and PR14A (`record_attempts`)
+are shipped.
+
+### 3. PR25 — Durable local provider health
 
 **Summary:** Persist provider cooldowns, rate limits, and health observations
 across router lifecycles.
@@ -467,58 +578,16 @@ implementation. This first stage promises durable state on one installation,
 not organization-wide coordination, and storage failures continue to degrade
 safely to in-memory health.
 
-### 2. PR14B — PostgreSQL provider health (PR14A shipped)
+### 4. PR14B — PostgreSQL provider health
 
-**Summary:** PR14A shipped shared organizational *metrics* over PostgreSQL.
-What remains is the health half, which depends on PR25.
+**Summary:** Implement the PostgreSQL provider-health backend against the
+storage-neutral health interface PR25 defines.
 
-**PR14A — shipped 2026-08-07.** `PostgresMetricsStore` is the optional public
-backend implementing all three mandatory `MetricsStore` operations against
-PostgreSQL, including one bounded SQL aggregate with PR30-equivalent partition,
-weighting, cardinality, validation, and failure semantics. It is the **live
-scoring source**, not an analytics destination: there is no composite store, no
-telemetry sink, and no dual write. It uses `psycopg` directly with hand-written
-SQL, matching the two local backends so all three aggregate queries can be read
-side by side; SQLAlchemy, an ORM, and Alembic were all considered and declined
-for a single engine with one schema version.
+PR14A already shipped shared organizational *metrics*. PR14B is the remaining
+health half only. PR25 is a hard prerequisite; health remains in-memory and
+process-local until both land. PR14A deliberately did not touch health.
 
-Support installs through the explicit `postgres` extra and is selected through
-`metrics_store=`; importing the package or using a local backend never loads
-`psycopg`. Supabase works as one PostgreSQL deployment target through the
-standard protocol, never the Data API or client SDK.
-
-The router never creates or alters the remote schema. Provisioning is a
-deliberate administrative act through `nygen-router storage create --backend
-postgres` or by applying the published DDL with the operator's own tooling, and
-the runtime role needs only INSERT/SELECT. The store validates the schema once
-per instance on first connection and otherwise raises an actionable,
-credential-redacted mismatch error.
-
-Connection behavior is explicit: a pooling mode that is never inferred
-(`direct`, `session_pooler`, `transaction_pooler`), latency-first timeout
-defaults of connect 5 / statement 2 / checkout 2 seconds (connect 10 /
-statement 5 / checkout 5 documented for distant links), a small pool with a
-low connection budget, and encryption required
-by default with an explicit opt-in for unencrypted connections. A stronger
-`sslmode` in the URL is respected rather than downgraded.
-
-Writes stay eager and synchronous. The store adds `record_attempts(events)` for
-one all-or-nothing multi-row insert, and the ordinary single write runs through
-it, so PR32 will find a real bulk capability rather than inventing one; no
-buffering, queueing, or background flushing was added.
-
-The retained index was measured, not assumed: against PostgreSQL 17.6 with
-60,000 rows, every current-scope, all-scope, and exponential query moved from a
-sequential scan to an index scan, with estimated scan cost falling roughly
-12-fold. Real PostgreSQL CI runs the full suite against a service container and
-provisions the schema through the supported route.
-
-**PR14B — remaining.** Implement the PostgreSQL provider-health backend against
-the storage-neutral health interface PR25 defines. PR25 is a hard prerequisite;
-PR14A deliberately did not touch health, which remains in-memory and
-process-local.
-
-### 3. PR15 — Routing profiles
+### 5. PR15 — Routing profiles
 
 **Summary:** Offer simple profiles for speed, reliability, or balanced routing.
 
@@ -527,7 +596,7 @@ rather than introducing a separate scoring system. Cost is excluded from the
 standard profiles. Profiles do not inspect native arguments, infer provider
 capabilities, or introduce new eligibility rules.
 
-### 4. PR6 — Manual token-cost calculation
+### 6. PR6 — Manual token-cost calculation
 
 **Summary:** Estimate cost from user-supplied prices and recorded usage.
 
@@ -536,7 +605,7 @@ cost only from usage supplied through an explicit public seam. Pricing remains
 visibility-only by default: no argument inspection, scraping, or automatic
 cost influence on core routing.
 
-### 5. PR28 — Optional local metrics dashboard
+### 7. PR28 — Optional local metrics dashboard
 
 **Summary:** Provide a read-only single-page view of provider performance.
 
@@ -545,7 +614,7 @@ explicitly configured cost estimates from the reporting interface. Ship it as
 an optional local web extra so dashboard dependencies do not affect the core
 import.
 
-### 6. PR16 — Environment and configuration factories
+### 8. PR16 — Environment and configuration factories
 
 **Summary:** Make common router setup concise and repeatable.
 
@@ -554,7 +623,7 @@ retaining direct `ProviderConfig` construction. Factories may select routing
 profiles and optional stores but must not hide invalid configuration or
 silently enable sticky routing and retries.
 
-### 7. PR19 — Configurable logging hooks
+### 9. PR19 — Configurable logging hooks
 
 **Summary:** Expose routing decisions and failures through standard Python
 logging.
@@ -564,7 +633,7 @@ sticky-provider selections, and storage degradation. Existing internal warnings
 should be consolidated into documented events without adding print-based
 output.
 
-### 8. PR20 — Optional observability hooks
+### 10. PR20 — Optional observability hooks
 
 **Summary:** Integrate routing activity with tracing and custom callbacks.
 
@@ -572,7 +641,7 @@ Provide optional OpenTelemetry, Logfire, and callback integrations using the
 neutral metrics and event model. Observability failures and missing optional
 packages must never break provider calls or the lightweight core import.
 
-### 9. PR18 — Pydantic-AI adapter (very low priority)
+### 11. PR18 — Pydantic-AI adapter (very low priority)
 
 **Summary:** Allow a Pydantic-AI agent to use the router as a model
 implementation.
@@ -587,7 +656,7 @@ The router cannot necessarily be passed directly to a Pydantic-AI `Agent`
 because it does not implement Pydantic AI's model interface. The integration
 must import the router, while the router core must not import Pydantic AI.
 
-### 10. PR17 — LangChain adapter (very low priority)
+### 12. PR17 — LangChain adapter (very low priority)
 
 **Summary:** Allow the router to behave like a LangChain chat model.
 
@@ -607,18 +676,21 @@ must import the router rather than the router importing LangChain.
 These decisions explain dependencies, sequencing, and scope boundaries that are
 not obvious from the numbered roadmap alone.
 
-- PR29, PR13, and PR30 are shipped prerequisites for the remaining
-  metrics/shared-storage work. Later PRs preserve exact partition identity,
-  mandatory bounded aggregate reads, independent version metadata, explicit
-  administration, and no-runtime-migration boundaries.
-- PR30 precedes production PostgreSQL score reads. PR31 shipped the baseline
-  concurrency and connection-lifecycle contract; PR32/PR33 build on it.
+- PR29, PR13, PR30, PR31, and PR14A are shipped prerequisites for the remaining
+  metrics/shared-storage and async work. Later PRs preserve exact partition
+  identity, mandatory bounded aggregate reads, independent version metadata,
+  explicit administration, and no-runtime-migration boundaries.
+- Async track (from `CODEBASE_AUDIT.md`): PR33 is prioritized next for native
+  async invocation/streaming; PR32 follows closely so buffered/batched writes
+  can clear the per-attempt sync write from the hot path, especially with
+  remote Postgres. Both build on PR31's concurrency and lifecycle contract.
+- Durable health remains PR25 then PR14B, after the async/buffering track,
+  unless a measured production need pulls health earlier.
 - PR21 and PR22 are scrapped. Native arguments stay opaque, and operation or
   argument errors remain adapter-time fail-fast errors.
 - PR13, PR30, and PR14A shipped the staged metrics persistence path: storage
   foundation, bounded aggregate reads, then true shared organizational
-  metrics. PR25 (durable local health) and PR14B (its PostgreSQL
-  implementation) remain, in that order.
+  metrics.
 - PR15 is narrowed to profiles supported by the existing scoring model.
 - Shipped fixed-preference routing and same-provider retries remain
   separate because they solve different problems and have different failure
@@ -629,6 +701,10 @@ not obvious from the numbered roadmap alone.
   but both remain at the bottom of the roadmap.
 - Meeting logistics such as preparing review comments and scheduling the
   follow-up are project-management actions, not software PRs.
+- Audit items that are not numbered PRs (repo/package naming, dead
+  `ProviderCapabilities` / `ANTHROPIC_MESSAGES` surface, LICENSE,
+  `requirements-dev.txt` alignment, README duplication) remain deferred
+  decisions outside this sequence.
 
 ## Assumptions
 
