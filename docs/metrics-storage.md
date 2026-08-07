@@ -111,4 +111,4 @@ For conformance, see `tests/test_metrics_store.py` and
 ## Score-based routing
 
 How history becomes attempt order lives in [Policies](./policies.md). Deep
-schema and aggregation detail remains in the [package README](../README.md).
+schema and aggregation detail remains in the [package README](../ProviderRouter/README.md).

@@ -125,4 +125,4 @@ preference. `name` is display metadata only.
 - [Policies](./policies.md) — round-robin, sticky, score-based, retry
 - [Streaming](./streaming.md)
 - [Metrics & storage](./metrics-storage.md)
-- Full detail: [package README](../README.md)
+- Full detail: [package README](../ProviderRouter/README.md)

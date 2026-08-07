@@ -152,4 +152,4 @@ calls need different replay rules.
 4. Then fallback continues to the next ordered provider.
 
 See also [Errors & health](./errors-and-health.md) and the
-[package README](../README.md) for full classification tables.
+[package README](../ProviderRouter/README.md) for full classification tables.

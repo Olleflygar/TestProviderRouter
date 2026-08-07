@@ -44,5 +44,5 @@ coverage report
 - Core imports stay SDK-free: no `openai` / `httpx` / `duckdb` / `psycopg` at
   module level — lazy-import inside the methods that need them.
 - Source and tests define shipped behavior. Roadmap lives under
-  [`../../Projectplan/NewProjectPlan.md`](../../Projectplan/NewProjectPlan.md).
-- Agent/implementation rules: [`../AGENTS.md`](../AGENTS.md).
+  [`../Projectplan/NewProjectPlan.md`](../Projectplan/NewProjectPlan.md).
+- Agent/implementation rules: [`../ProviderRouter/AGENTS.md`](../ProviderRouter/AGENTS.md).

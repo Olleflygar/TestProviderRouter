@@ -1,6 +1,6 @@
 # Documentation
 
-Topic guides for `llm-provider-router`. The [package README](../README.md) remains the full reference; these pages are curated entry points.
+Topic guides for `llm-provider-router`. The [package README](../ProviderRouter/README.md) remains the full reference; these pages are curated entry points.
 
 | Guide | What it's for |
 |-------|----------------|
