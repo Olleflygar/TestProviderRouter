@@ -920,35 +920,71 @@ universal ORM.
 - Preserve safe fallback to in-memory health.
 - Do not overload `MetricsStore` with health semantics.
 
-### PR14: PostgreSQL organizational state
+### PR14A: PostgreSQL organizational metrics — shipped (2026-08-07)
 
-- Add optional `PostgresMetricsStore` for metrics.
-- Add the PostgreSQL health backend against PR25's interface.
-- Supply explicit PostgreSQL/Supabase migrations and deployment guidance.
-- Add real PostgreSQL conformance/integration coverage.
-- Preserve DuckDB as the local default and SQLite as the native minimal option.
+- Added optional `PostgresMetricsStore` for metrics as the live scoring source.
+- Supplied explicit provisioning and Supabase deployment guidance.
+- Added real PostgreSQL conformance/integration coverage and CI.
+- Preserved DuckDB as the local default and SQLite as the native minimal option.
+- Deliberately excluded provider health, so PR25 was not a prerequisite.
 
-## Open decisions for the implementation prompt
+### PR14B: PostgreSQL provider health — remaining
 
-The architectural direction is established, but a later agent must still
-resolve these details from current source, tests, and measured behavior:
+- Add the PostgreSQL health backend against PR25's interface. PR25 first.
 
-1. Whether the first `PostgresMetricsStore` uses SQLAlchemy Core or direct
-   psycopg; Core is recommended, but the compatibility/dependency spike should
-   justify it concretely.
-2. Exact dependency version ranges and supported PostgreSQL versions.
-3. The public constructor's timeout, pooling, TLS, and advanced-engine seams.
-4. Exact PostgreSQL physical types and whether timestamp representation changes
-   from the local ISO-text representation.
-5. How schema validation is triggered without adding an unbounded network call
-   to every router invocation.
-6. Whether Supabase is the live scoring source or only a reporting destination.
-7. Acceptable remote read/write latency and timeout budgets.
-8. Data-retention expectations for an append-only global event table.
-9. The event-volume and freshness thresholds that would justify rollups or
-   caching beyond the mandatory PR30 server-side aggregate query.
-10. How PostgreSQL maps PR13's independent metrics/health components onto its
-    deployment migration tooling without coupling their revision streams.
+## Open decisions — resolved by PR14A
+
+These were resolved during the PR14A requirements interview and by measurement.
+Two departed from this document's own recommendations; both are noted.
+
+1. **Driver: direct psycopg 3 with `psycopg_pool`, not SQLAlchemy Core.**
+   *Departs from this document's recommendation.* The store's job is three SQL
+   statements whose arithmetic must provably match two hand-written siblings,
+   and keeping all three readable side by side was judged worth more than
+   portability to an engine nobody has requested. Core's other advantages
+   (pooling, transactions) are covered by `psycopg_pool` for one dialect with
+   one schema version, and literal SQL makes the required `EXPLAIN` plan
+   measurement direct. Alembic was declined for the same reason: the migration
+   registry holds zero steps, so it would manage a history of one while adding
+   a second version-history mechanism beside `nygen_router_schema_versions`.
+2. **Versions:** `psycopg[binary]>=3.2,<4` and `psycopg-pool>=3.2,<4`, in a
+   `postgres` extra. Verified against PostgreSQL 17.
+3. **Constructor seams:** a `PostgresConfig` pydantic model carrying pool mode,
+   the three timeouts, pool bounds, and TLS settings. No engine object is
+   exposed.
+4. **Physical types:** `TIMESTAMPTZ`, `BOOLEAN`, `DOUBLE PRECISION`, and `TEXT`
+   for enum-like values — native PostgreSQL types rather than the local
+   ISO-text representation, with UTC normalization preserving identical
+   behavior. No PostgreSQL enum types.
+5. **Schema validation:** once per store instance, inside lazy connection
+   setup, exactly as the local backends do. No per-call network round trip.
+6. **Supabase is the live scoring source**, not a reporting destination. No
+   composite store, telemetry sink, or dual write exists.
+7. **Timeout budgets:** latency-first defaults of connect 5 / statement 2 /
+   checkout 2 seconds, with connect 10 / statement 5 / checkout 5 documented
+   for distant links. The router holds its lock across storage calls, so these
+   bound a remote database's effect on *all* routing, not just one call.
+8. **Retention:** none. The event table stays append-only; retention needs its
+   own freshness and durability semantics.
+9. **Rollups/caching:** still unjustified. The bounded aggregate returns one
+   row per requested provider, and the measured plan is an index scan.
+10. **Component versions:** PostgreSQL reuses the same
+    `nygen_router_schema_versions` table and independent component rows. No
+    parallel migration history was introduced.
+
+### Measured behaviors that shaped the design
+
+- A managed pooler accepts the `options` startup parameter and **silently
+  ignores it**, so a statement timeout set that way would leave every query
+  unbounded while appearing configured. It is applied with a session `SET`.
+- Supabase's pooler tolerates server-side prepared statements in transaction
+  mode, unlike classic PgBouncer. `transaction_pooler` mode still disables them
+  conservatively so self-hosted PgBouncer keeps working.
+- `PostgresMetricsStore` holds **no lock of its own**, *departing from this
+  document's "each bundled store serializes behind one per-instance lock"*.
+  The local backends lock because their drivers cannot be shared across
+  threads; a pool exists precisely to handle that, and a lock there would let
+  one slow direct read block all routing.
 
 ## External references
 

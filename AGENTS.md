@@ -48,10 +48,17 @@ call when history is enabled and never falls back to `query_recent`; backend SQL
 returns intermediate totals, while `ProviderStats` and the final score remain
 shared Python.
 
+PR14A added the optional `PostgresMetricsStore` as a live scoring source over
+the standard PostgreSQL protocol. It implements the same three methods, holds
+no lock of its own (its pool is built for concurrent use and the router already
+serializes storage calls), and never creates or alters a remote schema.
+
 Schema inspection, creation, and migration stay on the separate typed
-`nygen_router.storage.admin` surface and the `nygen-router storage ...` CLI.
-Normal DuckDB/SQLite use may create metrics version 2 only when the configured
-file path is absent. Existing version-1 and exact implicit PR29 targets are
+`nygen_router.storage.admin` surface and the `nygen-router storage ...` CLI,
+which now also targets `--backend postgres` for inspect and create. Normal
+DuckDB/SQLite use may create metrics version 2 only when the configured file
+path is absent; a PostgreSQL schema is only ever created by that explicit
+administrative act, never by the router. Existing version-1 and exact implicit PR29 targets are
 recognized read-only but are not runtime-compatible and have no PR30 migration
 route. An existing file is never silently initialized, stamped, migrated,
 reindexed, replaced, renamed, deleted, redirected, copied, or switched. Keep

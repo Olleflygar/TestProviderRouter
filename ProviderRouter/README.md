@@ -959,14 +959,128 @@ returned. **DuckDB is single-process**: it allows only one writing process
 per file. If several local processes need to share one store, use
 `SQLiteMetricsStore(path)` instead, which uses Python's stdlib `sqlite3` (no
 extra install) and handles cross-process file locking natively. For shared,
-multi-machine routing history, a Postgres/Supabase-backed store remains planned
-in [`../Projectplan/NewProjectPlan.md`](../Projectplan/NewProjectPlan.md)
-(PR25 and PR14). It will use the standard PostgreSQL protocol, optional lazy
-dependencies, explicit deployment migrations, least-privilege runtime
-connections, credential-safe errors, bounded connect/statement/pool timeouts,
-explicit TLS and pooling mode, clear connection ownership, and idempotent
-cleanup. It will not silently switch, mirror, replicate, or dual-write local
-history.
+multi-machine routing history, use `PostgresMetricsStore` — see
+[PostgreSQL and Supabase](#postgresql-and-supabase) below.
+
+### PostgreSQL and Supabase
+
+`PostgresMetricsStore` is the optional shared organizational backend. It is a
+**live scoring source**, not an analytics destination: `ScoreBasedPolicy` reads
+its aggregates on the routing path exactly as it does for the local backends.
+
+```sh
+pip install "nygen-router[postgres]"
+```
+
+```python
+from nygen_router import PostgresMetricsStore, ProviderRouter
+
+metrics_store = PostgresMetricsStore(
+    "postgresql://app_user:...@db.example.com:5432/routing",
+    config={"pool_mode": "direct"},
+)
+router = ProviderRouter(
+    providers=[...],
+    metrics_scope="my-application:production",
+    metrics_store=metrics_store,
+)
+```
+
+It speaks the standard PostgreSQL protocol through `psycopg`, so it works with
+conventional PostgreSQL deployments and with Supabase alike. It never uses the
+Supabase Data API or client SDK. Importing `nygen_router` or using the local
+backends never loads `psycopg`; constructing the store without the extra logs
+one warning and raises an install hint at first use.
+
+**You provision the schema; the router never does.** Not at construction, not
+on first use, not ever. Run it once with a schema-owning role:
+
+```sh
+export NYGEN_ROUTER_POSTGRES_URL='postgresql://owner:...@db.example.com:5432/routing'
+nygen-router storage create --backend postgres
+nygen-router storage inspect --backend postgres
+```
+
+Prefer the environment variable over `--url`, which would put the password in
+your shell history and the process list. If you run your own migration
+tooling, apply `CREATE_PROVIDER_ATTEMPTS_TABLE_POSTGRES_SQL` and
+`CREATE_SCHEMA_VERSIONS_TABLE_POSTGRES_SQL` from
+`nygen_router.storage.schema` directly and skip the command entirely. Give the
+application's runtime role only `INSERT`/`SELECT` on `provider_attempts` and
+`SELECT` on `nygen_router_schema_versions`. The store validates the schema
+once per instance, on its first connection, and a mismatch raises an
+actionable error naming the target with the password redacted — it never
+alters, stamps, or creates anything remote.
+
+Selecting PostgreSQL begins from the history already in that database. It does
+not import, mirror, or dual-write your DuckDB or SQLite file. Empty history
+yields explicit zero aggregates and the usual optimistic start.
+
+#### Connection settings
+
+| Setting | Default | Notes |
+|---|---|---|
+| `pool_mode` | `direct` | `direct`, `session_pooler`, or `transaction_pooler`. Never inferred. |
+| `connect_timeout_seconds` | 5.0 | Establishing a new connection. |
+| `statement_timeout_seconds` | 2.0 | Applied server-side per pooled connection. |
+| `checkout_timeout_seconds` | 2.0 | Waiting for a free pooled connection. |
+| `min_pool_size` / `max_pool_size` | 1 / 4 | Small by design; hosted plans have low connection budgets. |
+| `sslmode` | unset → `require` | An explicit mode in the URL is respected and never downgraded. |
+| `sslrootcert` | unset | Certificate authority file for `verify-ca`/`verify-full`. |
+| `allow_unencrypted` | `False` | Required to confirm `disable`, `allow`, or `prefer`. |
+
+The timeouts default **latency-first**: bookkeeping never noticeably delays a
+provider response, at the cost of losing rows on a poor link. For a distant
+database where complete history matters more, the documented alternative is
+connect 10 / statement 5 / checkout 5. This matters more than it looks: the
+router holds its lock across storage calls, so a slow database delays every
+thread's routing, not only the call that triggered it. The timeouts are what
+bound that, and both failure modes still degrade safely — a lost write leaves
+the provider's response untouched, and a failed read falls back to the
+tie-break order.
+
+Encryption is required by default. `require` encrypts but does not verify the
+server's identity; use `verify-full` with `sslrootcert` when you need
+protection against an impersonated server. Unencrypted modes — including
+libpq's own `prefer` default — are refused unless you pass
+`allow_unencrypted=True`.
+
+#### Supabase
+
+Supabase is one PostgreSQL deployment, not a separate abstraction. From
+**Connect → Direct connection**, take the URI for the mode you will actually
+use, and set `pool_mode` to match:
+
+| Supabase option | Port | `pool_mode` |
+|---|---|---|
+| Direct connection | 5432 | `direct` |
+| Session pooler | 5432 | `session_pooler` |
+| Transaction pooler | 6543 | `transaction_pooler` |
+
+Direct connections are IPv6-only unless you buy the IPv4 add-on, so the
+session pooler is usually the right choice from an IPv4 network. In
+`transaction_pooler` mode the store disables server-side prepared statements,
+because a classic transaction pooler hands a server connection to another
+client between transactions and breaks them. Supabase's own pooler was
+measured to tolerate prepared statements, but the conservative default keeps
+self-hosted PgBouncer working; if you meet that failure anyway, the error
+names the setting to change.
+
+Two Supabase behaviours worth knowing, both measured rather than assumed: the
+`options` startup parameter is **silently ignored** through the pooler, which
+is why the statement timeout is applied with a session `SET` instead; and the
+API keys on the Settings → API Keys page are Data API credentials that cannot
+open a PostgreSQL connection.
+
+#### Writes
+
+Writes stay eager and synchronous: one attempt is recorded before the caller
+receives their response, exactly as with the local backends. The store also
+exposes `record_attempts(events)`, which inserts many rows in one round trip
+and one all-or-nothing transaction; the ordinary single write runs through it,
+so the batch path is exercised on every write rather than shipping unused. No
+buffering, queueing, or background flushing exists — that is PR32's work, and
+it will find a backend that already accepts a batch.
 
 Storage writes are best-effort and never replace or modify a provider response.
 The router logs one short warning when a configured store first fails, continues
@@ -1017,10 +1131,11 @@ backends run, point `tests/test_metrics_store.py`'s parametrized `store`
 fixture at a factory for your backend and add aggregate-equivalence/cardinality
 coverage matching `tests/test_pr30_storage_source.py`.
 
-PR30 added only bounded scoring aggregation. Dashboard/reporting queries belong
-to PR28; PostgreSQL/Supabase remains PR14. No retention, health persistence,
-cross-backend copy, rollup/cache, buffering, async behavior, or
-`request_size_bucket` behavior was added.
+`PostgresMetricsStore` implements the same three methods against PostgreSQL and
+runs the same shared conformance suite, so a custom backend has a third worked
+example. Dashboard/reporting queries belong to PR28. No retention, health
+persistence, cross-backend copy, rollup/cache, buffering, async behavior, or
+`request_size_bucket` behavior exists.
 
 ## Concurrency and lifecycle
 
@@ -1043,6 +1158,14 @@ Supported:
   creation, reads, writes, close) behind one per-instance lock. When the
   router lock and a store lock are both needed, the router's is always taken
   first; nothing takes them in the other order.
+- **`PostgresMetricsStore` from multiple threads in one process.** It holds no
+  lock of its own: its connection pool is built for concurrent use, and the
+  router already serializes its own storage calls, so a store lock would guard
+  nothing the router can do concurrently while giving one slow direct read a
+  way to block all routing. Taking no lock also means it cannot violate the
+  router-before-store ordering rule. Note that because the router does hold
+  its lock across storage calls, a slow remote database delays every thread's
+  routing — the connection timeouts are what bound that.
 - **Several processes sharing one metrics database via `SQLiteMetricsStore`.**
   SQLite handles cross-process file locking natively.
 - **`close()` and `with ProviderRouter(...) as router:`.** Close is idempotent
@@ -1058,10 +1181,10 @@ Not supported:
 
 - **Multiple processes writing one DuckDB file.** DuckDB allows one writing
   process per file; use `SQLiteMetricsStore` for a shared local file, or
-  PostgreSQL (PR14) for shared organizational state.
+  `PostgresMetricsStore` for shared organizational state.
 - **Sharing health state across processes.** Health is in-memory by design
-  and lives and dies with the router instance. Durable local health is PR25;
-  shared organizational state is PR14.
+  and lives and dies with the router instance. Durable local health remains
+  PR25, and its PostgreSQL implementation PR14B; PR14A shipped metrics only.
 - **One stream consumed by more than one thread.** A `RouterStream` is
   single-consumer: hand it to exactly one thread.
 - **Using the router after `close()`.** `invoke()` raises `RouterClosedError`.
@@ -1287,11 +1410,12 @@ at metrics v2 after smoke checks.
 `../WorkflowTests/workflow_history.pre-pr29.duckdb` remained untouched. Normal
 runtime has no equivalent reset or overwrite behavior.
 
-PostgreSQL/Supabase remains PR14. Reporting remains PR28; buffered/batched
-writes PR32; and native async routing/storage PR33. Baseline in-process thread
-safety and router lifecycle shipped as PR31 -- see "Concurrency and
-lifecycle". Rollups, caches, retention, and materialized scores are also
-deferred.
+PostgreSQL/Supabase metrics shipped as PR14A -- see "PostgreSQL and Supabase".
+Durable provider health remains PR25, and its PostgreSQL implementation PR14B.
+Reporting remains PR28; buffered/batched writes PR32; and native async
+routing/storage PR33. Baseline in-process thread safety and router lifecycle
+shipped as PR31 -- see "Concurrency and lifecycle". Rollups, caches, retention,
+and materialized scores are also deferred.
 
 ### Stable provider identity and display names
 

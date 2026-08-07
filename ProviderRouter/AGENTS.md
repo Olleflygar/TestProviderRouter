@@ -18,11 +18,15 @@ Implementation rules for this package:
   `openai` extra, and in `_map_sdk_exception`'s in-body import, which is
   reached only after `openai` itself imported successfully. `router.py` stays
   entirely SDK-free -- no `openai`, no `httpx`, not even lazily.
-- LangChain, Pydantic AI, Supabase, and OpenTelemetry remain optional roadmap
-  layers and must not become core dependencies. DuckDB is the current
-  metrics-storage default, but it follows the same lazy-import rule:
-  `storage/duckdb.py` imports `duckdb` only inside method bodies, so the core
-  import stays clean without it installed.
+- LangChain, Pydantic AI, and OpenTelemetry remain optional roadmap layers and
+  must not become core dependencies. DuckDB is the current metrics-storage
+  default and PostgreSQL is the optional shared backend, but both follow the
+  same lazy-import rule: `storage/duckdb.py` imports `duckdb` and
+  `storage/postgres.py` imports `psycopg`/`psycopg_pool` only inside method
+  bodies, so the core import stays clean without either installed. The
+  Supabase Data API and client SDK are deliberately never used: PostgreSQL
+  support speaks the standard PostgreSQL protocol, and Supabase is one
+  deployment target of it rather than its own abstraction.
 - Do not leak API keys in errors, logs, responses, or tests.
 - Use typed models, not raw dictionaries, in core APIs -- `CallVariant`,
   `ProviderConfig`, `EligibilityResult`, etc. The one deliberate exception is
@@ -166,12 +170,24 @@ score-based routing has real history to work from:
 - Every event carries the router's required nonblank `metrics_scope`, required
   `provider_id`, model, protocol, and declared call type. `provider_name` is
   display metadata and never an identity/filter key.
+- `PostgresMetricsStore` (`storage/postgres.py`) is the optional shared
+  organizational backend shipped by PR14A. It lazy-imports `psycopg` inside
+  method bodies only, holds its SQL as text like the two local backends, and
+  is selected through `metrics_store=`. It is a live scoring source: there is
+  no analytics-only mode, no composite store, and no dual write. It never
+  creates, alters, or migrates a remote schema -- provisioning is an explicit
+  administrative act, and the runtime role needs only INSERT/SELECT. It
+  validates the schema once per store instance on first connection, never per
+  call. It also exposes `record_attempts(events)` for one all-or-nothing
+  multi-row insert, and the ordinary single write runs through it; adding a
+  buffer, queue, or background flush on top is PR32's work, not this store's.
+  Do not add that capability to the local backends without a measured need.
 - Do not add cross-process coordination for DuckDB, async/batched writes,
   rollups, caches, retention, or reporting queries as unrelated work. PR30
   shipped only bounded score aggregates on top of PR13 administration. PR28
   owns reporting, PR32 buffering/batching, PR33 native async behavior, and
-  PR14 PostgreSQL/Supabase. PR31 shipped the baseline concurrency/lifecycle
-  contract -- see "Concurrency and lifecycle" below.
+  PR14B PostgreSQL health on top of PR25. PR31 shipped the baseline
+  concurrency/lifecycle contract -- see "Concurrency and lifecycle" below.
 - PR29 deliberately removed automatic additive migration, and shipped PR13
   preserves that boundary. PR30 creates the exact indexed metrics schema at
   `metrics = 2` only when the configured path is absent. Versioned v1 and the
@@ -203,9 +219,18 @@ that keep it true:
   and the `policy.order()` call. Policies are therefore always invoked under
   the router's lock -- built-in policies need no locks of their own, and a
   policy's `order()` must never call back into the router.
-- Each bundled store serializes every database operation (lazy connect, reads,
-  writes, close) behind one per-instance `threading.Lock`. SQLite passes
-  `check_same_thread=False`, which is safe only because of that lock.
+- Each bundled *local* store serializes every database operation (lazy
+  connect, reads, writes, close) behind one per-instance `threading.Lock`.
+  SQLite passes `check_same_thread=False`, which is safe only because of that
+  lock. `PostgresMetricsStore` deliberately holds no such lock: the local
+  drivers cannot be shared across threads, whereas its connection pool exists
+  precisely to handle that, and a lock there would let one slow direct read
+  block all routing. Taking no lock, it also cannot violate the lock ordering
+  rule below.
+- The router holds its lock across storage calls, so with a remote store one
+  slow round trip delays every thread's routing, not just the calling one.
+  Bounded connect/statement/checkout timeouts are what contain this; do not
+  "fix" it by moving network activity or widening the timeouts silently.
 - Lock order is router-before-store, everywhere, and no lock is ever held
   across an adapter invocation or stream iteration. Do not add a code path
   that takes the store lock and then the router lock, and do not move network
@@ -222,8 +247,8 @@ that keep it true:
   process-local. Multiple processes must not write one DuckDB file.
 - Still deferred, do not pull forward: buffered/batched/background writes
   (PR32), native async (PR33), cross-process coordination or shared health
-  (PR25/PR14), per-thread or pooled connections, and a close that waits for
-  outstanding streams.
+  (PR25/PR14B), per-thread or pooled connections *for the local stores*, and a
+  close that waits for outstanding streams.
 
 ## Metrics aggregation
 

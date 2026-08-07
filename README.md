@@ -178,8 +178,14 @@ metrics_store = DuckDBMetricsStore("/chosen/path/metrics.duckdb")
 router = ProviderRouter(..., metrics_store=metrics_store)
 ```
 
-PostgreSQL/Supabase remains a future PR14 backend using the standard PostgreSQL
-protocol. PR30 storage-side scoring aggregates are shipped; PR28 still owns
+PostgreSQL/Supabase is available as the optional shared organizational backend
+through `PostgresMetricsStore`, using the standard PostgreSQL protocol (never
+the Supabase Data API or SDK). Install `nygen-router[postgres]`, provision the
+schema deliberately with `nygen-router storage create --backend postgres`, and
+pass the store as `metrics_store=`; it is a live scoring source, and the router
+never creates or alters a remote schema. Full setup, connection settings, and
+Supabase guidance are in `ProviderRouter/README.md` under "PostgreSQL and
+Supabase". PR30 storage-side scoring aggregates are shipped; PR28 still owns
 reporting queries. The removed `request_size_bucket` metric was not restored.
 
 ## Bounded score-history reads
@@ -231,9 +237,10 @@ recreated empty at metrics v2 and smoke-validated. The archived
 `WorkflowTests/workflow_history.pre-pr29.duckdb` was untouched. This was a
 one-time authorized setup action, not runtime behavior.
 
-PostgreSQL/Supabase remains PR14. Rollups/caching, reporting, buffered writes,
-and native async execution remain deferred to PR28/PR32/PR33 or later focused
-work. PR31 shipped baseline in-process thread safety and router lifecycle: one
+PostgreSQL/Supabase metrics shipped as PR14A; durable provider health remains
+PR25 and its PostgreSQL implementation PR14B. Rollups/caching, reporting,
+buffered writes, and native async execution remain deferred to PR28/PR32/PR33
+or later focused work. PR31 shipped baseline in-process thread safety and router lifecycle: one
 router and both bundled stores are safe to share across threads in one
 process, `ProviderRouter.close()` is idempotent and terminal, and the full
 support matrix lives in `ProviderRouter/README.md` under "Concurrency and

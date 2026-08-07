@@ -202,7 +202,7 @@ exact-counting concurrency tests live in `tests/test_pr31_thread_safety.py`
 and `tests/test_pr31_lifecycle.py`.
 
 PR31 did not add buffered/batched or background writes (PR32), native async
-(PR33), cross-process coordination or shared/durable health (PR25/PR14),
+(PR33), cross-process coordination or shared/durable health (PR25/PR14B),
 per-thread connections, terminal store close, or a close that waits for
 outstanding streams. Writes remain eager and synchronous.
 
@@ -270,7 +270,7 @@ recreated empty at metrics v2: `~/.nygen_router/metrics.duckdb` discarded
 2 rows and `WorkflowTests/workflow_history.duckdb` discarded 46 rows.
 `WorkflowTests/workflow_history.pre-pr29.duckdb` was not touched.
 
-PR30 did not add PostgreSQL/Supabase (PR14), reporting (PR28), rollups/caching,
+PR30 did not add PostgreSQL/Supabase (shipped later as PR14A), reporting (PR28), rollups/caching,
 retention, concurrency/lifecycle (PR31), buffered/batched writes (PR32), or
 native async behavior (PR33).
 
@@ -467,41 +467,56 @@ implementation. This first stage promises durable state on one installation,
 not organization-wide coordination, and storage failures continue to degrade
 safely to in-memory health.
 
-### 2. PR14 — PostgreSQL organizational state (including Supabase)
+### 2. PR14B — PostgreSQL provider health (PR14A shipped)
 
-**Summary:** Share metrics and health across applications within an
-organization.
+**Summary:** PR14A shipped shared organizational *metrics* over PostgreSQL.
+What remains is the health half, which depends on PR25.
 
-Implement PostgreSQL backends for both metrics and provider-health state using
-the interfaces established by PR13 and PR25. DuckDB remains the local default;
-PostgreSQL provides the actual multi-application organizational store, with
-Supabase as the initial managed deployment target.
+**PR14A — shipped 2026-08-07.** `PostgresMetricsStore` is the optional public
+backend implementing all three mandatory `MetricsStore` operations against
+PostgreSQL, including one bounded SQL aggregate with PR30-equivalent partition,
+weighting, cardinality, validation, and failure semantics. It is the **live
+scoring source**, not an analytics destination: there is no composite store, no
+telemetry sink, and no dual write. It uses `psycopg` directly with hand-written
+SQL, matching the two local backends so all three aggregate queries can be read
+side by side; SQLAlchemy, an ORM, and Alembic were all considered and declined
+for a single engine with one schema version.
 
-Here, **Postgres** is the common short name for **PostgreSQL**, a specific
-client/server relational database system; it is not a generic name for SQL
-databases and is not middleware. **Supabase** is a managed platform whose
-database is PostgreSQL, so the initial global metrics backend is a public,
-optional `PostgresMetricsStore` that connects through the standard PostgreSQL
-protocol and works with Supabase as well as other conventional PostgreSQL
-deployments. It must not require the Supabase Data API or Supabase client SDK.
+Support installs through the explicit `postgres` extra and is selected through
+`metrics_store=`; importing the package or using a local backend never loads
+`psycopg`. Supabase works as one PostgreSQL deployment target through the
+standard protocol, never the Data API or client SDK.
 
-`PostgresMetricsStore` must implement all three mandatory `MetricsStore`
-operations, including one bounded SQL aggregate call with PR30-equivalent
-partition, weighting, cardinality, validation, and failure semantics. It uses
-explicit schema versions and keeps any SQL toolkit, PostgreSQL driver, engine,
-pool, and row representation private. PostgreSQL support is installed through
-an explicit extra and selected through `metrics_store=`; merely importing or
-using the local router must not load its dependencies. Direct and pooled
-connection modes, SSL, bounded timeouts, least-privilege runtime access,
-measured PostgreSQL indexes, and the extra network latency of score-history
-reads and per-attempt writes must be documented and tested.
+The router never creates or alters the remote schema. Provisioning is a
+deliberate administrative act through `nygen-router storage create --backend
+postgres` or by applying the published DDL with the operator's own tooling, and
+the runtime role needs only INSERT/SELECT. The store validates the schema once
+per instance on first connection and otherwise raises an actionable,
+credential-redacted mismatch error.
 
-Selecting the global store does not synchronize an existing DuckDB or SQLite
-file. It begins from the history already present in the selected PostgreSQL
-database, and missing/unavailable history continues to use the routing
-policy's documented tie-break behavior. Any future caching, background writes,
-rollups, retention, or local-to-global replication requires separate explicit
-semantics because each changes freshness, durability, or routing latency.
+Connection behavior is explicit: a pooling mode that is never inferred
+(`direct`, `session_pooler`, `transaction_pooler`), latency-first timeout
+defaults of connect 5 / statement 2 / checkout 2 seconds (connect 10 /
+statement 5 / checkout 5 documented for distant links), a small pool with a
+low connection budget, and encryption required
+by default with an explicit opt-in for unencrypted connections. A stronger
+`sslmode` in the URL is respected rather than downgraded.
+
+Writes stay eager and synchronous. The store adds `record_attempts(events)` for
+one all-or-nothing multi-row insert, and the ordinary single write runs through
+it, so PR32 will find a real bulk capability rather than inventing one; no
+buffering, queueing, or background flushing was added.
+
+The retained index was measured, not assumed: against PostgreSQL 17.6 with
+60,000 rows, every current-scope, all-scope, and exponential query moved from a
+sequential scan to an index scan, with estimated scan cost falling roughly
+12-fold. Real PostgreSQL CI runs the full suite against a service container and
+provisions the schema through the supported route.
+
+**PR14B — remaining.** Implement the PostgreSQL provider-health backend against
+the storage-neutral health interface PR25 defines. PR25 is a hard prerequisite;
+PR14A deliberately did not touch health, which remains in-memory and
+process-local.
 
 ### 3. PR15 — Routing profiles
 
@@ -600,8 +615,10 @@ not obvious from the numbered roadmap alone.
   concurrency and connection-lifecycle contract; PR32/PR33 build on it.
 - PR21 and PR22 are scrapped. Native arguments stay opaque, and operation or
   argument errors remain adapter-time fail-fast errors.
-- PR13, PR25, and PR14 form a staged persistence path: shipped storage
-  foundation, durable local health, then true shared organizational state.
+- PR13, PR30, and PR14A shipped the staged metrics persistence path: storage
+  foundation, bounded aggregate reads, then true shared organizational
+  metrics. PR25 (durable local health) and PR14B (its PostgreSQL
+  implementation) remain, in that order.
 - PR15 is narrowed to profiles supported by the existing scoring model.
 - Shipped fixed-preference routing and same-provider retries remain
   separate because they solve different problems and have different failure
@@ -620,7 +637,8 @@ be revisited when evidence or a dedicated PR changes them.
 
 - DuckDB provides local durability only; PostgreSQL provides the shared
   client/server database, while Supabase is one managed PostgreSQL deployment
-  option rather than a separate database abstraction layer.
+  option rather than a separate database abstraction layer. Shipped in PR14A
+  for metrics; health is still in-memory.
 - Any future usage or cost input is explicit and preserves the raw-response
   identity contract.
 - `StickyRoutingPolicy` is configurable and opt-in. It supplies fixed provider
