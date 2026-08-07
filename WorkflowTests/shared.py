@@ -133,12 +133,12 @@ def parse_options(description: str) -> WorkflowOptions:
 
 
 def load_project_environment() -> None:
-    """Load the same project-root .env file as the existing usage scripts."""
+    """Load the repository-root .env file used by these workflow scripts."""
     load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 
 def provider_configs() -> list[ProviderConfig]:
-    """Return the two provider/model pairs used by UsageTestRoundRobin.py."""
+    """Return the shared Fireworks and TogetherAI provider/model pairs."""
     return [
         ProviderConfig(
             provider_id="fireworks:gpt-oss-20b",

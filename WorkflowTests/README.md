@@ -1,7 +1,7 @@
 # ProviderRouter workflow usage tests
 
-These are manual, networked integration scripts. They use the Fireworks and
-TogetherAI provider/model configurations from `UsageTestRoundRobin.py` and
+These are manual, networked integration scripts. They use the shared Fireworks
+and TogetherAI provider/model configurations in `WorkflowTests/shared.py` and
 write provider-attempt metrics to the same local database:
 
 ```text
