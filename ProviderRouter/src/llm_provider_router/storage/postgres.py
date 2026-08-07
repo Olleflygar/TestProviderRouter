@@ -307,7 +307,8 @@ class PostgresMetricsStore:
     def _pool(self) -> ConnectionPool[Connection[Any]]:
         if not self._driver_available:
             raise ImportError(
-                'psycopg is not installed; install it with pip install "llm-provider-router[postgres]"'
+                "psycopg is not installed; install it with "
+                'pip install "llm-provider-router[postgres]"'
             )
         if self._pool_instance is None:
             from psycopg_pool import ConnectionPool

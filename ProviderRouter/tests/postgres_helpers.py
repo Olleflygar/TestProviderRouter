@@ -121,7 +121,10 @@ def ensure_schema(url: str) -> None:
     global _schema_ready
     if _schema_ready:
         return
-    from llm_provider_router.storage.admin import create_postgres_database, inspect_postgres_database
+    from llm_provider_router.storage.admin import (
+        create_postgres_database,
+        inspect_postgres_database,
+    )
     from llm_provider_router.storage.schema import SchemaState
 
     if inspect_postgres_database(url).schema.state is SchemaState.MISSING:

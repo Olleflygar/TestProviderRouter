@@ -24,7 +24,13 @@ from postgres_helpers import (
     skip_reason,
 )
 
-from llm_provider_router import ApiProtocol, CallType, MetricsEvent, MetricsStore, SQLiteMetricsStore
+from llm_provider_router import (
+    ApiProtocol,
+    CallType,
+    MetricsEvent,
+    MetricsStore,
+    SQLiteMetricsStore,
+)
 
 _DUCKDB_AVAILABLE = importlib.util.find_spec("duckdb") is not None
 

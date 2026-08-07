@@ -372,7 +372,9 @@ def inspect_schema_rows(
             components=components,
             metrics_version=metrics_version,
             compatible=False,
-            next_action="Use a llm-provider-router version that supports this newer metrics schema.",
+            next_action=(
+                "Use an llm-provider-router version that supports this newer metrics schema."
+            ),
             detail=(
                 f"The database records metrics version {metrics_version}, newer than installed "
                 f"version {METRICS_SCHEMA_VERSION}."

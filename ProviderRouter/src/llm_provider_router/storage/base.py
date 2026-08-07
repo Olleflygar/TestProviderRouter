@@ -7,7 +7,9 @@ from typing import Any, Protocol
 from llm_provider_router.config import ApiProtocol
 from llm_provider_router.metrics import MetricsEvent
 from llm_provider_router.storage.schema import COLUMN_NAMES
-from llm_provider_router.storage.schema import MetricsSchemaMismatchError as MetricsSchemaMismatchError
+from llm_provider_router.storage.schema import (
+    MetricsSchemaMismatchError as MetricsSchemaMismatchError,
+)
 from llm_provider_router.storage.score_aggregation import ScoreAggregate, ScoreAggregateQuery
 from llm_provider_router.types import CallType
 
