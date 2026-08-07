@@ -1,0 +1,488 @@
+You are implementing PR14A — optional PostgreSQL metrics storage in the
+existing nygen-router repository. Complete the work end to end:
+implementation, focused and regression tests, real PostgreSQL CI,
+documentation synchronization, sensible local commits, and the required local
+Git tags. Do not push commits or tags.
+
+Repository root:
+
+    /Users/olleflygar/Developer/TestProviderRouter
+
+Package root:
+
+    /Users/olleflygar/Developer/TestProviderRouter/ProviderRouter
+
+This is an implementation task, not a design task. The specification below is
+the approved result of a requirements interview. Do not reopen its decisions,
+retain rejected alternatives as parallel behavior, or reduce mandatory
+requirements to suggestions. If a requirement genuinely conflicts with an
+unchangeable engine or driver constraint, stop and report the conflict rather
+than inventing weaker semantics.
+
+## Outcome
+
+Add a public, optional PostgresMetricsStore that implements the existing
+three-method MetricsStore contract against PostgreSQL, so an organization can
+share routing history across machines and applications. It is a live scoring
+source: ScoreBasedPolicy reads its aggregates on the routing hot path exactly
+as it does for the local backends. DuckDB remains the local default and
+SQLite remains the native minimal option.
+
+The whole PR is additive. It changes no file under the router core: the
+router already accepts any object exposing the three storage methods, and it
+only ever closes a store it created itself, so a caller-supplied PostgreSQL
+store is never touched by the router's lifecycle. Do not modify router.py,
+health.py, filters.py, the policy modules, scoring.py, stats.py, metrics.py,
+or types.py.
+
+PR14A deliberately does not add durable provider health (that was PR25 plus a
+PR14B PostgreSQL implementation, and is not a prerequisite here), buffered or
+batched writing (PR32), native async (PR33), reporting queries (PR28),
+retention, rollups, caching, or any copying of local history into PostgreSQL.
+
+## Authority and precedence
+
+Before changing anything, read and follow in full:
+
+- AGENTS.md
+- ProviderRouter/AGENTS.md
+- CODEBASE_AUDIT.md, especially the storage roadmap and the PR14A entry
+- Projectplan/Newprojectplan.md, especially the PR14 section and the
+  PR13/PR30/PR31 ordering notes
+- Projectplan/sharedstorage.md, the storage design document — its chosen
+  architecture, logical schema contract, managed-PostgreSQL expectations,
+  dependency and import boundaries, Supabase operation section, and testing
+  requirements. Where it conflicts with this prompt, this prompt wins; the
+  conflicts are listed explicitly below.
+- Projectplan/prompt_construction.md for repository prompt conventions
+- this approved Projectplan/prompt_pr14a.txt
+
+Treat current source and tests as the primary description of shipped
+behavior. Every shipped routing, health, retry, streaming, scoring, error,
+concurrency, and lifecycle semantic is preserved exactly.
+
+Two places where the approved decisions deliberately depart from
+Projectplan/sharedstorage.md, both settled in the interview:
+
+- That document recommends SQLAlchemy Core as the starting implementation.
+  PR14A uses psycopg directly instead; the reasoning is recorded under
+  "Driver and dependencies" below and must be reflected when the document is
+  synchronized.
+- That document describes each bundled store serializing all database work
+  behind one per-instance lock. PR14A's store deliberately holds no such
+  lock; the reasoning is recorded under "Concurrency" below.
+
+## Inspect the current implementation
+
+Inspect in full before editing: storage/base.py (the protocol, the shared
+event/record conversion, the shared insert and raw-query SQL builders),
+storage/schema.py (the DDL constants, component versioning, index
+definitions, the catalog-inspection classifier, and the runtime validator),
+storage/sqlite.py and storage/duckdb.py (both are the structural template for
+this work), storage/score_aggregation.py (the query, aggregate, and
+validation contract), storage/admin.py and cli.py (the administration surface
+and its error hierarchy and exit codes), policies/score_based.py (how the
+aggregate is requested and how failure degrades), and router.py's metrics
+path and store validation. Inspect tests/test_metrics_store.py (the shared
+conformance suite and its factory-parametrized fixture),
+tests/metrics_store_helpers.py (the pure reference aggregate implementation
+that is the semantic oracle), tests/test_pr30_storage_source.py,
+tests/test_pr13_storage_admin.py, tests/test_pr13_storage_cli.py,
+tests/test_lightweight_import.py, and benchmarks/pr30_score_aggregation.py.
+Inspect ProviderRouter/pyproject.toml and .github/workflows/ci.yml for the
+configured quality commands and CI shape rather than assuming invocations.
+
+## Non-negotiable repository rules
+
+- No monkeypatching of internal collaborators in tests. Test the store
+  through its public constructor against a real PostgreSQL database, and test
+  router and policy degradation through the existing injected metrics_store
+  seam.
+- Never delete existing tests; add focused new test_pr14a_*.py files. The
+  shared conformance suite is extended by adding a factory to its existing
+  parametrization, not by rewriting it.
+- `from nygen_router import ProviderRouter` must not require psycopg. The new
+  module follows storage/duckdb.py's pattern exactly: no driver import at
+  module level, only inside the method bodies that need it, with a
+  TYPE_CHECKING-only import for annotations. Exporting the class from the
+  package root must not make the optional dependency mandatory.
+- Preserve native pass-through, raw response identity, error transparency,
+  and all shipped semantics. Avoid unrelated refactoring.
+- Do not add anything to the three-method MetricsStore protocol.
+
+## Approved design decisions
+
+### Scope and role
+
+PostgreSQL is the live scoring source, selected through `metrics_store=`. It
+is not an analytics-only destination. Do not build a composite store, a
+telemetry sink, dual writes, mirroring, or replication, and do not
+synchronize or import an existing DuckDB or SQLite file. Selecting the
+PostgreSQL store begins from the history already present in that database;
+empty history produces explicit zero aggregates and the established
+optimistic start, exactly as it does locally.
+
+One router uses exactly one store. No backend switching, fallback chaining,
+or hidden secondary writes.
+
+### Driver and dependencies
+
+Use psycopg 3 directly with psycopg_pool for pooling. Do not add SQLAlchemy,
+any ORM, any query builder, or Alembic. The three SQL statements are held as
+text in the source, the way both local backends already hold theirs, so all
+three backends can be read side by side and their arithmetic compared, and so
+EXPLAIN measures exactly the text that runs.
+
+Add a `postgres` optional-dependency extra containing psycopg (binary
+distribution) and psycopg_pool, with version ranges chosen and verified by
+you rather than guessed. Add the extra to the `dev` extra so the test suite
+can exercise it. Local users installing no extra, or only `duckdb`, must
+never receive or import these packages.
+
+Constructing the store without the extra installed follows
+DuckDBMetricsStore's shipped precedent: detect availability at construction,
+log one clear warning naming the exact install command, and raise a clear
+ImportError from the first operation that needs the driver. Do not raise from
+the constructor.
+
+Reuse storage/base.py's shared event/record conversion so enum values, null
+handling, booleans, timestamps, and field names have one source across all
+three backends. Note that psycopg uses a different parameter placeholder than
+sqlite3 and duckdb, so the shared insert SQL constant cannot be reused
+character-for-character; derive the PostgreSQL statement from the same shared
+column-name tuple rather than hand-copying the column list.
+
+### Schema, provisioning, and versioning
+
+The router never creates, alters, stamps, migrates, reindexes, or drops the
+remote schema — not at construction, not on first use, not ever. Provisioning
+is a deliberate administrative act performed with an administrator
+connection, and the application's runtime role holds only INSERT and SELECT
+on the attempts table plus SELECT on the version table.
+
+Provide both provisioning routes:
+
+- Extend the existing typed administration surface and the
+  `nygen-router storage ...` CLI to accept PostgreSQL as a target for
+  inspect and create, taking a connection string instead of a path. Preserve
+  the shipped safety semantics exactly: creation refuses to overwrite an
+  existing table, inspection writes nothing, and every failure raises from
+  the existing StorageAdministrationError hierarchy with the established exit
+  codes. Migration remains registered-route-only, and there are no routes to
+  register yet.
+- Publish the CREATE TABLE statement as a readable constant alongside the
+  existing DDL constants in storage/schema.py, and document it so operators
+  with their own migration tooling can apply it without installing or running
+  anything of ours.
+
+Physical schema: TEXT primary key id, TIMESTAMPTZ timestamp, TEXT for scope,
+provider id, provider name, model, protocol, call type and error type,
+BOOLEAN for success and stream_opened, DOUBLE PRECISION for the two latency
+columns. Do not use PostgreSQL enum types. Timestamps are stored as real
+TIMESTAMPTZ values rather than the local ISO-text representation; normalize
+to UTC on write and return timezone-aware UTC on read, so the round trip is
+behaviorally identical to the local backends.
+
+Versioning reuses the shipped mechanism unchanged: the same version table
+holding independent component rows, with the metrics component at the current
+version. Do not introduce a second version concept or a parallel migration
+history.
+
+Indexes are earned, not assumed. Ship a benchmark script under benchmarks/
+following benchmarks/pr30_score_aggregation.py's shape, measure the current-
+and all-scope aggregate plans against realistic row counts with EXPLAIN,
+retain only the smallest index set that measurably helps, and validate those
+project-owned definitions in the schema check the way the SQLite index
+already is. If no index measurably helps, ship none and record that, exactly
+as DuckDB did. Record the measurements and the machine caveat in the audit.
+
+### Runtime schema validation
+
+Validate once per store instance, inside lazy connection setup, exactly as
+both local backends do. Never validate per call, and never add a network
+round trip to a routing decision for validation purposes.
+
+On mismatch, raise the established mismatch error naming the backend, the
+target (with credentials redacted), what was detected, what was expected, the
+fact that nothing was altered, and the safe next action. A missing table is a
+mismatch, not an invitation to create one.
+
+### Connection configuration
+
+The constructor takes a standard PostgreSQL connection string plus explicit,
+individually configurable settings. Follow the repository's typed-model
+convention for grouped configuration and validate at the constructor
+boundary, raising from the existing error hierarchy for invalid values.
+
+Timeouts default to connect 5 seconds, statement 2 seconds, pool checkout 2
+seconds. Each is individually configurable. Document connect 10 / statement 5
+/ checkout 5 as the completeness-first preset for slow or distant links, and
+explain the trade plainly: short timeouts mean a provider call is never
+noticeably delayed by bookkeeping but rows can be lost on a poor connection;
+long timeouts mean complete history but a struggling database can add seconds
+to a call and, because the router holds its lock across storage calls, stall
+other threads while it does. The statement timeout is enforced server-side on
+the session.
+
+Pooling mode is one explicit setting with three values — direct, session
+pooler, transaction pooler — defaulting to direct. The store configures
+prepared statements and its own pooling to match: transaction-pooler mode
+must disable server-side prepared statements. Never auto-detect the mode.
+Because the wrong choice fails intermittently rather than obviously, detect
+the specific prepared-statement failure and re-raise it with a message naming
+the likely cause and the exact setting to change. Pool size defaults small
+(roughly one to four connections) and is configurable; hosted plans have low
+connection budgets and the router serializes its own storage calls anyway.
+
+Encryption is required by default. Certificate verification is available and
+documented, including how to supply a certificate authority file for hosted
+providers. An unencrypted connection is refused unless explicitly overridden,
+and the documentation must state plainly that the default encrypts without
+verifying the server's identity.
+
+Document the Supabase deployment shape specifically: direct versus session
+versus transaction pooler connection strings and their ports, the interaction
+between our pooling and an external pooler, prepared-statement restrictions,
+certificate configuration, and separate administrator and runtime roles and
+connection strings.
+
+### Concurrency and lifecycle
+
+The store holds no lock of its own. psycopg_pool is designed for concurrent
+use from many threads, and the router already serializes its own storage
+calls under the router lock, so a store-level lock would guard nothing the
+router can do concurrently while adding a way for one slow direct read to
+block all routing. Because the store takes no lock, the shipped
+router-before-store lock-ordering rule cannot be violated here.
+
+Document this deviation with its reason: the local backends lock because
+their drivers cannot be shared across threads; this one does not because its
+pool exists precisely to handle that.
+
+`close()` is idempotent, disposes the pool, and permits lazy reconnection on
+a later operation, matching the local backends. The store is always
+caller-constructed and therefore caller-owned; the router never closes it.
+Support use as a context manager if that reads naturally alongside the
+existing stores, but do not make the store terminal.
+
+### Writes
+
+Provide a batch-write method on the concrete class that inserts many rows in
+one round trip inside one all-or-nothing transaction, and implement the
+ordinary single-attempt write in terms of it, so the batch path is exercised
+by every write rather than shipped unused. The class may carry methods beyond
+the protocol — both local stores already do — as long as the router requires
+none of them.
+
+Nothing else about writing changes. The router still hands over one attempt
+at a time and that attempt is still written before the caller receives their
+response. Do not add a buffer, queue, background thread, delayed flush,
+retry loop, or any change to ordering, durability, or read-after-write
+visibility. PR32 owns all of that and will find a backend that can already
+accept a batch. Do not add batch writing to the local backends.
+
+### Reads
+
+`query_recent` keeps exact raw chronological semantics: the same filters, the
+same ascending order, the same lower time bound, converted through the shared
+record conversion.
+
+`query_score_aggregates` must match the shipped aggregate contract exactly —
+one bounded query, one row per distinct requested provider, the same
+scope/provider/model/protocol/call-type/time partition, flat and exponential
+weighting from the single supplied reference time, weighted attempt/success/
+latency evidence as floats, exact unweighted error, rate-limit and timeout
+tallies, explicit all-zero rows for genuine empty history, and the same
+validation of missing, duplicate, unexpected, malformed, negative,
+inconsistent, or non-integer results. The database never supplies its own
+current time. Final scores never move into SQL. The pure reference
+implementation in tests/metrics_store_helpers.py is the semantic oracle.
+
+Provide the private explain helper the local backends have, so plans can be
+measured deterministically.
+
+### Failures and credentials
+
+The store raises real driver and database errors and swallows nothing. The
+router's existing per-write exception handling and the scoring policy's
+existing fallback own graceful degradation and warning deduplication: an
+unreachable database must still return the provider's response, and a failed
+aggregate must still return the tie-break order. Do not add retries, silent
+recovery, or degradation logic inside the store.
+
+Connection strings, passwords, and bound parameter values must never appear
+in exception messages, log records, or the object's repr. Redact the
+credential portion everywhere a target is named, including administration and
+CLI output.
+
+## Required tests
+
+Add focused test_pr14a_*.py files, and add the PostgreSQL factory to the
+existing parametrized fixture in tests/test_metrics_store.py so the full
+shared conformance suite runs against it. Tests skip — never fail — when no
+test database is configured, mirroring how the DuckDB tests skip when that
+package is absent; plain `pytest` on a machine with no PostgreSQL must stay
+green and offline. Gate on one documented environment variable holding the
+test database connection string.
+
+The list below is the floor, not the ceiling; add whatever else the
+implementation genuinely needs.
+
+- The full shared conformance suite passes against PostgreSQL.
+- Aggregate equivalence against the pure reference implementation across
+  scopes, call types, both weighting modes, and empty history, matching the
+  coverage shape of tests/test_pr30_storage_source.py, including exactly one
+  row per requested provider and explicit zeros for a provider with no
+  history.
+- Exact field round trips: timezone-aware UTC timestamps including a non-UTC
+  input, null latencies, null stream_opened, booleans, and every enum-backed
+  string.
+- Combined filters and chronological ordering on raw history.
+- Batch writes: many rows land in one transaction; a batch that fails part
+  way leaves no rows behind.
+- Concurrent inserts from several threads through one store, with an exact
+  final row count.
+- Connection refused, connect timeout, and statement timeout each surface as
+  real errors within their configured bounds.
+- Schema mismatch and missing table raise the actionable error and alter
+  nothing; a database provisioned through the supported route validates
+  clean.
+- Credentials never appear in error messages, log output, or repr.
+- Router degradation: with the store unreachable, invoke() still returns the
+  provider response and warns once; scoring falls back to tie-break order
+  when the aggregate query fails. Drive these through the existing injected
+  store seam.
+- Administration and CLI behavior for the PostgreSQL target, including
+  refusing to overwrite an existing table and the established exit codes.
+- Importing nygen_router, and using the local backends, with psycopg not
+  installed — extend the existing lightweight-import coverage.
+
+## Continuous integration
+
+Add a separate required job to .github/workflows/ci.yml running a standard
+PostgreSQL service container. Do not add the service to the existing checks
+matrix; there is no reason to start a database to run formatting and type
+checks. Test against one PostgreSQL version, chosen as the version the
+documentation claims support for, and state that claim in the documentation.
+
+The job must provision the schema through the same supported route an
+operator would use, then run the suite against it, so the provisioning path
+itself is tested rather than assumed. It sets the test database environment
+variable to the container. It must never connect to a hosted database or use
+real credentials: Supabase compatibility is documented and verified by hand,
+and CI proves standard PostgreSQL only.
+
+## Explicit scope boundaries
+
+Do not add: any change to router core files; durable or shared provider
+health; buffered, batched, background, or delayed writing; queues or worker
+threads; async APIs; reporting or dashboard queries; retention, rollups,
+caching, or materialized scores; cross-backend copying, mirroring, or dual
+writes; a second version or migration mechanism; SQLAlchemy, an ORM, or
+Alembic; new methods on the storage protocol; changes to the event schema;
+batch writing on the local backends; capability flags or automatic backend
+selection; or unrelated refactoring.
+
+## Documentation synchronization
+
+After implementation and tests pass, synchronize the repository's explanatory
+material. At minimum:
+
+- ProviderRouter/README.md: replace the storage passage that describes a
+  PostgreSQL backend as still planned with what actually shipped; add setup,
+  connection-configuration, timeout, pooling-mode, encryption, provisioning,
+  role, and Supabase guidance; update the "bring your own backend" section;
+  and update the concurrency and lifecycle matrix — PostgreSQL is now the
+  answer for shared organizational state, the store holds no lock of its own,
+  and the router still holds its lock across storage calls so timeouts are
+  what bound a slow database's effect on routing.
+- Root README.md: the passages stating PostgreSQL/Supabase remains a future
+  backend.
+- Root AGENTS.md and ProviderRouter/AGENTS.md: the storage administration,
+  metrics persistence, and concurrency sections, including the deliberate
+  no-store-lock deviation and its reason.
+- Projectplan/Newprojectplan.md: mark PR14A shipped with its actual scope,
+  and state plainly that durable health and its PostgreSQL implementation
+  remain unshipped and are no longer a prerequisite for this work.
+- CODEBASE_AUDIT.md: update the storage roadmap and delivery order, record
+  that PR32 now has a real bulk-insert capability to build on, and record the
+  index measurements with their one-machine caveat.
+- Projectplan/sharedstorage.md: record the resolved answers to its open
+  decisions — driver choice and its justification, the constructor's timeout,
+  pooling and encryption seams, physical types and timestamp representation,
+  how schema validation is triggered without a per-call network call, and
+  that PostgreSQL is the live scoring source rather than a reporting
+  destination. Note the two deliberate departures from its recommendations.
+- Docstrings on the new module and any touched administration code, and any
+  stale statement anywhere that shared or multi-machine history is not yet
+  available.
+
+Documentation must be accurate about what was not done: writes remain eager
+and one-per-attempt, health remains in-memory and process-local, there is no
+async path, and the router still holds its lock across storage calls.
+
+During this step introduce no new runtime behavior and no unrelated code
+changes.
+
+## Git safety, commits, and tags
+
+Inspect git status and existing tags first and preserve unrelated
+pre-existing changes. Confirm neither pr14a-start nor pr14a-complete exists —
+if either does, stop and report rather than moving, replacing, or deleting
+it. Establish the repository's normal clean prompt-only baseline commit
+containing this approved prompt, create pr14a-start immediately before the
+first implementation change, make sensible local commits, and create
+pr14a-complete only after every completion criterion passes and all tracked
+PR14A work is committed. Do not push.
+
+## Validation
+
+Run the configured equivalents of: the focused PR14A tests, the full offline
+pytest suite with no PostgreSQL configured, the full suite with a real
+PostgreSQL configured, coverage, ruff format --check, ruff check, strict mypy
+over src, and the lightweight-import check with neither duckdb nor psycopg
+installed. Inspect pyproject.toml for exact commands. Run the benchmark and
+record its output. Report exact commands, pass counts, and results; do not
+weaken any configured gate.
+
+## Completion criteria
+
+PR14A is complete only when:
+
+- PostgresMetricsStore implements all three storage methods against real
+  PostgreSQL and is exported from the package root without making psycopg a
+  mandatory import;
+- no file under the router core is modified;
+- the store holds SQL as text via psycopg with psycopg_pool, and no
+  SQLAlchemy, ORM, query builder, or Alembic is present;
+- the aggregate query matches the shipped contract exactly, verified against
+  the pure reference implementation, with any retained index justified by
+  recorded measurements;
+- the router never creates or alters the remote schema, both provisioning
+  routes exist, and validation happens once per store with an actionable
+  mismatch error;
+- timeouts, pooling mode, pool size, and encryption behave as specified with
+  the agreed defaults, and the prepared-statement failure carries an
+  actionable message;
+- the store holds no lock, closes idempotently, is never closed by the
+  router, and the deviation is documented with its reason;
+- batch writing exists, the single write runs through it, and no buffering,
+  queueing, or timing change was introduced;
+- credentials never appear in errors, logs, or repr;
+- every required test exists and passes, the suite passes both with and
+  without PostgreSQL configured, and quality gates pass;
+- the required CI job provisions through the supported route and passes;
+- documentation is synchronized, PR14A is marked shipped, and the excluded
+  health work is described accurately; and
+- pr14a-start and pr14a-complete correctly bracket the committed work.
+
+## Final handoff
+
+Report concisely: the store's design as implemented (driver, pooling, the
+three SQL statements, batch write), the connection configuration surface and
+its defaults, the provisioning routes and validation behavior, the index
+decision with its measurements, important files added and changed, exact test
+and quality-gate results both with and without PostgreSQL configured, the CI
+job shape, documentation synchronized, commits created, both tag targets, and
+the deliberately deferred limitations (eager per-attempt writes, in-memory
+health, no async, router lock still held across storage calls).
