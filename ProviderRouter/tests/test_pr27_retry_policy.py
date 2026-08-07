@@ -6,7 +6,7 @@ from typing import Any, cast
 
 import pytest
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     ConfigError,

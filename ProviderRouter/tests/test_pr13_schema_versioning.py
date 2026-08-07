@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     DuckDBMetricsStore,
@@ -16,9 +16,9 @@ from nygen_router import (
     MetricsSchemaMismatchError,
     SQLiteMetricsStore,
 )
-from nygen_router.storage.admin import LocalBackend, create_database, inspect_database
-from nygen_router.storage.base import event_to_params, event_to_record, record_to_event
-from nygen_router.storage.schema import (
+from llm_provider_router.storage.admin import LocalBackend, create_database, inspect_database
+from llm_provider_router.storage.base import event_to_params, event_to_record, record_to_event
+from llm_provider_router.storage.schema import (
     CREATE_PROVIDER_ATTEMPTS_TABLE_SQL,
     METRICS_SCHEMA_VERSION,
     SCHEMA_VERSIONS_TABLE,

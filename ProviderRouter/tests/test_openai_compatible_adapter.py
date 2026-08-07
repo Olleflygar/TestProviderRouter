@@ -8,9 +8,9 @@ from typing import Any
 import httpx
 import pytest
 
-from nygen_router import ApiProtocol, NormalizedStream, ProviderConfig
-from nygen_router.adapters.openai_compatible import OpenAICompatibleAdapter
-from nygen_router.errors import (
+from llm_provider_router import ApiProtocol, NormalizedStream, ProviderConfig
+from llm_provider_router.adapters.openai_compatible import OpenAICompatibleAdapter
+from llm_provider_router.errors import (
     InvalidOperationArgumentsError,
     ProviderConnectionError,
     ProviderError,

@@ -5,7 +5,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 from pydantic import ValidationError
 
-from nygen_router import (
+from llm_provider_router import (
     CallType,
     ProviderScore,
     ProviderStats,

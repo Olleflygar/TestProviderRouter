@@ -8,7 +8,7 @@ import pytest
 from metrics_store_helpers import zero_score_aggregates
 from pydantic import ValidationError
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     CallVariant,
@@ -29,8 +29,8 @@ from nygen_router import (
     ScoreAggregateQuery,
     UnsupportedOperationError,
 )
-from nygen_router.errors import ErrorCategory, categorize_error
-from nygen_router.health import ProviderHealthState
+from llm_provider_router.errors import ErrorCategory, categorize_error
+from llm_provider_router.health import ProviderHealthState
 
 
 class _FakeClock:
@@ -449,7 +449,7 @@ def test_first_bench_warns_once_with_the_verbatim_error(caplog: pytest.LogCaptur
     clock = _FakeClock()
     router = _router([_config("provider_a")], script, clock=clock, health={"failure_threshold": 1})
 
-    with caplog.at_level(logging.DEBUG, logger="nygen_router.router"):
+    with caplog.at_level(logging.DEBUG, logger="llm_provider_router.router"):
         _fail(router)
 
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
@@ -466,7 +466,7 @@ def test_repeat_bench_within_one_episode_logs_debug_not_warning(
     clock = _FakeClock()
     router = _router([_config("provider_a")], script, clock=clock, health={"failure_threshold": 1})
 
-    with caplog.at_level(logging.DEBUG, logger="nygen_router.router"):
+    with caplog.at_level(logging.DEBUG, logger="llm_provider_router.router"):
         _fail(router)  # first bench: warns
         clock.advance(60.0)
         _fail(router)  # probe fails, re-benched with no success in between
@@ -484,7 +484,7 @@ def test_first_success_after_a_bench_logs_one_recovery_line(
     _fail(router)
     clock.advance(60.0)
 
-    with caplog.at_level(logging.INFO, logger="nygen_router.router"):
+    with caplog.at_level(logging.INFO, logger="llm_provider_router.router"):
         router.invoke(_calls())  # recovers
         router.invoke(_calls())  # already healthy; must not log again
 
@@ -500,7 +500,7 @@ def test_a_bench_after_a_recovery_warns_again(caplog: pytest.LogCaptureFixture) 
     clock = _FakeClock()
     router = _router([_config("provider_a")], script, clock=clock, health={"failure_threshold": 1})
 
-    with caplog.at_level(logging.DEBUG, logger="nygen_router.router"):
+    with caplog.at_level(logging.DEBUG, logger="llm_provider_router.router"):
         _fail(router)  # bench: warns
         clock.advance(60.0)
         router.invoke(_calls())  # recovers, ending the episode
@@ -662,7 +662,7 @@ def test_reset_health_rearms_the_bench_warning(caplog: pytest.LogCaptureFixture)
     clock = _FakeClock()
     router = _router([_config("provider_a")], script, clock=clock, health={"failure_threshold": 1})
 
-    with caplog.at_level(logging.DEBUG, logger="nygen_router.router"):
+    with caplog.at_level(logging.DEBUG, logger="llm_provider_router.router"):
         _fail(router)
         router.reset_health("provider_a")
         _fail(router)

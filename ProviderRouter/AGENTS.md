@@ -8,7 +8,7 @@ Implementation rules for this package:
   The constraints below describe the current implementation. An explicitly
   scoped roadmap item may replace the corresponding current constraint, but
   unrelated work must not pull planned features forward.
-- Core imports must stay lightweight: `from nygen_router import ProviderRouter`
+- Core imports must stay lightweight: `from llm_provider_router import ProviderRouter`
   must never require any provider SDK to be installed.
 - No provider SDK imports at module level, anywhere -- not even inside an
   adapter module. Always lazy-import inside the method body that actually

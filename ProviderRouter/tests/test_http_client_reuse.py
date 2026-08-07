@@ -19,14 +19,14 @@ from typing import Any
 import httpx
 import pytest
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     CallVariant,
     ProviderConfig,
     ProviderRouter,
 )
-from nygen_router.adapters.openai_compatible import OpenAICompatibleAdapter
+from llm_provider_router.adapters.openai_compatible import OpenAICompatibleAdapter
 
 
 def _provider(provider_id: str, **overrides: Any) -> ProviderConfig:

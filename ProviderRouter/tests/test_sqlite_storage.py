@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from nygen_router import ApiProtocol, CallType, MetricsEvent, SQLiteMetricsStore
-from nygen_router.storage.base import MetricsSchemaMismatchError
+from llm_provider_router import ApiProtocol, CallType, MetricsEvent, SQLiteMetricsStore
+from llm_provider_router.storage.base import MetricsSchemaMismatchError
 
 # The provider_attempts schema as it stood before PR 23 added its two columns,
 # so a file written by an earlier version can be built here for real.

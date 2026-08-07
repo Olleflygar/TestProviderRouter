@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import pytest
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     InvalidOperationArgumentsError,
     NormalizedStream,
@@ -22,8 +22,8 @@ from nygen_router import (
     ProviderTimeoutError,
     UnsupportedOperationError,
 )
-from nygen_router.adapters.openai_responses import OpenAIResponsesAdapter
-from nygen_router.errors import ErrorCategory, categorize_error
+from llm_provider_router.adapters.openai_responses import OpenAIResponsesAdapter
+from llm_provider_router.errors import ErrorCategory, categorize_error
 
 
 def _config(*, timeout_seconds: float = 12.5) -> ProviderConfig:
@@ -540,7 +540,7 @@ def test_malformed_sse_payload_leaves_as_router_error() -> None:
         next(stream)
 
     assert exc_info.value.provider_id == "responses_provider"
-    assert type(exc_info.value).__module__.startswith("nygen_router.")
+    assert type(exc_info.value).__module__.startswith("llm_provider_router.")
     assert isinstance(exc_info.value.__cause__, ValueError)
 
 

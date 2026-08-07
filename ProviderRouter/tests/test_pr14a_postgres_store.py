@@ -21,7 +21,7 @@ from postgres_helpers import (
     skip_reason,
 )
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     MetricsEvent,
@@ -29,11 +29,11 @@ from nygen_router import (
     ScoreAggregateProvider,
     ScoreAggregateQuery,
 )
-from nygen_router.storage.postgres import (
+from llm_provider_router.storage.postgres import (
     PostgresMetricsStore,
     PostgresPoolMode,
 )
-from nygen_router.storage.score_aggregation import (
+from llm_provider_router.storage.score_aggregation import (
     ExponentialScoreWeighting,
     FlatScoreWeighting,
 )

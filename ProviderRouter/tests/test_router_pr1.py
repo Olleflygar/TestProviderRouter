@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     CallVariant,
@@ -13,7 +13,7 @@ from nygen_router import (
     ProviderConfig,
     ProviderRouter,
 )
-from nygen_router.errors import (
+from llm_provider_router.errors import (
     NoEligibleProvidersError,
     NoProvidersConfiguredError,
 )

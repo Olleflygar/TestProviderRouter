@@ -8,12 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from nygen_router.cli import main
+from llm_provider_router.cli import main
 
 
 def _run(*arguments: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "nygen_router.cli", *arguments],
+        [sys.executable, "-m", "llm_provider_router.cli", *arguments],
         check=False,
         capture_output=True,
         text=True,
@@ -181,7 +181,7 @@ class DuckDBBlocker(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, DuckDBBlocker())
 sys.path.insert(0, {str(source_root)!r})
-from nygen_router.cli import main
+from llm_provider_router.cli import main
 raise SystemExit(main(['storage', 'create', '--backend', 'sqlite', '--path', {str(path)!r}]))
 """
 
@@ -215,7 +215,7 @@ class DuckDBBlocker(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, DuckDBBlocker())
 sys.path.insert(0, {str(source_root)!r})
-from nygen_router.cli import main
+from llm_provider_router.cli import main
 raise SystemExit(main(['storage', 'inspect', '--backend', 'duckdb', '--path', {str(path)!r}]))
 """
 
@@ -229,5 +229,5 @@ raise SystemExit(main(['storage', 'inspect', '--backend', 'duckdb', '--path', {s
     assert result.returncode == 3
     assert result.stdout == ""
     assert "pip install" in result.stderr
-    assert "nygen-router[duckdb]" in result.stderr
+    assert "llm-provider-router[duckdb]" in result.stderr
     assert "Traceback" not in result.stderr

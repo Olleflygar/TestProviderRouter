@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     CallVariant,
@@ -33,8 +33,8 @@ from nygen_router import (
     ScoreBasedPolicy,
     redact_postgres_url,
 )
-from nygen_router.cli import POSTGRES_URL_ENV, main
-from nygen_router.storage.score_aggregation import FlatScoreWeighting
+from llm_provider_router.cli import POSTGRES_URL_ENV, main
+from llm_provider_router.storage.score_aggregation import FlatScoreWeighting
 
 _PSYCOPG_AVAILABLE = importlib.util.find_spec("psycopg") is not None
 
@@ -166,11 +166,11 @@ class TestMissingDriver:
         with caplog.at_level(logging.WARNING):
             store = PostgresMetricsStore("postgresql://h/db", driver_available=False)
         assert store.available is False
-        assert "nygen-router[postgres]" in caplog.text
+        assert "llm-provider-router[postgres]" in caplog.text
 
     def test_first_use_raises_an_actionable_import_error(self) -> None:
         store = PostgresMetricsStore("postgresql://h/db", driver_available=False)
-        with pytest.raises(ImportError, match=r"nygen-router\[postgres\]"):
+        with pytest.raises(ImportError, match=r"llm-provider-router\[postgres\]"):
             store.record_attempt(_event())
 
     def test_close_before_any_use_is_harmless(self) -> None:

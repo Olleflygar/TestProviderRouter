@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from nygen_router import ApiProtocol, ProviderConfig
-from nygen_router.errors import MissingApiKeyError
+from llm_provider_router import ApiProtocol, ProviderConfig
+from llm_provider_router.errors import MissingApiKeyError
 
 
 def test_valid_openai_compatible_config() -> None:

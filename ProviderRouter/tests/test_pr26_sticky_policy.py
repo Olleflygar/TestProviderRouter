@@ -7,7 +7,7 @@ from typing import Any, cast
 import pytest
 from metrics_store_helpers import aggregate_events_for_score_query
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     ConfigError,

@@ -10,6 +10,9 @@ venv/
 .coverage
 .coverage.*
 htmlcov/
+build/
+dist/
+*.egg-info/
 WorkflowTests/*.duckdb
 WorkflowTests/*.duckdb.wal
 

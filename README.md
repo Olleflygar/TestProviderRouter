@@ -63,7 +63,7 @@ observations stored in DuckDB. With no history, its round-robin tie breaker give
 each provider a chance to collect observations.
 
 ```python
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     CallVariant,
@@ -154,8 +154,8 @@ Use the separate administrator CLI to inspect, create, or explicitly migrate a
 local target:
 
 ```sh
-nygen-router storage inspect --backend duckdb --default
-nygen-router storage create --backend sqlite --path ./router_metrics.sqlite
+llm-provider-router storage inspect --backend duckdb --default
+llm-provider-router storage create --backend sqlite --path ./router_metrics.sqlite
 ```
 
 `inspect` never creates or changes a file. `create` accepts only an absent
@@ -171,7 +171,7 @@ The default router automatically reuses only
 discovered automatically; configure it explicitly:
 
 ```python
-from nygen_router import DuckDBMetricsStore, ProviderRouter, SQLiteMetricsStore
+from llm_provider_router import DuckDBMetricsStore, ProviderRouter, SQLiteMetricsStore
 
 metrics_store = DuckDBMetricsStore("/chosen/path/metrics.duckdb")
 # Or: metrics_store = SQLiteMetricsStore("/chosen/path/metrics.sqlite")
@@ -180,8 +180,8 @@ router = ProviderRouter(..., metrics_store=metrics_store)
 
 PostgreSQL/Supabase is available as the optional shared organizational backend
 through `PostgresMetricsStore`, using the standard PostgreSQL protocol (never
-the Supabase Data API or SDK). Install `nygen-router[postgres]`, provision the
-schema deliberately with `nygen-router storage create --backend postgres`, and
+the Supabase Data API or SDK). Install `llm-provider-router[postgres]`, provision the
+schema deliberately with `llm-provider-router storage create --backend postgres`, and
 pass the store as `metrics_store=`; it is a live scoring source, and the router
 never creates or alters a remote schema. Full setup, connection settings, and
 Supabase guidance are in `ProviderRouter/README.md` under "PostgreSQL and

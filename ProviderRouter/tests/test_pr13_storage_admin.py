@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from nygen_router import ApiProtocol, CallType, MetricsEvent
-from nygen_router.storage.admin import (
+from llm_provider_router import ApiProtocol, CallType, MetricsEvent
+from llm_provider_router.storage.admin import (
     LocalBackend,
     StorageAdministrationError,
     StorageBackupError,
@@ -21,8 +21,8 @@ from nygen_router.storage.admin import (
     inspect_database,
     migrate_database,
 )
-from nygen_router.storage.base import event_to_params
-from nygen_router.storage.schema import (
+from llm_provider_router.storage.base import event_to_params
+from llm_provider_router.storage.schema import (
     CREATE_PROVIDER_ATTEMPTS_TABLE_SQL,
     CREATE_SCHEMA_VERSIONS_TABLE_SQL,
     METRICS_COMPONENT,

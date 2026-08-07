@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 from metrics_store_helpers import zero_score_aggregates
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     CallVariant,

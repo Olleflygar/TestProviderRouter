@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from nygen_router import (
+from llm_provider_router import (
     ExponentialScoreWeighting,
     MetricsEvent,
     ScoreAggregate,
     ScoreAggregateQuery,
 )
-from nygen_router.errors import ErrorCategory
+from llm_provider_router.errors import ErrorCategory
 
 
 def aggregate_events_for_score_query(

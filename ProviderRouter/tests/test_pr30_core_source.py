@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     ConfigError,
@@ -25,8 +25,8 @@ from nygen_router import (
     ScoreBasedPolicy,
     SQLiteMetricsStore,
 )
-from nygen_router.metrics import MetricsEvent
-from nygen_router.storage.score_aggregation import validate_score_aggregates
+from llm_provider_router.metrics import MetricsEvent
+from llm_provider_router.storage.score_aggregation import validate_score_aggregates
 
 
 def _provider(provider_id: str) -> ProviderConfig:
@@ -248,7 +248,7 @@ def test_score_policy_all_scope_omits_only_scope_filter_and_deduplicates_failure
         call_type=CallType.REGULAR,
     )
 
-    with caplog.at_level(logging.DEBUG, logger="nygen_router.policies.score_based"):
+    with caplog.at_level(logging.DEBUG, logger="llm_provider_router.policies.score_based"):
         first = policy.order([a, b], context)
         second = policy.order([a, b], context)
 

@@ -90,7 +90,7 @@ def shared_store() -> object:
     """
     global _shared_store
     if _shared_store is None:
-        from nygen_router import PostgresMetricsStore
+        from llm_provider_router import PostgresMetricsStore
 
         url = postgres_url()
         assert url is not None
@@ -121,8 +121,8 @@ def ensure_schema(url: str) -> None:
     global _schema_ready
     if _schema_ready:
         return
-    from nygen_router.storage.admin import create_postgres_database, inspect_postgres_database
-    from nygen_router.storage.schema import SchemaState
+    from llm_provider_router.storage.admin import create_postgres_database, inspect_postgres_database
+    from llm_provider_router.storage.schema import SchemaState
 
     if inspect_postgres_database(url).schema.state is SchemaState.MISSING:
         create_postgres_database(url)
@@ -147,8 +147,8 @@ def restore_schema(url: str) -> None:
     reported as a test error. Nothing under test is retried: the store's own
     failure behavior is asserted deterministically elsewhere.
     """
-    from nygen_router.storage.admin import inspect_postgres_database
-    from nygen_router.storage.schema import SchemaState
+    from llm_provider_router.storage.admin import inspect_postgres_database
+    from llm_provider_router.storage.schema import SchemaState
 
     for attempt in (1, 2):
         try:
@@ -175,8 +175,8 @@ def reset_schema(url: str) -> None:
     """
     import psycopg
 
-    from nygen_router.storage.admin import create_postgres_database
-    from nygen_router.storage.schema import SCHEMA_VERSIONS_TABLE
+    from llm_provider_router.storage.admin import create_postgres_database
+    from llm_provider_router.storage.schema import SCHEMA_VERSIONS_TABLE
 
     with psycopg.connect(url, connect_timeout=15) as connection:
         connection.execute("DROP TABLE IF EXISTS provider_attempts")
@@ -190,7 +190,7 @@ def drop_schema(url: str) -> None:
     """Remove the metrics schema entirely, leaving an un-provisioned database."""
     import psycopg
 
-    from nygen_router.storage.schema import SCHEMA_VERSIONS_TABLE
+    from llm_provider_router.storage.schema import SCHEMA_VERSIONS_TABLE
 
     with psycopg.connect(url, connect_timeout=15) as connection:
         connection.execute("DROP TABLE IF EXISTS provider_attempts")

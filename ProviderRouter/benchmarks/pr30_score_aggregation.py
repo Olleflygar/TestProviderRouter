@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     DuckDBMetricsStore,
@@ -29,15 +29,15 @@ from nygen_router import (
     SQLiteMetricsStore,
     aggregate_stats,
 )
-from nygen_router.metrics import MetricsEvent
-from nygen_router.storage.admin import LocalBackend, create_database
-from nygen_router.storage.base import INSERT_PROVIDER_ATTEMPT_SQL
-from nygen_router.storage.schema import (
+from llm_provider_router.metrics import MetricsEvent
+from llm_provider_router.storage.admin import LocalBackend, create_database
+from llm_provider_router.storage.base import INSERT_PROVIDER_ATTEMPT_SQL
+from llm_provider_router.storage.schema import (
     DUCKDB_REQUIRED_METRICS_INDEXES,
     SQLITE_REQUIRED_METRICS_INDEXES,
     IndexDefinition,
 )
-from nygen_router.storage.score_aggregation import provider_stats_from_score_aggregate
+from llm_provider_router.storage.score_aggregation import provider_stats_from_score_aggregate
 
 MINIMUM_ROWS = 50_000
 DEFAULT_ROWS = 60_000

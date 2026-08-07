@@ -1,6 +1,6 @@
-# nygen-router
+# llm-provider-router
 
-`nygen-router` is a lightweight foundation for routing a native, provider-specific
+`llm-provider-router` is a lightweight foundation for routing a native, provider-specific
 API call to one of several providers that can serve the same model. It does not
 translate your request into a shared internal schema: you supply the exact
 arguments the provider's own SDK expects, the router picks an eligible provider,
@@ -50,8 +50,8 @@ pytest
 pytest tests/test_config.py -v
 ```
 
-If you see `ModuleNotFoundError: No module named 'nygen_router'`, you are likely
-using the wrong Python (for example conda's `provider-router` instead of
+If you see `ModuleNotFoundError: No module named 'llm_provider_router'`, you are likely
+using the wrong Python (for example conda's `llm-provider-router` instead of
 `.venv/bin/python`). Select the `.venv` interpreter in your IDE, or run:
 
 ```sh
@@ -61,7 +61,7 @@ using the wrong Python (for example conda's `provider-router` instead of
 ## Minimal Usage
 
 ```python
-from nygen_router import ApiProtocol, CallType, CallVariant, ProviderConfig, ProviderRouter
+from llm_provider_router import ApiProtocol, CallType, CallVariant, ProviderConfig, ProviderRouter
 
 router = ProviderRouter(
     providers=[
@@ -197,13 +197,13 @@ stateful continuation; stateless calls are safe across interchangeable providers
 
 ## Installing the openai SDK
 
-The core package (`from nygen_router import ProviderRouter`) never requires any
+The core package (`from llm_provider_router import ProviderRouter`) never requires any
 provider SDK -- that import always works with just `pydantic` installed. The
 `OPENAI_CHAT` and `OPENAI_RESPONSES` adapters lazily import `openai` only when
 actually invoked, so install the matching extra to use either:
 
 ```sh
-pip install "nygen-router[openai]"
+pip install "llm-provider-router[openai]"
 ```
 
 ```sh
@@ -225,7 +225,7 @@ The recommended batteries-included install adds DuckDB too, so metrics
 persistence (see below) works out of the box:
 
 ```sh
-pip install "nygen-router[openai,duckdb]"
+pip install "llm-provider-router[openai,duckdb]"
 ```
 
 ## Hard filtering
@@ -312,7 +312,7 @@ Round robin plus fallback is the default with no configuration. To override the
 selection order, pass a `policy` to the constructor:
 
 ```python
-from nygen_router import ProviderRouter, RoundRobinPolicy
+from llm_provider_router import ProviderRouter, RoundRobinPolicy
 
 router = ProviderRouter(
     providers=[...], metrics_scope="my-application:production", policy=RoundRobinPolicy()
@@ -327,7 +327,7 @@ providers tried first in a fixed order. It is enabled only through the existing
 unchanged.
 
 ```python
-from nygen_router import ProviderRouter, ScoreBasedPolicy, StickyRoutingPolicy
+from llm_provider_router import ProviderRouter, ScoreBasedPolicy, StickyRoutingPolicy
 
 router = ProviderRouter(
     providers=providers,
@@ -396,7 +396,7 @@ the already-computed order, with normal cross-provider fallback. Provider SDK
 retries stay disabled so router-controlled attempts remain visible.
 
 ```python
-from nygen_router import ProviderRouter, SameProviderRetryPolicy
+from llm_provider_router import ProviderRouter, SameProviderRetryPolicy
 
 router = ProviderRouter(
     providers=providers,
@@ -420,7 +420,7 @@ highest-ranked provider; with sticky routing it is the first eligible sticky
 provider. Fallback providers still receive their ordinary base attempts.
 
 ```python
-from nygen_router import RetryProviderScope, SameProviderRetryPolicy
+from llm_provider_router import RetryProviderScope, SameProviderRetryPolicy
 
 retry_first = SameProviderRetryPolicy()
 retry_all = SameProviderRetryPolicy(provider_scope=RetryProviderScope.ALL)
@@ -538,7 +538,7 @@ Pass a `HealthConfig` to override any of the three knobs. The two cooldowns are
 separate settings that happen to share a default, so they can diverge:
 
 ```python
-from nygen_router import HealthConfig, ProviderRouter
+from llm_provider_router import HealthConfig, ProviderRouter
 
 router = ProviderRouter(
     providers=[...],
@@ -599,7 +599,7 @@ means "this provider may be tried again now", not "forget what happened".
 
 ### Seeing benches
 
-Benches are reported on the standard library logger `nygen_router.router`:
+Benches are reported on the standard library logger `llm_provider_router.router`:
 
 - The first bench of an outage logs one **WARNING** naming the provider, the
   trigger, the bench duration, and the provider's verbatim error text -- so a
@@ -613,7 +613,7 @@ Benches are reported on the standard library logger `nygen_router.router`:
 import logging
 
 logging.basicConfig(level=logging.INFO)  # WARNING benches + INFO recoveries
-logging.getLogger("nygen_router.router").setLevel(logging.DEBUG)  # every bench
+logging.getLogger("llm_provider_router.router").setLevel(logging.DEBUG)  # every bench
 ```
 
 ### Two caveats worth knowing
@@ -713,7 +713,7 @@ be discarded** -- the new provider starts its answer over from the beginning.
 That is never allowed to happen silently:
 
 ```python
-from nygen_router import ProviderRouter, StreamRestart
+from llm_provider_router import ProviderRouter, StreamRestart
 
 
 def on_restart(restart: StreamRestart) -> None:
@@ -738,7 +738,7 @@ far is on the returned stream as `.restarts`.
 To stop on any mid-stream failure rather than regenerate, set the policy:
 
 ```python
-from nygen_router import ProviderRouter, StreamFailurePolicy
+from llm_provider_router import ProviderRouter, StreamFailurePolicy
 
 router = ProviderRouter(
     providers=[...],
@@ -856,7 +856,7 @@ routing policies. The frozen typed Python API accepts only the explicit
 `LocalBackend.DUCKDB` or `LocalBackend.SQLITE` selector:
 
 ```python
-from nygen_router import (
+from llm_provider_router import (
     LocalBackend,
     create_database,
     inspect_database,
@@ -901,10 +901,10 @@ fails. Backups are never automatic.
 The same implementation is exposed by the standard-library CLI:
 
 ```sh
-nygen-router storage inspect --backend duckdb --default
-nygen-router storage inspect --backend sqlite --path ./metrics.sqlite
-nygen-router storage create --backend duckdb --path ./metrics.duckdb
-nygen-router storage migrate --backend sqlite --path ./metrics.sqlite \
+llm-provider-router storage inspect --backend duckdb --default
+llm-provider-router storage inspect --backend sqlite --path ./metrics.sqlite
+llm-provider-router storage create --backend duckdb --path ./metrics.duckdb
+llm-provider-router storage migrate --backend sqlite --path ./metrics.sqlite \
   --backup ./metrics.before-migration.sqlite
 ```
 
@@ -920,7 +920,7 @@ source, environment variables, configuration, or a running router and does not
 make that router discover it. Pass the concrete path explicitly:
 
 ```python
-from nygen_router import DuckDBMetricsStore, ProviderRouter, SQLiteMetricsStore
+from llm_provider_router import DuckDBMetricsStore, ProviderRouter, SQLiteMetricsStore
 
 metrics_store = DuckDBMetricsStore("/chosen/path/metrics.duckdb")
 # or
@@ -932,7 +932,7 @@ router = ProviderRouter(..., metrics_store=metrics_store)
 `metrics_store` is a `ProviderRouter` constructor parameter with three forms:
 
 ```python
-from nygen_router import DuckDBMetricsStore, ProviderRouter, SQLiteMetricsStore
+from llm_provider_router import DuckDBMetricsStore, ProviderRouter, SQLiteMetricsStore
 
 # 1. Default: not passed at all -- a DuckDBMetricsStore at ~/.nygen_router/metrics.duckdb
 router = ProviderRouter(providers=[...], metrics_scope="my-application:production")
@@ -951,7 +951,7 @@ router = ProviderRouter(
 ```
 
 `DuckDBMetricsStore` is the default: an embedded, no-server-to-run database,
-requiring `pip install "nygen-router[duckdb]"`. Without that extra installed,
+requiring `pip install "llm-provider-router[duckdb]"`. Without that extra installed,
 `ProviderRouter` still constructs (logging one warning) and `invoke()` still
 works -- the write attempt fails with an `ImportError`, which is treated like
 any other storage failure: the successful provider response is still
@@ -969,11 +969,11 @@ multi-machine routing history, use `PostgresMetricsStore` — see
 its aggregates on the routing path exactly as it does for the local backends.
 
 ```sh
-pip install "nygen-router[postgres]"
+pip install "llm-provider-router[postgres]"
 ```
 
 ```python
-from nygen_router import PostgresMetricsStore, ProviderRouter
+from llm_provider_router import PostgresMetricsStore, ProviderRouter
 
 metrics_store = PostgresMetricsStore(
     "postgresql://app_user:...@db.example.com:5432/routing",
@@ -988,7 +988,7 @@ router = ProviderRouter(
 
 It speaks the standard PostgreSQL protocol through `psycopg`, so it works with
 conventional PostgreSQL deployments and with Supabase alike. It never uses the
-Supabase Data API or client SDK. Importing `nygen_router` or using the local
+Supabase Data API or client SDK. Importing `llm_provider_router` or using the local
 backends never loads `psycopg`; constructing the store without the extra logs
 one warning and raises an install hint at first use.
 
@@ -997,15 +997,15 @@ on first use, not ever. Run it once with a schema-owning role:
 
 ```sh
 export NYGEN_ROUTER_POSTGRES_URL='postgresql://owner:...@db.example.com:5432/routing'
-nygen-router storage create --backend postgres
-nygen-router storage inspect --backend postgres
+llm-provider-router storage create --backend postgres
+llm-provider-router storage inspect --backend postgres
 ```
 
 Prefer the environment variable over `--url`, which would put the password in
 your shell history and the process list. If you run your own migration
 tooling, apply `CREATE_PROVIDER_ATTEMPTS_TABLE_POSTGRES_SQL` and
 `CREATE_SCHEMA_VERSIONS_TABLE_POSTGRES_SQL` from
-`nygen_router.storage.schema` directly and skip the command entirely. Give the
+`llm_provider_router.storage.schema` directly and skip the command entirely. Give the
 application's runtime role only `INSERT`/`SELECT` on `provider_attempts` and
 `SELECT` on `nygen_router_schema_versions`. The store validates the schema
 once per instance, on its first connection, and a mismatch raises an
@@ -1210,7 +1210,7 @@ direct analysis and is the semantic oracle used to verify database aggregation:
 ```python
 from datetime import UTC, datetime, timedelta
 
-from nygen_router import CallType, aggregate_stats
+from llm_provider_router import CallType, aggregate_stats
 
 store = SQLiteMetricsStore("metrics.sqlite")
 events = store.query_recent(
@@ -1311,7 +1311,7 @@ descoped.
 hands the full best-first list to the router's existing fallback loop:
 
 ```python
-from nygen_router import HistoryScope, ProviderRouter, ScoreBasedPolicy, ScoreWeights
+from llm_provider_router import HistoryScope, ProviderRouter, ScoreBasedPolicy, ScoreWeights
 
 policy = ScoreBasedPolicy(
     weights=ScoreWeights(success_weight=2.0, speed_weight=1.0),
@@ -1468,7 +1468,7 @@ debugging. The contract:
   `__cause__` and `.original`.
 
 ```python
-from nygen_router import ProviderHTTPError, ProviderRouter
+from llm_provider_router import ProviderHTTPError, ProviderRouter
 
 try:
     router.invoke([...])

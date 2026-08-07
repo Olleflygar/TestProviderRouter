@@ -28,13 +28,13 @@ import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
-from nygen_router import ApiProtocol, CallType, ErrorCategory, PostgresMetricsStore
-from nygen_router.metrics import MetricsEvent
-from nygen_router.storage.schema import (
+from llm_provider_router import ApiProtocol, CallType, ErrorCategory, PostgresMetricsStore
+from llm_provider_router.metrics import MetricsEvent
+from llm_provider_router.storage.schema import (
     POSTGRES_REQUIRED_METRICS_INDEXES,
     SCHEMA_VERSIONS_TABLE,
 )
-from nygen_router.storage.score_aggregation import (
+from llm_provider_router.storage.score_aggregation import (
     ExponentialScoreWeighting,
     FlatScoreWeighting,
     ScoreAggregateProvider,
@@ -144,7 +144,7 @@ def _seed(store: PostgresMetricsStore, events: Sequence[MetricsEvent]) -> float:
 
 
 def _reset(store: PostgresMetricsStore) -> None:
-    from nygen_router.storage.admin import create_postgres_database
+    from llm_provider_router.storage.admin import create_postgres_database
 
     with store._connection(validate=False) as connection:
         connection.execute("DROP TABLE IF EXISTS provider_attempts")

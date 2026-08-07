@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     CallVariant,
@@ -11,8 +11,8 @@ from nygen_router import (
     ProviderConfig,
     ProviderRouter,
 )
-from nygen_router.filters import filter_eligible_providers
-from nygen_router.health import CooldownTrigger, ProviderHealthState
+from llm_provider_router.filters import filter_eligible_providers
+from llm_provider_router.health import CooldownTrigger, ProviderHealthState
 
 SUPPORTED = frozenset({ApiProtocol.OPENAI_CHAT})
 REQUESTED = frozenset({ApiProtocol.OPENAI_CHAT})

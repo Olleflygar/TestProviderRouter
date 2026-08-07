@@ -31,7 +31,7 @@ class OptionalDependencyBlocker(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, OptionalDependencyBlocker())
 sys.path.insert(0, {str(source_root)!r})
-from nygen_router import (
+from llm_provider_router import (
     ErrorCategory,
     LocalBackend,
     PostgresConfig,
@@ -66,7 +66,7 @@ assert store.effective_sslmode == "require"
 try:
     store.query_recent(since=__import__("datetime").datetime.now(__import__("datetime").UTC))
 except ImportError as exc:
-    assert "nygen-router[postgres]" in str(exc)
+    assert "llm-provider-router[postgres]" in str(exc)
 else:
     raise AssertionError("expected an ImportError naming the postgres extra")
 assert not ({{

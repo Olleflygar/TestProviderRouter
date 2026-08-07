@@ -21,20 +21,20 @@ from postgres_helpers import (
     skip_reason,
 )
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     MetricsEvent,
     MetricsSchemaMismatchError,
     PostgresMetricsStore,
 )
-from nygen_router.cli import POSTGRES_URL_ENV, main
-from nygen_router.storage.admin import (
+from llm_provider_router.cli import POSTGRES_URL_ENV, main
+from llm_provider_router.storage.admin import (
     StorageTargetError,
     create_postgres_database,
     inspect_postgres_database,
 )
-from nygen_router.storage.schema import (
+from llm_provider_router.storage.schema import (
     METRICS_SCHEMA_VERSION,
     POSTGRES_REQUIRED_METRICS_INDEXES,
     SCHEMA_VERSIONS_TABLE,

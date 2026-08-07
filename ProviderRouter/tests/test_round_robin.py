@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     CallVariant,

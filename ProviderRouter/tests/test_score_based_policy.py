@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from metrics_store_helpers import aggregate_events_for_score_query
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     CallVariant,
@@ -278,7 +278,7 @@ def test_query_failure_degrades_to_tie_break_order_and_deduplicates_warning(
         metrics_scope="test", call_type=CallType.REGULAR, metrics_store=_FailingStore()
     )
 
-    with caplog.at_level(logging.DEBUG, logger="nygen_router.policies.score_based"):
+    with caplog.at_level(logging.DEBUG, logger="llm_provider_router.policies.score_based"):
         first = policy.order(providers, context)
         second = policy.order(providers, context)
 

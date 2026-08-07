@@ -8,7 +8,7 @@ import httpx
 import pytest
 from metrics_store_helpers import zero_score_aggregates
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     CallVariant,
@@ -31,7 +31,7 @@ from nygen_router import (
     UnsupportedOperationError,
     UnsupportedProtocolError,
 )
-from nygen_router.adapters.openai_responses import OpenAIResponsesAdapter
+from llm_provider_router.adapters.openai_responses import OpenAIResponsesAdapter
 
 
 class _StaticPolicy:

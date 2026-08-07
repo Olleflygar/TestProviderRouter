@@ -66,8 +66,8 @@ jobs:
       - name: Install package with dev dependencies
         run: python -m pip install -e ".[dev]"
       - name: Provision the schema through the supported route
-        run: python -m nygen_router storage create --backend postgres
+        run: python -m llm_provider_router storage create --backend postgres
       - name: Confirm the provisioned schema inspects clean
-        run: python -m nygen_router storage inspect --backend postgres
+        run: python -m llm_provider_router storage inspect --backend postgres
       - name: Run the full suite against real PostgreSQL
         run: python -m pytest

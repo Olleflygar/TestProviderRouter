@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from nygen_router import ApiProtocol, CallType, MetricsEvent
-from nygen_router.storage.base import MetricsSchemaMismatchError
-from nygen_router.storage.duckdb import DuckDBMetricsStore
+from llm_provider_router import ApiProtocol, CallType, MetricsEvent
+from llm_provider_router.storage.base import MetricsSchemaMismatchError
+from llm_provider_router.storage.duckdb import DuckDBMetricsStore
 
 _DUCKDB_AVAILABLE = importlib.util.find_spec("duckdb") is not None
 requires_duckdb = pytest.mark.skipif(not _DUCKDB_AVAILABLE, reason="duckdb is not installed")
@@ -69,7 +69,7 @@ def test_custom_path_is_honored(tmp_path: Path) -> None:
 
 def test_sdk_available_false_logs_exactly_one_warning(caplog: pytest.LogCaptureFixture) -> None:
     """The seam works with duckdb installed too -- sdk_available overrides the real check."""
-    with caplog.at_level(logging.WARNING, logger="nygen_router.storage.duckdb"):
+    with caplog.at_level(logging.WARNING, logger="llm_provider_router.storage.duckdb"):
         DuckDBMetricsStore(sdk_available=False)
 
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
@@ -80,7 +80,7 @@ def test_sdk_available_false_logs_exactly_one_warning(caplog: pytest.LogCaptureF
 def test_sdk_available_false_warns_only_once_when_router_writes(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from nygen_router import CallVariant, ProviderConfig, ProviderRouter
+    from llm_provider_router import CallVariant, ProviderConfig, ProviderRouter
 
     class _Adapter:
         def invoke(self, operation: str, arguments: dict[str, object]) -> str:

@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 from metrics_store_helpers import zero_score_aggregates
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     CallVariant,
@@ -382,7 +382,7 @@ def test_restart_without_a_callback_logs_a_warning(caplog: pytest.LogCaptureFixt
     )
     router, _ = _router([_config("provider_a"), _config("provider_b")], script)
 
-    with caplog.at_level(logging.WARNING, logger="nygen_router.router"):
+    with caplog.at_level(logging.WARNING, logger="llm_provider_router.router"):
         list(router.invoke(_calls()))
 
     discard_warnings = [
@@ -639,7 +639,7 @@ def test_unrecognized_stream_shape_counts_a_clean_end_as_completed(
     script = _Script({"provider_a": [_FakeStream(["a"], marker_at=None, recognized=False)]})
     router, store = _router([_config("provider_a"), _config("provider_b")], script)
 
-    with caplog.at_level(logging.DEBUG, logger="nygen_router.router"):
+    with caplog.at_level(logging.DEBUG, logger="llm_provider_router.router"):
         assert list(router.invoke(_calls())) == ["a"]
 
     assert script.invoked == ["provider_a"]  # no fallback: nothing failed
@@ -664,7 +664,7 @@ def test_unrecognized_stream_shape_warns_once_per_operation_then_drops_to_debug(
     )
     router, _ = _router([_config("provider_a")], script)
 
-    with caplog.at_level(logging.DEBUG, logger="nygen_router.router"):
+    with caplog.at_level(logging.DEBUG, logger="llm_provider_router.router"):
         list(router.invoke(_calls()))
         list(router.invoke(_calls()))
 

@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     CallVariant,

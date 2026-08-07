@@ -54,7 +54,7 @@ no lock of its own (its pool is built for concurrent use and the router already
 serializes storage calls), and never creates or alters a remote schema.
 
 Schema inspection, creation, and migration stay on the separate typed
-`nygen_router.storage.admin` surface and the `nygen-router storage ...` CLI,
+`llm_provider_router.storage.admin` surface and the `llm-provider-router storage ...` CLI,
 which now also targets `--backend postgres` for inspect and create. Normal
 DuckDB/SQLite use may create metrics version 2 only when the configured file
 path is absent; a PostgreSQL schema is only ever created by that explicit

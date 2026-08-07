@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from nygen_router import ApiProtocol, CallType, MetricsEvent, ProviderConfig, aggregate_stats
-from nygen_router.errors import ErrorCategory
+from llm_provider_router import ApiProtocol, CallType, MetricsEvent, ProviderConfig, aggregate_stats
+from llm_provider_router.errors import ErrorCategory
 
 
 def _event(

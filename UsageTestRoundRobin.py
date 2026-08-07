@@ -11,7 +11,7 @@ ROUTER_SRC = PROJECT_ROOT / "ProviderRouter" / "src"
 # Makes this script runnable from the IDE play button without installing the package first.
 sys.path.insert(0, str(ROUTER_SRC))
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     CallVariant,

@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from metrics_store_helpers import zero_score_aggregates
 
-from nygen_router import (
+from llm_provider_router import (
     ApiProtocol,
     CallType,
     CallVariant,
@@ -221,7 +221,7 @@ def test_repeated_storage_failures_warn_once_and_include_debug_details(
     store = _RaisingStore(RuntimeError("sensitive diagnostic detail"))
     router = _router([_config("provider_a")], {}, metrics_store=store)
 
-    with caplog.at_level(logging.DEBUG, logger="nygen_router.router"):
+    with caplog.at_level(logging.DEBUG, logger="llm_provider_router.router"):
         router.invoke(_calls())
         router.invoke(_calls())
 
@@ -239,7 +239,7 @@ def test_storage_retries_and_logs_one_recovery_message(
     store = _RecoveringStore(failures=2)
     router = _router([_config("provider_a")], {}, metrics_store=store)
 
-    with caplog.at_level(logging.INFO, logger="nygen_router.router"):
+    with caplog.at_level(logging.INFO, logger="llm_provider_router.router"):
         router.invoke(_calls())
         router.invoke(_calls())
         router.invoke(_calls())

@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from nygen_router import (
+from llm_provider_router import (
     METRICS_SCHEMA_VERSION,
     ApiProtocol,
     CallType,
@@ -28,15 +28,15 @@ from nygen_router import (
     aggregate_stats,
     calculate_provider_score,
 )
-from nygen_router.cli import main
-from nygen_router.storage.admin import (
+from llm_provider_router.cli import main
+from llm_provider_router.storage.admin import (
     LocalBackend,
     StorageCompatibilityError,
     create_database,
     inspect_database,
     migrate_database,
 )
-from nygen_router.storage.schema import (
+from llm_provider_router.storage.schema import (
     CREATE_PROVIDER_ATTEMPTS_TABLE_SQL,
     CREATE_SCHEMA_VERSIONS_TABLE_SQL,
     DUCKDB_REQUIRED_METRICS_INDEXES,
@@ -45,7 +45,7 @@ from nygen_router.storage.schema import (
     SQLITE_REQUIRED_METRICS_INDEXES,
     SchemaState,
 )
-from nygen_router.storage.score_aggregation import provider_stats_from_score_aggregate
+from llm_provider_router.storage.score_aggregation import provider_stats_from_score_aggregate
 
 _DUCKDB_AVAILABLE = importlib.util.find_spec("duckdb") is not None
 Store = DuckDBMetricsStore | SQLiteMetricsStore

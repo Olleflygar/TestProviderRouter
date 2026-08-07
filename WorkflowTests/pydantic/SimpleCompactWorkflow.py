@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "ProviderRouter" / "src"))
 
-from nygen_router import (  # noqa: E402
+from llm_provider_router import (  # noqa: E402
     ApiProtocol,
     CallType,
     CallVariant,

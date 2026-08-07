@@ -13,7 +13,7 @@ WORKFLOW_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = WORKFLOW_ROOT.parent
 sys.path.insert(0, str(PROJECT_ROOT / "ProviderRouter" / "src"))
 
-from nygen_router import (  # noqa: E402
+from llm_provider_router import (  # noqa: E402
     ApiProtocol,
     CallType,
     CallVariant,

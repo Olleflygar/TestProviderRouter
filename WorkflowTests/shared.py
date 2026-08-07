@@ -20,7 +20,7 @@ METRICS_SCOPE = "workflow-tests:local"
 # Keep the scripts runnable from an IDE without installing the local package.
 sys.path.insert(0, str(ROUTER_SRC))
 
-from nygen_router import (  # noqa: E402
+from llm_provider_router import (  # noqa: E402
     ApiProtocol,
     CallType,
     CallVariant,

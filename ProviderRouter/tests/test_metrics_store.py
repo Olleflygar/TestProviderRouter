@@ -24,7 +24,7 @@ from postgres_helpers import (
     skip_reason,
 )
 
-from nygen_router import ApiProtocol, CallType, MetricsEvent, MetricsStore, SQLiteMetricsStore
+from llm_provider_router import ApiProtocol, CallType, MetricsEvent, MetricsStore, SQLiteMetricsStore
 
 _DUCKDB_AVAILABLE = importlib.util.find_spec("duckdb") is not None
 
@@ -36,7 +36,7 @@ def _sqlite_factory(tmp_path: Path) -> MetricsStore:
 
 
 def _duckdb_factory(tmp_path: Path) -> MetricsStore:
-    from nygen_router import DuckDBMetricsStore
+    from llm_provider_router import DuckDBMetricsStore
 
     return DuckDBMetricsStore(tmp_path / "metrics.duckdb")
 
