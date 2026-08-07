@@ -2,7 +2,7 @@
 
 ## Project goal
 
-Build `nygen-router`, a lightweight Python router that selects the best
+Build `llm-provider-router`, a lightweight Python router that selects the best
 configured provider for a user-chosen model. Routing decisions use observed
 latency, reliability, rate limits, provider health, and explicit caller-defined
 metrics scopes.
@@ -34,7 +34,7 @@ ahead of durable health and the remaining product layers.
 These constraints define the architectural boundaries that shipped and future
 work must preserve.
 
-- `from nygen_router import ProviderRouter` must remain lightweight.
+- `from llm_provider_router import ProviderRouter` must remain lightweight.
 - Provider and framework dependencies are optional and lazily imported.
 - Provider-native `CallVariant.arguments` remain opaque to router code. The
   router does not infer capabilities or pre-validate SDK call signatures.
@@ -136,7 +136,7 @@ call identity, and replaced implicit schema mutation with exact-schema checks.
 
 Added component-specific schema metadata, exact runtime validation, shared
 named event conversion, typed read-only/create/migrate administration, and the
-`nygen-router storage` CLI for DuckDB and SQLite. At PR13 release, normal
+`llm-provider-router storage` CLI for DuckDB and SQLite. At PR13 release, normal
 runtime initialized only an absent configured path and explicit offline
 migration could stamp the exact implicit PR29 baseline without guessing at
 unknown layouts. PR30 later retained the absent-path safety while replacing the
@@ -324,7 +324,7 @@ existing target was left untouched with an actionable error.
 The frozen typed administration records and `inspect_database`,
 `create_database`, and `migrate_database` functions are separate from the
 runtime `MetricsStore` protocol. The standard-library CLI exposes the same
-implementation as `nygen-router storage inspect|create|migrate`. Inspection
+implementation as `llm-provider-router storage inspect|create|migrate`. Inspection
 remains read-only, create atomically refuses every existing target, and any
 future migration remains offline, exclusive, route-validated, transactional,
 idempotent, and optionally protected by an explicit engine-safe validated
@@ -701,10 +701,10 @@ not obvious from the numbered roadmap alone.
   but both remain at the bottom of the roadmap.
 - Meeting logistics such as preparing review comments and scheduling the
   follow-up are project-management actions, not software PRs.
-- Audit items that are not numbered PRs (repo/package naming, dead
-  `ProviderCapabilities` / `ANTHROPIC_MESSAGES` surface, LICENSE,
-  `requirements-dev.txt` alignment, README duplication) remain deferred
-  decisions outside this sequence.
+- Audit items that are not numbered PRs (repo rename, reserved
+  `ANTHROPIC_MESSAGES` protocol with no adapter yet, README duplication)
+  remain deferred decisions outside this sequence. `ProviderCapabilities`,
+  LICENSE, and root `requirements-dev.txt` are already resolved.
 
 ## Assumptions
 

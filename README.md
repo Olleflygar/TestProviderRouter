@@ -5,6 +5,19 @@ the same model. Your application keeps the provider SDK's request shape and
 response type; the router selects the provider, falls back when appropriate,
 and records runtime observations for later routing decisions.
 
+## Documentation
+
+| Resource | Description |
+|----------|-------------|
+| [Getting started](docs/getting-started.md) | Install, first call, how the router thinks |
+| [Policies](docs/policies.md) | Routing order and same-provider retry |
+| [Streaming](docs/streaming.md) | Streams, restarts, early close |
+| [Metrics & storage](docs/metrics-storage.md) | DuckDB / SQLite / Postgres and the storage CLI |
+| [Errors & health](docs/errors-and-health.md) | Failures, benches, cooldowns |
+| [Concurrency](docs/concurrency.md) | Threading, processes, `close()` |
+| [Development](docs/development.md) | Local setup, tests, lint |
+| [Package README](ProviderRouter/README.md) | Full reference for the `llm-provider-router` package |
+
 ## Onboarding: route the model call
 
 Without Nygen Router, an application sends every request to one configured
