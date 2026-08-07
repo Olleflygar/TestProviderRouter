@@ -19,6 +19,7 @@ from postgres_helpers import (
     reset_schema,
     shared_store,
     skip_reason,
+    unencrypted_opt_in,
 )
 
 from llm_provider_router import (
@@ -343,7 +344,8 @@ class TestConnectionSettings:
     def test_the_shipped_default_statement_timeout_reaches_the_server(self) -> None:
         url = postgres_url()
         assert url is not None
-        default_store = PostgresMetricsStore(url)
+        # Keep shipped timeout defaults; only opt into CI's deliberate plaintext URL.
+        default_store = PostgresMetricsStore(url, config=unencrypted_opt_in(url))
         try:
             with default_store._connection(validate=False) as connection:
                 (value,) = connection.execute("SHOW statement_timeout").fetchone()
@@ -363,7 +365,12 @@ class TestConnectionSettings:
         url = postgres_url()
         assert url is not None
         impatient = PostgresMetricsStore(
-            url, config={"statement_timeout_seconds": 0.5, "checkout_timeout_seconds": 10.0}
+            url,
+            config={
+                "statement_timeout_seconds": 0.5,
+                "checkout_timeout_seconds": 10.0,
+                **unencrypted_opt_in(url),
+            },
         )
         try:
             with pytest.raises(psycopg.errors.QueryCanceled) as caught:

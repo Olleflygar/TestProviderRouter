@@ -66,6 +66,18 @@ REMOTE_TEST_CONFIG = {
 }
 
 
+def unencrypted_opt_in(url: str) -> dict[str, object]:
+    """Confirm plaintext only when the URL deliberately asks for it.
+
+    Production code still refuses ``sslmode=disable`` by default. CI and local
+    service containers use plaintext on localhost, so tests that construct a
+    store without the remote-timeout preset still need this opt-in alone.
+    """
+    if "sslmode=disable" in url:
+        return {"allow_unencrypted": True}
+    return {}
+
+
 def config_for_url(url: str) -> dict[str, object]:
     """Test settings for whichever database is configured.
 
@@ -73,8 +85,7 @@ def config_for_url(url: str) -> dict[str, object]:
     there is deliberate and must be confirmed rather than silently permitted.
     """
     config = dict(REMOTE_TEST_CONFIG)
-    if "sslmode=disable" in url:
-        config["allow_unencrypted"] = True
+    config.update(unencrypted_opt_in(url))
     return config
 
 

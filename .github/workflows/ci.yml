@@ -41,7 +41,9 @@ jobs:
       postgres:
         image: postgres:17
         env:
-          POSTGRES_PASSWORD: postgres
+          # Distinct from the username/database name so credential-leak
+          # assertions do not false-positive on "Backend: postgres".
+          POSTGRES_PASSWORD: ci-pg-test-secret
           POSTGRES_DB: postgres
         options: >-
           --health-cmd pg_isready
@@ -53,8 +55,8 @@ jobs:
     env:
       # A service container speaks plaintext on localhost; the test helpers
       # confirm that unencrypted use is deliberate rather than accidental.
-      NYGEN_ROUTER_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable
-      NYGEN_ROUTER_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable
+      NYGEN_ROUTER_POSTGRES_URL: postgresql://postgres:ci-pg-test-secret@localhost:5432/postgres?sslmode=disable
+      NYGEN_ROUTER_TEST_POSTGRES_URL: postgresql://postgres:ci-pg-test-secret@localhost:5432/postgres?sslmode=disable
     defaults:
       run:
         working-directory: ProviderRouter
